@@ -1,0 +1,4 @@
+$ /nix/store/piidmzyl8dvi91i5y6hs8kaclbalk7bf-lima-2.1.4/bin/limactl shell hl-rosetta -- sh -c /mnt/lima-rosetta/rosetta /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox echo rosetta-baseline-ok; echo rc=$?
+rosetta-baseline-ok
+rc=0
+exit=0

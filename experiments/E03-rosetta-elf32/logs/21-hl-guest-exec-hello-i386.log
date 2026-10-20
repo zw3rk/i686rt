@@ -1,0 +1,8 @@
+$ /Users/angerman/Projects/zw3rk/hyper-linux/_build/hl --fs-mode=legacy --audio-backend null /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox sh -c ./hello-i386; echo exit=$?
+hl: rosetta: VZ_CAPS: binary path exceeds the 42-byte caps field (103 bytes) — publishing /proc/self/fd/3 (the pre-opened binary) instead of a truncated path so AOT stays enabled: /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox
+hl: android: props: fork import master=-1 regions=0
+./hello-i386: not a 64-bit ELF
+hl: rosetta: VZ_CAPS: binary path exceeds the 42-byte caps field (103 bytes) — publishing /proc/self/fd/3 (the pre-opened binary) instead of a truncated path so AOT stays enabled: /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox
+hello-i386: applet not found
+exit=127
+exit=0

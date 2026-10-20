@@ -1,0 +1,27 @@
+Tue Oct 20 21:59:29 KST 2026
+--- host ---
+arm64
+ProductName:		macOS
+ProductVersion:		26.5.2
+/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[xxHash]=d605fbe098a7ebc9, stripped
+--- hl ---
+-rwxr-xr-x 1 angerman staff 855024 Oct 20 21:51 /Users/angerman/Projects/zw3rk/hyper-linux/_build/hl
+/nix/store/fsqxl9xnppms64abzv3syajrmh4lz389-hl-x64-test-binaries-x86_64-unknown-linux-musl-0.1.0/bin/test-hello: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, not stripped
+/nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox:         ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[sha1]=2a81f3df795f1b0b97a22c09418c9ab274190320, not stripped
+--- lima VM hl-rosetta ---
+time="2026-10-20T21:59:29+09:00" level=warning msg="Both top-level 'rosetta' and 'vmOpts.vz.rosetta' are configured. Using vmOpts.vz.rosetta. Top-level 'rosetta' is deprecated."
+NAME          STATUS     SSH                VMTYPE    ARCH       CPUS    MEMORY    DISK      DIR
+aosp-bp1a     Stopped    127.0.0.1:59789    vz        aarch64    8       24GiB     220GiB    ~/.lima/aosp-bp1a
+docker        Stopped    127.0.0.1:52767    vz        aarch64    4       4GiB      100GiB    ~/.lima/docker
+hl-rosetta    Running    127.0.0.1:58921    vz        aarch64    4       4GiB      100GiB    ~/.lima/hl-rosetta
+Linux lima-hl-rosetta 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 17:41:03 UTC 2026 aarch64 GNU/Linux
+-rwxr-xr-x 1 angerman angerman 1726504 Feb 20  2026 /mnt/lima-rosetta/rosetta
+enabled
+interpreter /mnt/lima-rosetta/rosetta
+flags: OCF
+offset 0
+magic 7f454c4602010100000000000000000002003e00
+mask fffffffffffefe00fffffffffffffffffeffffff
+--- test vector ---
+gen_hello386: wrote hello-i386 (96 bytes, entry 0x08048054)
+hello-i386: ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), statically linked, no section header
