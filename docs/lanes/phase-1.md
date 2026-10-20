@@ -98,3 +98,27 @@ Notes:
   main.c engine wiring (`rt32_elf_load` + `rt32_stack_setup` + interp run +
   syscall dispatch). S1 merges everything and runs RC1
   (`make test-p1-lima` → `PASS` under lima).
+
+## S1 sync record (2026-10-21)
+
+- All seven lanes merged; coordinator core (decode.c, interp.c, flags.c,
+  main wiring, Makefile globs) landed; contract amendment ratified:
+  three-operand IMUL (`IMUL_GvEvIz`/`IMUL_GvEvIb`, 0x69/0x6B) added to the
+  generator (248 ids) and implemented.
+- Integration fixes found by the RC1 run (all committed):
+  PF even-parity inversion; lazy descriptor width field (`lazy_width`);
+  width units unified to BITS across `x86_rm_read/write` and handler
+  modules (byte-unit sites in h_mov/h_string converted; zero-byte store
+  class of bugs eliminated); disp32 fetch for mod-0 absolute EAs; SIB
+  base-4 = ESP; moffs load operand slot (opnd[1]); SETcc condition from
+  the 0F-nibble (not modrm reg); BSWAP register synthesis (0F C8+r);
+  EIP-advance normalization for the L1e modules; ENTER double-immediate
+  packing.
+- RC1 acceptance check executed once and PASSED:
+  `I686RT_ENGINE=interp i686rt -- test_p1_isa` prints `PASS` (exit 0).
+  Host deviation: run on the aarch64 Docker Desktop VM — `limactl` is not
+  installed in this environment (the lima instances under ~/.lima are not
+  drivable without it). Recorded like the Phase 0 nix-shell amendment;
+  revisit if a limactl binary appears.
+- `I686RT_TRACE=1` traces each dispatched instruction (kept for the
+  Phase 3 differential harness).
