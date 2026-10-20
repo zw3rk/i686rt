@@ -1,0 +1,45 @@
+#!/bin/sh
+# init — E02 guest init (PID 1), runs inside the initramfs.
+# Executes the three probes, records everything on serial console,
+# then powers the VM off.
+#
+# Exit-code key (reported by busybox ash):
+#   probe-farjmp:  0 = FARJMP:OK printed; 139 = SIGSEGV at the ljmp
+#   probe-int80:   0 = returned (see printed eax); 139 = SIGSEGV at int 0x80
+#   hello-i386:   42 = i386 ELF ran, int 0x80 exit(42) worked
+#                139 = ran but int 0x80 was blocked (SIGSEGV)
+#                127 + "EXEC:...: errno=8" = execve refused (ENOEXEC)
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# Make sure PID 1 has a console even if the cpio node was missed.
+[ -c /dev/console ] || /bin/busybox mknod /dev/console c 5 1 2>/dev/null
+exec </dev/console >/dev/console 2>&1
+
+/bin/busybox mount -t devtmpfs none /dev 2>/dev/null
+/bin/busybox mkdir -p /proc /sys
+/bin/busybox mount -t proc none /proc 2>/dev/null
+/bin/busybox mount -t sysfs none /sys 2>/dev/null
+
+echo "=== E02 INIT START ==="
+uname -a
+echo "--- cmdline:"
+cat /proc/cmdline
+echo "--- dmesg ia32/compat lines:"
+dmesg | grep -i -E 'ia32|compat' || echo "(no ia32/compat lines in dmesg)"
+echo "=== PROBES ==="
+
+echo "### BEGIN probe-farjmp"
+/probe-farjmp
+echo "### END probe-farjmp rc=$?"
+
+echo "### BEGIN probe-int80"
+/probe-int80
+echo "### END probe-int80 rc=$?"
+
+echo "### BEGIN hello-i386 (i386 static ELF -> exit(42) via int 0x80)"
+/run-exe /hello-i386
+echo "### END hello-i386 rc=$?"
+
+echo "=== E02 INIT DONE, POWERING OFF ==="
+exec /bin/busybox poweroff -f
