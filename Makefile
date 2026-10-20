@@ -23,8 +23,10 @@ LDFLAGS ?= -static-pie
 
 # src/main.c plus every vendored rt32 core file present; src/rt32/ arrives
 # with lane L0a, so pre-merge this globs to nothing and main.c builds alone.
-SRCS := src/main.c $(wildcard src/rt32/*.c)
-HDRS := src/i686rt.h include/a32host.h $(wildcard src/rt32/*.h)
+SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
+        $(wildcard src/interp/*.c) $(wildcard src/os/*.c)
+HDRS := src/i686rt.h include/a32host.h $(wildcard src/rt32/*.h) \
+         $(wildcard src/x86/*.h) $(wildcard src/interp/*.h) $(wildcard src/os/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
 OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))

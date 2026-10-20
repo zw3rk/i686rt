@@ -84,6 +84,8 @@ EXPECTED_IDS += [
     "BT_EvGv", "BTS_EvGv", "BTR_EvGv", "BTC_EvGv", "BSF_GvEv", "BSR_GvEv",
     "BT_EvIb", "BTS_EvIb", "BTR_EvIb", "BTC_EvIb", "SHLD_EvIb", "SHLD_EvCL",
     "SHRD_EvIb", "SHRD_EvCL", "IMUL_GvEv",
+    # S1 ratified amendment: three-operand IMUL
+    "IMUL_GvEvIz", "IMUL_GvEvIb",
 ]
 EXPECTED_IDS += [
     "MOVSb", "MOVSw", "CMPSb", "CMPSw", "STOSb", "STOSw",
@@ -113,7 +115,7 @@ S_1B = [
     (0x4F, "DEC_Ev", ("RM32",), 0, 0, 0),
     (0x50, "PUSH_Gv", ("R32",), 0, 0, 0),
     (0x5F, "POP_Gv", ("R32",), 0, 0, 0),
-    (0x69, "INVALID", None, 0, 0, 0),
+    (0x69, "IMUL_GvEvIz", ("R32", "RM32", "I32"), 1, 0, 0),
     (0x6A, "PUSH_Ib", ("I8SX",), 0, 0, 0),
     (0x70, "JCC_Jb", ("REL8",), 0, 0, 0),
     (0x7F, "JCC_Jb", ("REL8",), 0, 0, 0),

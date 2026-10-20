@@ -156,7 +156,7 @@ typedef struct i686_ctx {
     uint32_t lazy_cf_in;                /* 0x05c */
     uint32_t exit_target;               /* 0x060 trampoline/dbt scratch */
     uint32_t x87_top;                   /* 0x064 fast TOP (0..7; fstat mirrors) */
-    uint32_t pad_lock0;                 /* 0x068 */
+    uint32_t lazy_width;                /* 0x068 8/16/32 for lazy materialize */
     uint64_t guest_base;                /* 0x070 */
     uint32_t exit_reason;               /* 0x078 */
     uint32_t exit_arg;                  /* 0x07c */
@@ -260,6 +260,7 @@ _Static_assert(offsetof(i686_ctx_t, eflags) == 36, "eflags must be at offset 36"
 _Static_assert(offsetof(i686_ctx_t, seg_base) == 40, "seg_base must be at offset 40");
 _Static_assert(offsetof(i686_ctx_t, seg_sel) == 64, "seg_sel must be at offset 64");
 _Static_assert(offsetof(i686_ctx_t, lazy_op) == 76, "lazy_op must be at offset 76");
+_Static_assert(offsetof(i686_ctx_t, lazy_width) == 104, "lazy_width must be at offset 104");
 _Static_assert(offsetof(i686_ctx_t, guest_base) == 112, "guest_base must be at offset 112");
 _Static_assert(offsetof(i686_ctx_t, exit_reason) == 120, "exit_reason must be at offset 120");
 _Static_assert(offsetof(i686_ctx_t, exit_arg) == 124, "exit_arg must be at offset 124");

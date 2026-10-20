@@ -138,7 +138,8 @@ typedef enum {
     I686_OP_BT_EvGv, I686_OP_BTS_EvGv, I686_OP_BTR_EvGv, I686_OP_BTC_EvGv,
     I686_OP_BSF_GvEv, I686_OP_BSR_GvEv, I686_OP_BT_EvIb, I686_OP_BTS_EvIb,
     I686_OP_BTR_EvIb, I686_OP_BTC_EvIb, I686_OP_SHLD_EvIb, I686_OP_SHLD_EvCL,
-    I686_OP_SHRD_EvIb, I686_OP_SHRD_EvCL, I686_OP_IMUL_GvEv,
+    I686_OP_SHRD_EvIb, I686_OP_SHRD_EvCL, I686_OP_IMUL_GvEv, I686_OP_IMUL_GvEvIz,
+    I686_OP_IMUL_GvEvIb,
 
     /* strings (REP via pfx_rep) */
     I686_OP_MOVSb, I686_OP_MOVSw, I686_OP_CMPSb, I686_OP_CMPSw,
@@ -149,7 +150,7 @@ typedef enum {
     I686_OP_INT_Ib, I686_OP_INT3, I686_OP_INTO, I686_OP_IRET,
 } i686_op_t;
 
-#define I686_OP_COUNT 247u /* including I686_OP_INVALID */
+#define I686_OP_COUNT 249u /* including I686_OP_INVALID */
 
 /* Per-opcode descriptor (frozen in docs/lanes/phase-1.md). */
 typedef struct {
@@ -266,9 +267,9 @@ static const i686_insn_desc_t i686_insn_tab_1b[256] = {
     /* 0x66 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* prefix (handled by the decoder) */
     /* 0x67 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* prefix (handled by the decoder) */
     /* 0x68 */ { I686_OP_PUSH_Iz, { 10u, 0u, 0u }, 0u, 0u, 0u },
-    /* 0x69 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* IMUL Gv,Ev,Iz: no contract id in v1 */
+    /* 0x69 */ { I686_OP_IMUL_GvEvIz, { 3u, 6u, 10u }, 1u, 0u, 0u },
     /* 0x6A */ { I686_OP_PUSH_Ib, { 8u, 0u, 0u }, 0u, 0u, 0u }, /* imm8 sign-extended */
-    /* 0x6B */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* IMUL Gv,Ev,Ib: no contract id in v1 */
+    /* 0x6B */ { I686_OP_IMUL_GvEvIb, { 3u, 6u, 8u }, 1u, 0u, 0u },
     /* 0x6C */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* INS: I/O excluded */
     /* 0x6D */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* INS: I/O excluded */
     /* 0x6E */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* OUTS: I/O excluded */

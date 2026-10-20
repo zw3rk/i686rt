@@ -122,7 +122,7 @@ static int h_shl(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned cf;
 
     if (cnt == 0U) {
-        return I686_INTERP_CONTINUE; /* no write, no flags */
+        { ctx->eip += insn->len; return I686_INTERP_CONTINUE; } /* no write, no flags */
     }
     val = x86_rm_read(ctx, insn, w);
     res = (uint32_t)(((uint64_t)val << cnt) & sh_mask(w));
@@ -134,7 +134,7 @@ static int h_shl(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, cf ^ ((res >> (w - 1U)) & 1U));
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* C0-C3 /5 — SHR. */
@@ -145,7 +145,7 @@ static int h_shr(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint32_t val, res;
 
     if (cnt == 0U) {
-        return I686_INTERP_CONTINUE;
+        { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
     val = x86_rm_read(ctx, insn, w);
     res = (val >> cnt) & sh_mask(w); /* val is zero-extended: logical */
@@ -155,7 +155,7 @@ static int h_shr(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, (val >> (w - 1U)) & 1U); /* OF = MSB(operand) */
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* C0-C3 /7 — SAR (sign fill; no implementation-defined right shift of
@@ -186,7 +186,7 @@ static int h_sar(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint32_t val, res;
 
     if (cnt == 0U) {
-        return I686_INTERP_CONTINUE;
+        { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
     val = x86_rm_read(ctx, insn, w);
     res = sh_sar_value(val, w, cnt);
@@ -198,7 +198,7 @@ static int h_sar(i686_ctx_t *ctx, const x86_insn_t *insn)
         sh_set_cf(ctx, (val >> (w - 1U)) & 1U); /* sign bit repeats */
     }
     /* count==1: OF = 0 — already cleared by i686_flags_logiczx. */
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* C0-C3 /0 with rotate semantics — ROL. */
@@ -209,7 +209,7 @@ static int h_rol(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint32_t res;
 
     if (cnt == 0U) {
-        return I686_INTERP_CONTINUE;
+        { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
     res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), cnt, w);
     x86_rm_write(ctx, insn, w, res);
@@ -220,7 +220,7 @@ static int h_rol(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) ^ res) & 1U); /* MSB ^ CF */
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* C0-C3 /1 — ROR. */
@@ -231,7 +231,7 @@ static int h_ror(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint32_t res;
 
     if (cnt == 0U) {
-        return I686_INTERP_CONTINUE;
+        { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
     res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), w - (cnt % w), w);
     x86_rm_write(ctx, insn, w, res);
@@ -240,7 +240,7 @@ static int h_ror(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) ^ (res >> (w - 2U))) & 1U);
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* C0-C3 /2 — RCL: rotate the (CF | operand) entity of w+1 bits. */
@@ -253,7 +253,7 @@ static int h_rcl(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned cf_in, cf_out;
 
     if (cnt == 0U) {
-        return I686_INTERP_CONTINUE;
+        { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
     /* CF in can live in the lazy descriptor: materialize before use. */
     i686_flags_materialize(ctx);
@@ -267,7 +267,7 @@ static int h_rcl(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) & 1U) ^ cf_out); /* MSB ^ CF */
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* C0-C3 /3 — RCR. */
@@ -280,7 +280,7 @@ static int h_rcr(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned cf_in, cf_out;
 
     if (cnt == 0U) {
-        return I686_INTERP_CONTINUE;
+        { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
     i686_flags_materialize(ctx);
     cf_in = (ctx->eflags & I686_EF_CF) ? 1U : 0U;
@@ -293,7 +293,7 @@ static int h_rcr(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) ^ (res >> (w - 2U))) & 1U);
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* Registered from i686_interp_muldiv_init() (h_muldiv.c): the whole G2

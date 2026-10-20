@@ -118,7 +118,7 @@ static int h_mul(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     /* CF = OF = (upper half of the product != 0). */
     md_set_cf_of(ctx, (p >> w) != 0U);
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* F6 /5, F7 /5 — one-operand signed multiply into the double-width
@@ -143,10 +143,29 @@ static int h_imul1(i686_ctx_t *ctx, const x86_insn_t *insn)
     /* CF = OF = 1 iff the signed product does not fit the lower half,
      * i.e. the upper half is not the sign extension of the lower half. */
     md_set_cf_of(ctx, p != md_sext((uint32_t)p, w));
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* 0F AF — two-operand signed multiply, result truncated to Gv. */
+
+/* S1 ratified amendment: three-operand IMUL (0x69 Iz / 0x6B IbSX) —
+ * dest = dest * rm * imm, truncated, with the two-operand overflow rule. */
+static int h_imul3(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    unsigned w = insn->pfx_opsize ? 16U : 32U;
+    uint32_t imm = insn->opnd[2] == I686_OPND_I8SX
+                       ? (uint32_t)md_sext(insn->imm & 0xFFU, 8)
+                       : (insn->pfx_opsize ? (insn->imm & 0xFFFFU) : insn->imm);
+    int64_t p = md_sext(x86_reg_read(ctx, insn->modrm_reg, w), w) *
+                md_sext(x86_rm_read(ctx, insn, w), w) * md_sext(imm, w);
+    uint32_t res = (uint32_t)p;
+
+    x86_reg_write(ctx, insn->modrm_reg, w, res);
+    md_set_cf_of(ctx, p != md_sext(res, w));
+    ctx->eip += insn->len;
+    return I686_INTERP_CONTINUE;
+}
+
 static int h_imul2(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     unsigned w = insn->pfx_opsize ? 16U : 32U;
@@ -156,7 +175,7 @@ static int h_imul2(i686_ctx_t *ctx, const x86_insn_t *insn)
 
     x86_reg_write(ctx, insn->modrm_reg, w, res);
     md_set_cf_of(ctx, p != md_sext(res, w));
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* F6 /6, F7 /6 — unsigned divide; quotient overflow or /0 faults. */
@@ -208,7 +227,7 @@ static int h_div(i686_ctx_t *ctx, const x86_insn_t *insn)
         x86_reg_write(ctx, I686_REG_EDX, 32, (uint32_t)(tmp % d));
     }
     /* All arithmetic flags are architecturally undefined: untouched. */
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* F6 /7, F7 /7 — signed divide (quotients truncate toward zero,
@@ -261,7 +280,7 @@ static int h_idiv(i686_ctx_t *ctx, const x86_insn_t *insn)
         x86_reg_write(ctx, I686_REG_EDX, 32, (uint32_t)r);
     }
     /* All arithmetic flags are architecturally undefined: untouched. */
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* 98 — CWDE: widen half of the accumulator by sign (EAX = sext(AX); with
@@ -276,7 +295,7 @@ static int h_cwde(i686_ctx_t *ctx, const x86_insn_t *insn)
         uint32_t ax = x86_reg_read(ctx, I686_REG_EAX, 16);
         x86_reg_write(ctx, I686_REG_EAX, 32, (uint32_t)md_sext(ax, 16));
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 /* 99 — CDQ: EDX = (EAX < 0) ? ~0 : 0 (with a 66 prefix the CWD placement
@@ -291,7 +310,7 @@ static int h_cdq(i686_ctx_t *ctx, const x86_insn_t *insn)
     } else {
         x86_reg_write(ctx, I686_REG_EDX, w, 0U);
     }
-    return I686_INTERP_CONTINUE;
+    { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
 void i686_interp_muldiv_init(void)
@@ -301,6 +320,8 @@ void i686_interp_muldiv_init(void)
     i686_interp_register(I686_OP_IMUL_Eb, h_imul1);
     i686_interp_register(I686_OP_IMUL_Ev, h_imul1);
     i686_interp_register(I686_OP_IMUL_GvEv, h_imul2);
+    i686_interp_register(I686_OP_IMUL_GvEvIz, h_imul3);
+    i686_interp_register(I686_OP_IMUL_GvEvIb, h_imul3);
     i686_interp_register(I686_OP_DIV_Eb, h_div);
     i686_interp_register(I686_OP_DIV_Ev, h_div);
     i686_interp_register(I686_OP_IDIV_Eb, h_idiv);

@@ -12,12 +12,16 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "i686rt.h"
+#include "interp/interp.h"
+#include "rt32/rt32.h"
 
 extern char **environ;
 
@@ -146,10 +150,92 @@ static void apply_env(i686_ctx_t *ctx)
     }
 }
 
+static uint64_t env_window(void)
+{
+    const char *s = getenv("I686RT_WINDOW");
+    char *end = NULL;
+    unsigned long long v;
+
+    if (s == NULL) {
+        return 0;
+    }
+    v = strtoull(s, &end, 0);
+    if (end == s || *end != '\0') {
+        return 0;
+    }
+    return (uint64_t)v;
+}
+
+/* Load the guest and run it on the configured engine.  Returns the guest
+ * exit status (0..255) or -1 on a host-side failure. */
+static int run_guest(i686_ctx_t *ctx)
+{
+    rt32_elf_info_t info;
+    uint32_t sp = 0;
+    int fd;
+    int r;
+
+    rt32_host_probe(ctx);
+    if (rt32_vm_init(ctx, env_window()) != 0) {
+        (void)fprintf(stderr, "i686rt: guest window init failed\n");
+        return -1;
+    }
+
+    fd = open(ctx->exec_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        (void)fprintf(stderr, "i686rt: open %s: %s\n", ctx->exec_path,
+                      strerror(errno));
+        return -1;
+    }
+    if (rt32_elf_load(ctx, fd, ctx->exec_path, &info) != 0) {
+        (void)fprintf(stderr, "i686rt: ELF load failed: %s\n", ctx->exec_path);
+        (void)close(fd);
+        return -1;
+    }
+    (void)close(fd);
+
+    if (rt32_stack_setup(ctx, &info, ctx->guest_argc, ctx->guest_argv,
+                         ctx->host_envp, &sp) != 0) {
+        (void)fprintf(stderr, "i686rt: guest stack setup failed\n");
+        return -1;
+    }
+
+    /* Flat i386 Linux initial state. */
+    ctx->gpr[I686_REG_ESP] = sp;
+    ctx->eip = info.entry;
+    ctx->eflags = 0x202U; /* IF set; bit 1 reserved, always 1 */
+    ctx->seg_sel[I686_SEG_CS] = 0x23U;
+    ctx->seg_sel[I686_SEG_DS] = 0x2bU;
+    ctx->seg_sel[I686_SEG_ES] = 0x2bU;
+    ctx->seg_sel[I686_SEG_SS] = 0x2bU;
+    ctx->seg_sel[I686_SEG_FS] = 0U;
+    ctx->seg_sel[I686_SEG_GS] = 0U;
+    ctx->seg_base[I686_SEG_CS] = 0;
+    ctx->seg_base[I686_SEG_DS] = 0;
+    ctx->seg_base[I686_SEG_ES] = 0;
+    ctx->seg_base[I686_SEG_SS] = 0;
+    ctx->seg_base[I686_SEG_FS] = 0;
+    ctx->seg_base[I686_SEG_GS] = 0;
+
+    if (ctx->engine == I686_ENGINE_DBT) {
+        (void)fprintf(stderr, "i686rt: dbt engine lands in phase 3; "
+                              "using interpreter\n");
+        ctx->engine = I686_ENGINE_INTERP;
+    }
+
+    i686_interp_init_all();
+    r = i686_interp_run(ctx);
+    if (r == I686_EXIT_SYSCALL) {
+        return (int)(ctx->exit_arg & 0xffU);
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     i686_ctx_t ctx;
     int path_idx;
+    int st;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.engine = I686_ENGINE_INTERP; /* interpreter is the default oracle (D2) */
@@ -165,10 +251,14 @@ int main(int argc, char **argv)
     ctx.guest_argv = &argv[path_idx];
     ctx.host_envp = environ;
 
-    (void)ctx.guest_base;
-    fprintf(stderr,
-            "i686rt: no engine implemented yet (phase 0 scaffold); "
-            "cannot run %s\n",
-            ctx.exec_path);
-    return 1;
+    st = run_guest(&ctx);
+    if (st < 0) {
+        return 1;
+    }
+    if (ctx.stats_enabled) {
+        (void)fprintf(stderr, "i686rt: blocks=%llu syscalls=%llu\n",
+                      (unsigned long long)ctx.blocks_executed,
+                      (unsigned long long)ctx.syscalls_executed);
+    }
+    return st;
 }

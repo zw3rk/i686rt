@@ -119,6 +119,8 @@ def contract_ids():
         "BT_EvGv", "BTS_EvGv", "BTR_EvGv", "BTC_EvGv", "BSF_GvEv", "BSR_GvEv",
         "BT_EvIb", "BTS_EvIb", "BTR_EvIb", "BTC_EvIb", "SHLD_EvIb", "SHLD_EvCL",
         "SHRD_EvIb", "SHRD_EvCL", "IMUL_GvEv",
+        # Contract amendment (S1, ratified): three-operand IMUL (gcc-required)
+        "IMUL_GvEvIz", "IMUL_GvEvIb",
     ]))
     sections.append(("strings (REP via pfx_rep)", [
         "MOVSb", "MOVSw", "CMPSb", "CMPSw", "STOSb", "STOSw",
@@ -165,8 +167,6 @@ ONEB_INVALID = {
     0x3F: "AAS: BCD excluded",
     0x62: "BOUND: excluded",
     0x63: "ARPL: excluded",
-    0x69: "IMUL Gv,Ev,Iz: no contract id in v1",
-    0x6B: "IMUL Gv,Ev,Ib: no contract id in v1",
     0x6C: "INS: I/O excluded", 0x6D: "INS: I/O excluded",
     0x6E: "OUTS: I/O excluded", 0x6F: "OUTS: I/O excluded",
     0x9A: "CALLF: far transfer excluded",
@@ -293,6 +293,9 @@ def build_oneb():
     t[0x89] = Desc("MOV_EvGv", ("RM32", "R32"))
     t[0x8A] = Desc("MOV_GbEb", ("R8", "RM8"))
     t[0x8B] = Desc("MOV_GvEv", ("R32", "RM32"))
+    # Contract amendment (S1, ratified): three-operand IMUL.
+    t[0x69] = Desc("IMUL_GvEvIz", ("R32", "RM32", "I32"))
+    t[0x6B] = Desc("IMUL_GvEvIb", ("R32", "RM32", "I8SX"))
     t[0x8C] = Desc("MOV_EwSw", ("RM16", "SREG"))
     t[0x8D] = Desc("LEA_GvM", ("R32", "RM32"),
                    note="not named in the phase-1 list; 8D is required for flat code")
@@ -575,8 +578,8 @@ def generate():
     if len(ids) != len(set(ids)):
         dup = sorted({i for i in ids if ids.count(i) > 1})
         raise SystemExit("duplicate contract ids: %r" % dup)
-    if len(ids) != 246:
-        raise SystemExit("expected 246 contract ids, got %d" % len(ids))
+    if len(ids) != 248:
+        raise SystemExit("expected 248 contract ids (246 + S1 IMUL amendment), got %d" % len(ids))
 
     oneb = build_oneb()
     twob = build_twob()
