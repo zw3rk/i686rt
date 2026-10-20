@@ -47,7 +47,7 @@ static int interp_done(i686_ctx_t *ctx, const x86_insn_t *insn)
 /* "w"-form width: operand-size dependent. */
 static unsigned str_width(const x86_insn_t *insn)
 {
-    return (insn->pfx_opsize != 0U) ? 2U : 4U;
+    return (insn->pfx_opsize != 0U) ? 2U : 4U; /* bytes: h_string is byte-unit internal */
 }
 
 static uint32_t width_mask(unsigned width)

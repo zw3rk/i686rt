@@ -115,12 +115,14 @@ static void mem_store(i686_ctx_t *ctx, uint32_t va, unsigned width, uint32_t val
     memcpy((void *)p, buf, width);
 }
 
+/* width is in BITS (8/16/32) per the frozen contract; mem helpers take
+ * bytes. */
 uint32_t x86_rm_read(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     if (insn->modrm_mod == 3U || !insn->ea_has) {
         return x86_reg_read(ctx, insn->modrm_rm, width);
     }
-    return mem_load(ctx, x86_ea_compute(ctx, insn), width);
+    return mem_load(ctx, x86_ea_compute(ctx, insn), width / 8U);
 }
 
 void x86_rm_write(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width,
@@ -130,7 +132,7 @@ void x86_rm_write(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width,
         x86_reg_write(ctx, insn->modrm_rm, width, val);
         return;
     }
-    mem_store(ctx, x86_ea_compute(ctx, insn), width, val);
+    mem_store(ctx, x86_ea_compute(ctx, insn), width / 8U, val);
 }
 
 /* Decode ModRM + optional SIB/displacement; advances *pc. */
@@ -158,7 +160,7 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out)
         /* 32-bit addressing. */
         static const uint8_t base_map[8] = {
             I686_REG_EAX, I686_REG_ECX, I686_REG_EDX, I686_REG_EBX,
-            REG_NONE,     I686_REG_EBP, I686_REG_ESI, I686_REG_EDI
+            I686_REG_ESP, I686_REG_EBP, I686_REG_ESI, I686_REG_EDI
         };
         if (out->modrm_rm == 4U) { /* SIB */
             uint8_t sib = fetch8(ctx, *pc);
@@ -171,13 +173,17 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out)
             base = sib & 7U;
             if (base == 5U && out->modrm_mod == 0U) {
                 out->ea_base = REG_NONE; /* disp32-only SIB base */
+                out->ea_disp = mem_load(ctx, *pc, 4);
+                *pc += 4;
             } else {
-                out->ea_base = base_map[base];
+                out->ea_base = base_map[base]; /* SIB base 4 = ESP */
             }
         } else if (out->modrm_rm == 5U && out->modrm_mod == 0U) {
             out->ea_base = REG_NONE; /* absolute disp32 (no rip-rel on i386) */
+            out->ea_disp = mem_load(ctx, *pc, 4);
+            *pc += 4;
         } else {
-            out->ea_base = base_map[out->modrm_rm];
+            out->ea_base = base_map[out->modrm_rm]; /* rm 4 never reaches here */
         }
         if (out->modrm_mod == 1U) {
             out->ea_disp = (uint32_t)(int32_t)(int8_t)fetch8(ctx, *pc);
@@ -198,6 +204,8 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out)
         };
         if (out->modrm_rm == 6U && out->modrm_mod == 0U) {
             out->ea_base = REG_NONE; /* disp16 absolute */
+            out->ea_disp = mem_load(ctx, *pc, 2);
+            *pc += 2;
         } else {
             out->ea_base = base16[out->modrm_rm];
             out->ea_index = index16[out->modrm_rm];
@@ -236,6 +244,12 @@ static const i686_group_t *group_lookup(int is_0f, uint8_t opcode)
 static unsigned synth_reg_opcode(uint8_t b1)
 {
     return (b1 >= 0x40U && b1 <= 0x5fU) || (b1 >= 0xb0U && b1 <= 0xbfU);
+}
+
+/* 0F C8+r BSWAP r32: register rides the second opcode byte. */
+static unsigned synth_reg_opcode_0f(uint8_t b2)
+{
+    return b2 >= 0xc8U && b2 <= 0xcfU;
 }
 
 int x86_decode(i686_ctx_t *ctx, uint32_t eip, x86_insn_t *out)
@@ -313,19 +327,23 @@ prefixes_done:;
         out->opnd[0] = desc->opnd[0];
         out->opnd[1] = desc->opnd[1];
         out->opnd[2] = desc->opnd[2];
-        if (synth_reg_opcode(b1)) {
+        if (synth_reg_opcode(b1) || (b1 == 0x0fU && synth_reg_opcode_0f(b2))) {
+            uint8_t r = (uint8_t)((b1 == 0x0fU ? b2 : b1) & 7U);
             out->has_modrm = 1; /* synthesized, not fetched */
             out->modrm_mod = 3;
-            out->modrm_reg = (uint8_t)(b1 & 7U);
-            out->modrm_rm = (uint8_t)(b1 & 7U);
+            out->modrm_reg = r;
+            out->modrm_rm = r;
             out->ea_has = 0;
         } else if (desc->modrm) {
             decode_modrm(ctx, &pc, out);
         }
     }
 
-    /* moffs forms (A0–A3): absolute address, no modrm. */
-    if (opnd_is_mem(out->opnd[0]) && !out->has_modrm) {
+    /* moffs forms (A0–A3): absolute address, no modrm.  Loads (A0/A1)
+     * carry the memory operand in opnd[1] (register destination is
+     * opnd[0]); stores (A2/A3) in opnd[0]. */
+    if ((opnd_is_mem(out->opnd[0]) || opnd_is_mem(out->opnd[1])) &&
+        !out->has_modrm) {
         unsigned w = out->pfx_opsize ? 2U : 4U;
         out->ea_has = 1;
         out->ea_base = REG_NONE;
@@ -336,12 +354,16 @@ prefixes_done:;
 
     /* Family opcodes: condition nibble placement (S1 convention).
      * JCC_*: cond in synthesized modrm_reg (no modrm byte in stream).
-     * SETcc_Eb: cond comes from the real modrm reg field (nothing to do).
+     * SETcc_Eb: real modrm present but its reg field is don't-care —
+     *           cond from the opcode nibble, parked in modrm_reg.
      * CMOVcc_Gv: reg field is the destination; cond parked in imm&0xF. */
     switch (out->op) {
     case I686_OP_JCC_Jb:
     case I686_OP_JCC_Jz:
         out->modrm_reg = (uint8_t)((b1 == 0x0fU ? b2 : b1) & 0x0fU);
+        break;
+    case I686_OP_SETcc_Eb:
+        out->modrm_reg = (uint8_t)(b2 & 0x0fU);
         break;
     case I686_OP_CMOVcc_Gv:
         out->imm = (uint32_t)(b2 & 0x0fU);

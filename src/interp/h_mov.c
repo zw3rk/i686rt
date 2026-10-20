@@ -38,7 +38,7 @@ static int interp_done(i686_ctx_t *ctx, const x86_insn_t *insn)
  * 16-bit forms (v1 flat 32-bit code, so both ride these handlers). */
 static unsigned opsz(const x86_insn_t *insn)
 {
-    return (insn->pfx_opsize != 0U) ? 2U : 4U;
+    return (insn->pfx_opsize != 0U) ? 16U : 32U;
 }
 
 /* Segment used for a direct memory access: explicit override else the
@@ -108,7 +108,7 @@ static void seg_load(i686_ctx_t *ctx, uint8_t seg, uint16_t sel)
 
 static int h_mov_ebgb(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_rm_write(ctx, insn, 1U, x86_reg_read(ctx, insn->modrm_reg, 1U));
+    x86_rm_write(ctx, insn, 8U, x86_reg_read(ctx, insn->modrm_reg, 8U));
     return interp_done(ctx, insn);
 }
 
@@ -121,7 +121,7 @@ static int h_mov_evgv(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_mov_gbeb(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_reg_write(ctx, insn->modrm_reg, 1U, x86_rm_read(ctx, insn, 1U));
+    x86_reg_write(ctx, insn->modrm_reg, 8U, x86_rm_read(ctx, insn, 8U));
     return interp_done(ctx, insn);
 }
 
@@ -145,25 +145,26 @@ static uint32_t moffs_va(const i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_mov_alob(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_reg_write(ctx, I686_REG_EAX, 1U, mem_read(ctx, moffs_va(ctx, insn), 1U));
+    x86_reg_write(ctx, I686_REG_EAX, 8U, mem_read(ctx, moffs_va(ctx, insn), 1U));
     return interp_done(ctx, insn);
 }
 
 static int h_mov_eaxov(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_reg_write(ctx, I686_REG_EAX, opsz(insn), mem_read(ctx, moffs_va(ctx, insn), opsz(insn)));
+    x86_reg_write(ctx, I686_REG_EAX, opsz(insn),
+                   mem_read(ctx, moffs_va(ctx, insn), opsz(insn) / 8U));
     return interp_done(ctx, insn);
 }
 
 static int h_mov_obal(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    mem_write(ctx, moffs_va(ctx, insn), 1U, x86_reg_read(ctx, I686_REG_EAX, 1U));
+    mem_write(ctx, moffs_va(ctx, insn), 1U, x86_reg_read(ctx, I686_REG_EAX, 8U));
     return interp_done(ctx, insn);
 }
 
 static int h_mov_oveax(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    mem_write(ctx, moffs_va(ctx, insn), opsz(insn),
+    mem_write(ctx, moffs_va(ctx, insn), opsz(insn) / 8U,
               x86_reg_read(ctx, I686_REG_EAX, opsz(insn)));
     return interp_done(ctx, insn);
 }
@@ -172,7 +173,7 @@ static int h_mov_oveax(i686_ctx_t *ctx, const x86_insn_t *insn)
  * target the r/m operand.  imm is right-aligned raw per decode.h. */
 static int h_mov_gbib(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_reg_write(ctx, insn->modrm_reg, 1U, insn->imm);
+    x86_reg_write(ctx, insn->modrm_reg, 8U, insn->imm);
     return interp_done(ctx, insn);
 }
 
@@ -184,7 +185,7 @@ static int h_mov_gviv(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_mov_ebib(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_rm_write(ctx, insn, 1U, insn->imm);
+    x86_rm_write(ctx, insn, 8U, insn->imm);
     return interp_done(ctx, insn);
 }
 
@@ -201,7 +202,7 @@ static int h_mov_eviz(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_mov_ewsw(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     if (insn->modrm_reg < I686_SEG_COUNT) {
-        x86_rm_write(ctx, insn, 2U, ctx->seg_sel[insn->modrm_reg]);
+        x86_rm_write(ctx, insn, 16U, ctx->seg_sel[insn->modrm_reg]);
     }
     return interp_done(ctx, insn);
 }
@@ -209,7 +210,7 @@ static int h_mov_ewsw(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_mov_swew(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     if (insn->modrm_reg < I686_SEG_COUNT) {
-        seg_load(ctx, insn->modrm_reg, (uint16_t)x86_rm_read(ctx, insn, 2U));
+        seg_load(ctx, insn->modrm_reg, (uint16_t)x86_rm_read(ctx, insn, 16U));
     }
     return interp_done(ctx, insn);
 }
@@ -245,19 +246,19 @@ static int h_lea_gvm(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_movzx_gveb(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_reg_write(ctx, insn->modrm_reg, opsz(insn), x86_rm_read(ctx, insn, 1U));
+    x86_reg_write(ctx, insn->modrm_reg, opsz(insn), x86_rm_read(ctx, insn, 8U));
     return interp_done(ctx, insn);
 }
 
 static int h_movzx_gvew(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    x86_reg_write(ctx, insn->modrm_reg, opsz(insn), x86_rm_read(ctx, insn, 2U));
+    x86_reg_write(ctx, insn->modrm_reg, opsz(insn), x86_rm_read(ctx, insn, 16U));
     return interp_done(ctx, insn);
 }
 
 static int h_movsx_gveb(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    uint32_t v = (uint32_t)(int32_t)(int8_t)x86_rm_read(ctx, insn, 1U);
+    uint32_t v = (uint32_t)(int32_t)(int8_t)x86_rm_read(ctx, insn, 8U);
 
     x86_reg_write(ctx, insn->modrm_reg, opsz(insn), v);
     return interp_done(ctx, insn);
@@ -265,7 +266,7 @@ static int h_movsx_gveb(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_movsx_gvew(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    uint32_t v = (uint32_t)(int32_t)(int16_t)x86_rm_read(ctx, insn, 2U);
+    uint32_t v = (uint32_t)(int32_t)(int16_t)x86_rm_read(ctx, insn, 16U);
 
     x86_reg_write(ctx, insn->modrm_reg, opsz(insn), v);
     return interp_done(ctx, insn);
@@ -336,8 +337,8 @@ static int h_xlat(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->pfx_addrsize != 0U) {
         base &= 0xffffU;
     }
-    x86_reg_write(ctx, I686_REG_EAX, 1U,
-                  mem_read(ctx, base + x86_reg_read(ctx, I686_REG_EAX, 1U) +
+    x86_reg_write(ctx, I686_REG_EAX, 8U,
+                  mem_read(ctx, base + x86_reg_read(ctx, I686_REG_EAX, 8U) +
                                    ctx->seg_base[seg_used(insn, I686_SEG_DS)], 1U));
     return interp_done(ctx, insn);
 }
@@ -349,20 +350,23 @@ static int h_xlat(i686_ctx_t *ctx, const x86_insn_t *insn)
 /* All pushes/pops run against SS.  ESP arithmetic wraps at 32 bits; the
  * 66 prefix narrows the pushed/pop width to 2 bytes but ESP stays the
  * full 32-bit register (32-bit mode stack). */
+/* width in BITS (8/16/32), consistent with the frozen accessors. */
 static void push_val(i686_ctx_t *ctx, uint32_t val, unsigned width)
 {
-    uint32_t esp = ctx->gpr[I686_REG_ESP] - width;
+    unsigned bytes = width / 8U;
+    uint32_t esp = ctx->gpr[I686_REG_ESP] - bytes;
 
     ctx->gpr[I686_REG_ESP] = esp;
-    mem_write(ctx, ctx->seg_base[I686_SEG_SS] + esp, width, val);
+    mem_write(ctx, ctx->seg_base[I686_SEG_SS] + esp, bytes, val);
 }
 
 static uint32_t pop_val(i686_ctx_t *ctx, unsigned width)
 {
+    unsigned bytes = width / 8U;
     uint32_t esp = ctx->gpr[I686_REG_ESP];
-    uint32_t v = mem_read(ctx, ctx->seg_base[I686_SEG_SS] + esp, width);
+    uint32_t v = mem_read(ctx, ctx->seg_base[I686_SEG_SS] + esp, bytes);
 
-    ctx->gpr[I686_REG_ESP] = esp + width;
+    ctx->gpr[I686_REG_ESP] = esp + bytes;
     return v;
 }
 

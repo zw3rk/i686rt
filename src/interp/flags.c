@@ -34,7 +34,7 @@ uint8_t i686_flags_parity(uint8_t v)
         p ^= (uint8_t)(v & 1U);
         v >>= 1;
     }
-    return p; /* PF set when even parity */
+    return (uint8_t)(p == 0U ? 1U : 0U); /* 1 when EVEN parity (PF set) */
 }
 
 /* Write SF/ZF/PF from a width-masked result. */

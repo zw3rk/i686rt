@@ -11,6 +11,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "interp/interp.h"
 
@@ -29,6 +30,8 @@ void i686_interp_register(uint16_t op, i686_interp_fn fn)
     }
 }
 
+static int s_trace;
+
 void i686_interp_init_all(void)
 {
     static int s_done;
@@ -36,6 +39,7 @@ void i686_interp_init_all(void)
         return;
     }
     s_done = 1;
+    s_trace = getenv("I686RT_TRACE") != NULL;
     i686_interp_alu_init();
     i686_interp_mov_init();
     i686_interp_branch_init();
@@ -75,6 +79,11 @@ int i686_interp_run(i686_ctx_t *ctx)
             ctx->exit_arg = insn.op;
             diag("unimplemented opcode", ctx, insn.op);
             return I686_EXIT_UNDEF;
+        }
+        if (s_trace) {
+            (void)fprintf(stderr, "T %08x op=%u len=%u esp=%08x\n",
+                          ctx->eip, (unsigned)insn.op, insn.len,
+                          ctx->gpr[I686_REG_ESP]);
         }
         r = fn(ctx, &insn);
         ctx->blocks_executed++;
