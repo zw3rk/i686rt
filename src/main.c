@@ -8,6 +8,9 @@
  * wired yet (Phases 1 and 3); running a guest exits 1 with a clear message.
  */
 
+/* POSIX 2008: setenv/environ under strict -std=c11 with musl. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
