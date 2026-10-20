@@ -1,0 +1,4 @@
+# Container: docker --platform linux/386 alpine:latest on Apple-Silign Docker Desktop.
+# QEMU user-mode emulation of i386 binaries on the arm64 linuxkit kernel:
+# the guest signal frames observed in sigframe_probe.out are constructed by
+# QEMU linux-user (qemu-i386), not by a native ia32 kernel path.
