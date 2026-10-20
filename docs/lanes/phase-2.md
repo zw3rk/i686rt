@@ -161,3 +161,12 @@ aarch64 docker VM with the recorded lima deviation).
   -O2 divergence (127 vs SIGSEGV) points at UB in our C; UBSan is not
   available for cross-musl; next step: targeted watchpoint on the
   caller frame or bisect the trace writes).
+- RC2-debug state (precise): O2 vs -O0 builds of the SAME interpreter
+  diverge at trace line 8432, at guest 0x08063215 `jne` closing a
+  byte-compare loop (0x0806320d: xor ecx,ecx / mov bl,[edx+ecx] / test
+  / je / inc ecx / cmp [eax+ecx-1],bl / jne). O2 takes the back-edge,
+  O0 falls through — same inputs, different flags => undefined behavior
+  in our C (in, or affecting, the CMP_EbGb->lazy-SUB->JNE path or the
+  memory values feeding it). 37k-insn crash later is downstream
+  corruption. Next: gdb both builds side by side at guest 0x0806320d,
+  compare ctx->eflags/lazy state and guest memory at [eax+ecx-1].
