@@ -1,0 +1,256 @@
+
+*** Dumping AST Record Layout
+         0 | struct _fpreg
+         0 |   __u16[4] significand
+         8 |   __u16 exponent
+           | [sizeof=10, align=2]
+
+*** Dumping AST Record Layout
+         0 | struct _fpxreg
+         0 |   __u16[4] significand
+         8 |   __u16 exponent
+        10 |   __u16[3] padding
+           | [sizeof=16, align=2]
+
+*** Dumping AST Record Layout
+         0 | struct _xmmreg
+         0 |   __u32[4] element
+           | [sizeof=16, align=4]
+
+*** Dumping AST Record Layout
+         0 | union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:132:2)
+         0 |   __u32[44] padding1
+         0 |   __u32[44] padding
+           | [sizeof=176, align=4]
+
+*** Dumping AST Record Layout
+         0 | struct _fpx_sw_bytes
+         0 |   __u32 magic1
+         4 |   __u32 extended_size
+         8 |   __u64 xfeatures
+        16 |   __u32 xstate_size
+        20 |   __u32[7] padding
+           | [sizeof=48, align=4]
+
+*** Dumping AST Record Layout
+         0 | union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:137:2)
+         0 |   __u32[12] padding2
+         0 |   struct _fpx_sw_bytes sw_reserved
+         0 |     __u32 magic1
+         4 |     __u32 extended_size
+         8 |     __u64 xfeatures
+        16 |     __u32 xstate_size
+        20 |     __u32[7] padding
+           | [sizeof=48, align=4]
+
+*** Dumping AST Record Layout
+         0 | struct _fpstate_32
+         0 |   __u32 cw
+         4 |   __u32 sw
+         8 |   __u32 tag
+        12 |   __u32 ipoff
+        16 |   __u32 cssel
+        20 |   __u32 dataoff
+        24 |   __u32 datasel
+        28 |   struct _fpreg[8] _st
+       108 |   __u16 status
+       110 |   __u16 magic
+       112 |   __u32[6] _fxsr_env
+       136 |   __u32 mxcsr
+       140 |   __u32 reserved
+       144 |   struct _fpxreg[8] _fxsr_st
+       272 |   struct _xmmreg[8] _xmm
+       400 |   union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:132:2) 
+       400 |     __u32[44] padding1
+       400 |     __u32[44] padding
+       576 |   union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:137:2) 
+       576 |     __u32[12] padding2
+       576 |     struct _fpx_sw_bytes sw_reserved
+       576 |       __u32 magic1
+       580 |       __u32 extended_size
+       584 |       __u64 xfeatures
+       592 |       __u32 xstate_size
+       596 |       __u32[7] padding
+           | [sizeof=624, align=4]
+
+*** Dumping AST Record Layout
+         0 | struct sigcontext_32
+         0 |   __u16 gs
+         2 |   __u16 __gsh
+         4 |   __u16 fs
+         6 |   __u16 __fsh
+         8 |   __u16 es
+        10 |   __u16 __esh
+        12 |   __u16 ds
+        14 |   __u16 __dsh
+        16 |   __u32 di
+        20 |   __u32 si
+        24 |   __u32 bp
+        28 |   __u32 sp
+        32 |   __u32 bx
+        36 |   __u32 dx
+        40 |   __u32 cx
+        44 |   __u32 ax
+        48 |   __u32 trapno
+        52 |   __u32 err
+        56 |   __u32 ip
+        60 |   __u16 cs
+        62 |   __u16 __csh
+        64 |   __u32 flags
+        68 |   __u32 sp_at_signal
+        72 |   __u16 ss
+        74 |   __u16 __ssh
+        76 |   __u32 fpstate
+        80 |   __u32 oldmask
+        84 |   __u32 cr2
+           | [sizeof=88, align=4]
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa495903f0 </tmp/k-sigcontext.h:207:1, line:238:1> line:207:8 struct sigcontext_32 definition
+|-FieldDecl 0xa495904a0 <line:208:2, col:11> col:11 gs '__u16':'unsigned short'
+|-FieldDecl 0xa49590500 <col:2, col:15> col:15 __gsh '__u16':'unsigned short'
+|-FieldDecl 0xa49590560 <line:209:2, col:11> col:11 fs '__u16':'unsigned short'
+|-FieldDecl 0xa495905c0 <col:2, col:15> col:15 __fsh '__u16':'unsigned short'
+|-FieldDecl 0xa49590620 <line:210:2, col:11> col:11 es '__u16':'unsigned short'
+|-FieldDecl 0xa49590680 <col:2, col:15> col:15 __esh '__u16':'unsigned short'
+|-FieldDecl 0xa495906e0 <line:211:2, col:11> col:11 ds '__u16':'unsigned short'
+|-FieldDecl 0xa49590740 <col:2, col:15> col:15 __dsh '__u16':'unsigned short'
+|-FieldDecl 0xa495907a0 <line:212:2, col:11> col:11 di '__u32':'unsigned int'
+|-FieldDecl 0xa49590800 <line:213:2, col:11> col:11 si '__u32':'unsigned int'
+|-FieldDecl 0xa49590860 <line:214:2, col:11> col:11 bp '__u32':'unsigned int'
+|-FieldDecl 0xa495908c0 <line:215:2, col:11> col:11 sp '__u32':'unsigned int'
+|-FieldDecl 0xa49590920 <line:216:2, col:11> col:11 bx '__u32':'unsigned int'
+|-FieldDecl 0xa49590980 <line:217:2, col:11> col:11 dx '__u32':'unsigned int'
+|-FieldDecl 0xa495909e0 <line:218:2, col:11> col:11 cx '__u32':'unsigned int'
+|-FieldDecl 0xa49590a40 <line:219:2, col:11> col:11 ax '__u32':'unsigned int'
+|-FieldDecl 0xa49590aa0 <line:220:2, col:11> col:11 trapno '__u32':'unsigned int'
+|-FieldDecl 0xa49590b00 <line:221:2, col:11> col:11 err '__u32':'unsigned int'
+|-FieldDecl 0xa49590b60 <line:222:2, col:11> col:11 ip '__u32':'unsigned int'
+|-FieldDecl 0xa49590bc0 <line:223:2, col:11> col:11 cs '__u16':'unsigned short'
+|-FieldDecl 0xa49590c20 <col:2, col:15> col:15 __csh '__u16':'unsigned short'
+|-FieldDecl 0xa49590c80 <line:224:2, col:11> col:11 flags '__u32':'unsigned int'
+|-FieldDecl 0xa49590ce0 <line:225:2, col:11> col:11 sp_at_signal '__u32':'unsigned int'
+|-FieldDecl 0xa49590d40 <line:226:2, col:11> col:11 ss '__u16':'unsigned short'
+|-FieldDecl 0xa49590da0 <col:2, col:15> col:15 __ssh '__u16':'unsigned short'
+|-FieldDecl 0xa49590e00 <line:235:2, col:11> col:11 fpstate '__u32':'unsigned int'
+|-FieldDecl 0xa49590e60 <line:236:2, col:11> col:11 oldmask '__u32':'unsigned int'
+`-FieldDecl 0xa49590ec0 <line:237:2, col:11> col:11 cr2 '__u32':'unsigned int'
+
+Layout: <CGRecordLayout
+  LLVMType:%struct.sigcontext_32 = type { i16, i16, i16, i16, i16, i16, i16, i16, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i16, i16, i32, i32, i16, i16, i32, i32, i32 }
+  IsZeroInitializable:1
+  BitFields:[
+]>
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa49585810 </tmp/k-sigcontext.h:90:1, line:93:1> line:90:8 struct _fpreg definition
+|-FieldDecl 0xa495859d0 <line:91:2, col:24> col:11 significand '__u16[4]'
+`-FieldDecl 0xa49585a30 <line:92:2, col:11> col:11 exponent '__u16':'unsigned short'
+
+Layout: <CGRecordLayout
+  LLVMType:%struct._fpreg = type { [4 x i16], i16 }
+  IsZeroInitializable:1
+  BitFields:[
+]>
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa49585a80 </tmp/k-sigcontext.h:96:1, line:100:1> line:96:8 struct _fpxreg definition
+|-FieldDecl 0xa49585b80 <line:97:2, col:24> col:11 significand '__u16[4]'
+|-FieldDecl 0xa49585be0 <line:98:2, col:11> col:11 exponent '__u16':'unsigned short'
+`-FieldDecl 0xa49585cf0 <line:99:2, col:20> col:11 padding '__u16[3]'
+
+Layout: <CGRecordLayout
+  LLVMType:%struct._fpxreg = type { [4 x i16], i16, [3 x i16] }
+  IsZeroInitializable:1
+  BitFields:[
+]>
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa49585d40 </tmp/k-sigcontext.h:103:1, line:105:1> line:103:8 struct _xmmreg definition
+`-FieldDecl 0xa49585ea0 <line:104:2, col:20> col:11 element '__u32[4]'
+
+Layout: <CGRecordLayout
+  LLVMType:%struct._xmmreg = type { [4 x i32] }
+  IsZeroInitializable:1
+  BitFields:[
+]>
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa495899e0 </tmp/k-sigcontext.h:132:2, line:135:2> line:132:2 union definition
+|-FieldDecl 0xa49589b40 <line:133:3, col:22> col:11 padding1 '__u32[44]'
+`-FieldDecl 0xa49589bf0 <line:134:3, col:21> col:11 padding '__u32[44]'
+
+Layout: <CGRecordLayout
+  LLVMType:%union.anon = type { [44 x i32] }
+  IsZeroInitializable:1
+  BitFields:[
+]>
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa49585418 </tmp/k-sigcontext.h:45:1, line:75:1> line:45:8 struct _fpx_sw_bytes definition
+|-FieldDecl 0xa49585530 <line:50:2, col:11> col:11 magic1 '__u32':'unsigned int'
+|-FieldDecl 0xa49585590 <line:59:2, col:11> col:11 extended_size '__u32':'unsigned int'
+|-FieldDecl 0xa49585650 <line:65:2, col:11> col:11 xfeatures '__u64':'unsigned long long'
+|-FieldDecl 0xa495856b0 <line:71:2, col:11> col:11 xstate_size '__u32':'unsigned int'
+`-FieldDecl 0xa495857c0 <line:74:2, col:20> col:11 padding '__u32[7]'
+
+Layout: <CGRecordLayout
+  LLVMType:%struct._fpx_sw_bytes = type { i32, i32, i64, i32, [7 x i32] }
+  IsZeroInitializable:1
+  BitFields:[
+]>
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa49589d98 </tmp/k-sigcontext.h:137:2, line:140:2> line:137:2 union definition
+|-FieldDecl 0xa49589f00 <line:138:3, col:22> col:11 padding2 '__u32[12]'
+`-FieldDecl 0xa49589fa0 <line:139:3, col:24> col:24 sw_reserved 'struct _fpx_sw_bytes'
+
+Layout: <CGRecordLayout
+  LLVMType:%union.anon.0 = type { [12 x i32] }
+  IsZeroInitializable:1
+  BitFields:[
+]>
+
+*** Dumping IRgen Record Layout
+Record: RecordDecl 0xa49585ef0 </tmp/k-sigcontext.h:112:1, line:141:1> line:112:8 struct _fpstate_32 definition
+|-FieldDecl 0xa49585fa0 <line:114:2, col:11> col:11 cw '__u32':'unsigned int'
+|-FieldDecl 0xa49589000 <line:115:2, col:11> col:11 sw '__u32':'unsigned int'
+|-FieldDecl 0xa49589060 <line:116:2, col:11> col:11 tag '__u32':'unsigned int'
+|-FieldDecl 0xa495890c0 <line:117:2, col:11> col:11 ipoff '__u32':'unsigned int'
+|-FieldDecl 0xa49589120 <line:118:2, col:11> col:11 cssel '__u32':'unsigned int'
+|-FieldDecl 0xa49589180 <line:119:2, col:11> col:11 dataoff '__u32':'unsigned int'
+|-FieldDecl 0xa495891e0 <line:120:2, col:11> col:11 datasel '__u32':'unsigned int'
+|-FieldDecl 0xa49589390 <line:121:2, col:23> col:18 _st 'struct _fpreg[8]'
+|-FieldDecl 0xa495893f0 <line:122:2, col:11> col:11 status '__u16':'unsigned short'
+|-FieldDecl 0xa49589450 <line:123:2, col:11> col:11 magic '__u16':'unsigned short'
+|-FieldDecl 0xa49589560 <line:127:2, col:22> col:11 _fxsr_env '__u32[6]'
+|-FieldDecl 0xa495895c0 <line:128:2, col:11> col:11 mxcsr '__u32':'unsigned int'
+|-FieldDecl 0xa49589620 <line:129:2, col:11> col:11 reserved '__u32':'unsigned int'
+|-FieldDecl 0xa495897e0 <line:130:2, col:29> col:19 _fxsr_st 'struct _fpxreg[8]'
+|-FieldDecl 0xa49589990 <line:131:2, col:25> col:19 _xmm 'struct _xmmreg[8]'
+|-RecordDecl 0xa495899e0 <line:132:2, line:135:2> line:132:2 union definition
+| |-FieldDecl 0xa49589b40 <line:133:3, col:22> col:11 padding1 '__u32[44]'
+| `-FieldDecl 0xa49589bf0 <line:134:3, col:21> col:11 padding '__u32[44]'
+|-FieldDecl 0xa49589c98 <line:132:2> col:2 implicit 'union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:132:2)'
+|-IndirectFieldDecl 0xa49589cf8 <line:133:11> col:11 implicit padding1 '__u32[44]'
+| |-Field 0xa49589c98 field_index 15 'union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:132:2)'
+| `-Field 0xa49589b40 'padding1' '__u32[44]'
+|-IndirectFieldDecl 0xa49589d50 <line:134:11> col:11 implicit padding '__u32[44]'
+| |-Field 0xa49589c98 field_index 15 'union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:132:2)'
+| `-Field 0xa49589bf0 'padding' '__u32[44]'
+|-RecordDecl 0xa49589d98 <line:137:2, line:140:2> line:137:2 union definition
+| |-FieldDecl 0xa49589f00 <line:138:3, col:22> col:11 padding2 '__u32[12]'
+| `-FieldDecl 0xa49589fa0 <line:139:3, col:24> col:24 sw_reserved 'struct _fpx_sw_bytes'
+|-FieldDecl 0xa4958b058 <line:137:2> col:2 implicit 'union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:137:2)'
+|-IndirectFieldDecl 0xa4958b0b8 <line:138:11> col:11 implicit padding2 '__u32[12]'
+| |-Field 0xa4958b058 field_index 16 'union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:137:2)'
+| `-Field 0xa49589f00 'padding2' '__u32[12]'
+`-IndirectFieldDecl 0xa4958b110 <line:139:24> col:24 implicit sw_reserved 'struct _fpx_sw_bytes'
+  |-Field 0xa4958b058 field_index 16 'union _fpstate_32::(anonymous at /tmp/k-sigcontext.h:137:2)'
+  `-Field 0xa49589fa0 'sw_reserved' 'struct _fpx_sw_bytes'
+
+Layout: <CGRecordLayout
+  LLVMType:%struct._fpstate_32 = type { i32, i32, i32, i32, i32, i32, i32, [8 x %struct._fpreg], i16, i16, [6 x i32], i32, i32, [8 x %struct._fpxreg], [8 x %struct._xmmreg], %union.anon, %union.anon.0 }
+  IsZeroInitializable:1
+  BitFields:[
+]>

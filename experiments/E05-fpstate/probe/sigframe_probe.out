@@ -1,0 +1,12 @@
+fpstate                 = 0x40800150
+fpstate % 64            = 16
+cw=0000037f sw=00000000 tag=0000ffff
+fpstate[0x6e].magic     = 0xffff (expect 0x0000 = X86_FXSR_MAGIC)
+sw_reserved.magic1      = 0x46505853 (expect 0x46505853 = FP_XSTATE_MAGIC1)
+sw_reserved.extended_size = 2812
+sw_reserved.xfeatures     = 0x000000000000021f
+sw_reserved.xstate_size   = 2696
+fpstate+112 % 64        = 0 (expect 0)
+magic2 @ +112+xstate_size = 0x46505845 (expect 0x46505845 = FP_XSTATE_MAGIC2)
+fpstate[0..15]          = 7f 03 00 00 00 00 00 00 ff ff 00 00 00 00 00 00
+probe done: d=1.000000 cw=0x037f

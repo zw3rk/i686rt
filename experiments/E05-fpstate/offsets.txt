@@ -1,0 +1,223 @@
+E05 — i386 signal-frame byte-offset tables and magic constants
+==============================================================
+
+Primary source: torvalds/linux master, arch/x86/include/uapi/asm/sigcontext.h
+(fetched 2026-10-20; identical constants verified for tags v5.15, v6.1, v6.6,
+v6.12, v6.15). Offsets verified twice: (1) gcc i386 offsetof run
+(probe/layout_probe.out, docker --platform linux/386 alpine gcc -static) and
+(2) clang -m32 -Xclang -fdump-record-layouts (probe/clang-layout-dump.txt).
+A live frame dump from a signal handler is in probe/sigframe_probe.out.
+
+Magic constants (kernel uapi sigcontext.h:21-23,102; glibc x86 bits/sigcontext.h:27-29,93)
+----------------------------------------------------------------------------------------
+FP_XSTATE_MAGIC1  = 0x46505853u   (u32, sw_reserved.magic1; "FPXS")
+FP_XSTATE_MAGIC2  = 0x46505845u   (u32, terminator word; "FPXE")  -- NOT 0x46505854
+FP_XSTATE_MAGIC2_SIZE = 4
+X86_FXSR_MAGIC    = 0x0000u       (u16, _fpstate_32.magic; old FXSR magic)
+Legacy convention: _fpstate_32.magic == 0xffff means "regular FPU data only"
+(pure-FSAVE frame; the modern kernel never writes 0xffff itself).
+
+The three distinct "magic" locations in a 32-bit frame
+------------------------------------------------------
+1) _fpstate_32.magic        u16 @ fpstate+0x006e
+   = X86_FXSR_MAGIC (0x0000) when the kernel writes an FXSR-class frame
+     (kernel arch/x86/kernel/fpu/signal.c:85, save_fsave_header(), under
+      use_fxsr() -- true for every fxsave AND xsave CPU)
+   = not written by the kernel for pure-fsave frames (0xffff semantics are
+     the documented iBCS-era convention; QEMU linux-user writes 0xffff here
+     for fxsr/xsave frames instead -- see FINDINGS.md "QEMU divergence").
+2) sw_reserved.magic1       u32 @ fpstate+0x0240 (= 112 + 464 into the image)
+   = FP_XSTATE_MAGIC1 (0x46505853) on EVERY use_fxsr() frame (kernel
+     fpu/signal.c:108, save_sw_bytes(): unconditional); kernel v5.15:524
+     (fpu__init_prepare_fx_sw_frame) behaves the same.
+   The uapi doc comment ("0 if a legacy frame") describes what a reader
+   should ACCEPT; QEMU linux-user is the implementation that actually
+   writes 0 there for fxsave-only frames (qemu linux-user/i386/signal.c:325).
+3) magic2 (no struct field) u32 @ buf_fx + xstate_size (= fpstate + extended_size - 4)
+   = FP_XSTATE_MAGIC2 (0x46505845) written ONLY when use_xsave()
+     (kernel fpu/signal.c:128-132, save_xstate_epilog()). Absent on
+     fxsave-only CPUs (their extended_size is still user_size+4(+112) --
+     the slot simply is not written).
+
+Exact conditions (kernel arch/x86/kernel/fpu/signal.c, master)
+--------------------------------------------------------------
+use_fxsr() frame (every FXSR or XSAVE CPU; what i686rt always builds):
+  - fsave-format header written at fpstate: convert_from_fxsr() env
+    (cw|0xffff0000, swd|0xffff0000, twd expanded, ip/cs/op, dp/ds) into
+    bytes 0x00..0x6b; status(u16 @0x6c) = xsave->i387.swd;
+    magic(u16 @0x6e) = X86_FXSR_MAGIC = 0x0000            [fpu/signal.c:81-86]
+  - sw_reserved.magic1 = FP_XSTATE_MAGIC1 (unconditional) [fpu/signal.c:108]
+  - sw_reserved.extended_size = user_size + 4 (+ 112 for ia32 frames)
+                                                       [fpu/signal.c:109,113-114]
+  - sw_reserved.xfeatures = user_xfeatures              [fpu/signal.c:110]
+  - sw_reserved.xstate_size = user_size                 [fpu/signal.c:111]
+  - additionally, only when use_xsave():
+      magic2 = FP_XSTATE_MAGIC2 at buf_fx+user_size     [fpu/signal.c:128-132]
+      xsave header bit 0+1 (FPSSE) forced to 1          [fpu/signal.c:145]
+pure-fsave frame (no FXSR; pre-Pentium-Pro class only):
+  - buf == buf_fx (no 112-byte gap), FNSAVE image; status = swd;
+    magic NOT written; sw_reserved NOT written.
+sigreturn acceptance (what the kernel checks on the way back,
+fpu/signal.c:27-64 check_xstate_in_sigframe):
+  - magic1 != FP_XSTATE_MAGIC1 or xstate_size < 576 (512-byte fxsave area +
+    64-byte xsave header) or xstate_size > user_size or > extended_size
+    -> fall back to "fx only" restore (fxrstor of the 512-byte area)
+  - word at buf_fx + xstate_size must equal FP_XSTATE_MAGIC2 -> xstate path
+  - _fpstate_32.magic (@0x6e) is NEVER checked by the kernel restore path
+    (advisory for userspace: gdb/unwinders).
+
+struct sigcontext_32 (88 = 0x58 bytes, align 4) — uapi sigcontext.h:202-233
+--------------------------------------------------------------------------
+  offset  size  field
+  0x0000   2    gs          + 0x0002 2 __gsh   (written as one u32)
+  0x0004   2    fs          + 0x0006 2 __fsh
+  0x0008   2    es          + 0x000a 2 __esh
+  0x000c   2    ds          + 0x000e 2 __dsh
+  0x0010   4    di
+  0x0014   4    si
+  0x0018   4    bp
+  0x001c   4    sp
+  0x0020   4    bx
+  0x0024   4    dx
+  0x0028   4    cx
+  0x002c   4    ax
+  0x0030   4    trapno      (current->thread.trap_nr)
+  0x0034   4    err         (current->thread.error_code)
+  0x0038   4    ip
+  0x003c   2    cs          + 0x003e 2 __csh   (written as one u32)
+  0x0040   4    flags       (eflags)
+  0x0044   4    sp_at_signal
+  0x0048   2    ss          + 0x004a 2 __ssh   (written as one u32)
+  0x004c   4    fpstate     (32-bit pointer to _fpstate_32/_xstate; 0 = none)
+  0x0050   4    oldmask     (set->sig[0])
+  0x0054   4    cr2         (current->thread.cr2)
+Kernel writer: arch/x86/kernel/signal_32.c:210-251 __unsafe_setup_sigcontext32
+(userspace name view: glibc struct sigcontext, glibc-x86-sigcontext.h:95-119,
+same order, names edi/esi/ebp/esp/ebx/edx/ecx/eax/eip/eflags).
+
+struct _fpstate_32 (624 = 0x270 bytes, align 4) — uapi sigcontext.h:107-136
+--------------------------------------------------------------------------
+  offset  size  field                   note
+  0x0000   4    cw                      } fsave-format legacy environment
+  0x0004   4    sw                      } written by convert_from_fxsr()
+  0x0008   4    tag                     } (kernel fpu/regset.c:331-366:
+  0x000c   4    ipoff                   }  cwd|0xffff0000, swd|0xffff0000,
+  0x0010   4    cssel                   }  fcs|fop<<16, twd expanded)
+  0x0014   4    dataoff                 }
+  0x0018   4    datasel                 }
+  0x001c  80    _st[8]                  8 x struct _fpreg (10 B: u16[4]+u16)
+  0x006c   2    status                  = xsave->i387.swd
+  0x006e   2    magic                   = X86_FXSR_MAGIC 0x0000 (FXSR frames)
+  ------- 64-byte-aligned fxsave/xsave image starts at fpstate+112 -------
+  0x0070  24    _fxsr_env[6]            = fxsave bytes 4..27 (fop/fip/fcs/fdp/fds/pad)
+  0x0088   4    mxcsr                   = fxsave byte 24
+  0x008c   4    reserved                = fxsave byte 28 (mxcsr_mask)
+  0x0090 128    _fxsr_st[8]             = fxsave bytes 32..159 (8 x 16 B)
+  0x0110 128    _xmm[8]                 = fxsave bytes 160..287 (8 x 16 B)
+  0x0190 176    padding1[44] (padding)  = fxsave bytes 288..463 (xmm8-15 on xsave)
+  0x0240  48    union padding2[12] /
+               struct _fpx_sw_bytes sw_reserved = fxsave bytes 464..511
+Total: 0x270 = 624 bytes. glibc's userspace struct _fpstate ends at the same
+624 bytes (__glibc_reserved2[56] covering 0x190..0x26f).
+
+struct _fpx_sw_bytes (48 = 0x30 bytes) — uapi sigcontext.h:40-70
+------------------------------------------------------------------
+  offset (within struct / within fpstate)  size  field
+  0x00 / 0x240   4    magic1         = FP_XSTATE_MAGIC1 (kernel: always on fxsr)
+  0x04 / 0x244   4    extended_size  = xstate_size + 4 (+ 112 for ia32 frames)
+  0x08 / 0x248   8    xfeatures      (u64; kernel user_xfeatures; FPSSE forced)
+  0x10 / 0x250   4    xstate_size    (kernel user_size: 512 fxsave-only,
+                                       512+64+extensions with xsave)
+  0x14 / 0x254  28    padding[7]
+(glibc names the u64 "xstate_bv", kernel names it "xfeatures".)
+
+Kernel-internal struct fregs_state (112 bytes, align 4) — asm/fpu/types.h
+------------------------------------------------------------------------
+cwd,swd,twd,fip,fcs,foo,fos (7 x u32 = 28) + st_space[20] u32 (80) +
+status (4) = 112. This 112 is the "fsave header" size: on ia32 FXSR frames
+sc.fpstate points at the header and the 64-byte-aligned [f]xsave/xsave image
+begins exactly 112 bytes higher (fpu/signal.c:472,501-504; fpu__alloc_mathframe).
+Verified live: (fpstate + 112) % 64 == 0.
+
+struct ucontext_ia32 (116 = 0x74 bytes, align 4) — asm-generic/ucontext.h @ i386
+-------------------------------------------------------------------------------
+  0x0000  4   uc_flags      (kernel sets UC_FP_XSTATE = 0x1 when XSAVE,
+                             arch/x86/include/uapi/asm/ucontext.h:10,
+                             signal_32.c:360-363; else 0)
+  0x0004  4   uc_link
+  0x0008 12   uc_stack      (u32 ss_sp; s32 ss_flags; u32 ss_size)
+  0x0014 88   uc_mcontext   (struct sigcontext_32)
+  0x006c  8   uc_sigmask    (kernel writes 8 bytes = 64 signals,
+                             signal_32.c:380; glibc's larger userspace
+                             sigset_t extends past the kernel frame)
+
+struct sigframe_ia32 (non-RT, 732 = 0x2dc bytes) — asm/sigframe.h:23-39
+-----------------------------------------------------------------------
+  0x0000  4   pretcode     (restorer address)
+  0x0004  4   sig
+  0x0008 88   sc           (struct sigcontext_32)
+  0x0060 624  fpstate_unused (PLACEHOLDER ONLY — real fpstate is allocated
+                              after retcode; field exists so extramask keeps
+                              its historical offset)
+  0x02d0  4   extramask[1] (set->sig[1]; second half of the 64-bit mask,
+                             first half is sc.oldmask)
+  0x02d4  8   retcode      ("popl %eax; movl $119,%eax; int $0x80" =
+                              58 b8 77 00 00 00 cd 80; still written for gdb
+                              even when the restorer is a vdso/sa_restorer)
+  fpstate follows above retcode (offset chosen by get_sigframe; see below)
+
+struct rt_sigframe_ia32 (RT, 268 = 0x10c bytes) — asm/sigframe.h:41-54
+---------------------------------------------------------------------
+  0x0000   4   pretcode
+  0x0004   4   sig
+  0x0008   4   pinfo        (pointer to frame->info)
+  0x000c   4   puc          (pointer to frame->uc)
+  0x0010 128   info         (compat_siginfo_t; ABI-fixed 128 bytes, align 4)
+  0x0090 116   uc           (struct ucontext_ia32; uc_mcontext.fpstate =
+                             real fpstate address)
+  0x0104   8   retcode      ("movl $173,%eax; int $0x80" =
+                              b8 ad 00 00 00 cd 80 00)
+  fpstate follows above retcode
+
+Whole-stack memory map for an ia32 FXSR frame (kernel signal.c:194-208)
+-----------------------------------------------------------------------
+    higher addresses
+    +-----------------------+
+    | alignment padding     |
+    +-----------------------+  <- buf_fx (64-byte aligned; fpu__alloc_mathframe
+    | [f]xsave frame        |     round_down(sp - frame_size, 64))
+    +-----------------------+  <- sc.fpstate = buf_fx - 112 (ia32 + fxsr only)
+    | fsave header (112 B)  |
+    +-----------------------+
+    | alignment padding     |
+    +-----------------------+  <- sp (frame proper; ia32: ((sp+4)&-16)-4 so
+    | siginfo + ucontext    |      handler entry has (sp+4)%16==0)
+    +-----------------------+
+    lower addresses
+For non-RT frames read sc.fpstate; for RT frames read uc.uc_mcontext.fpstate.
+sigreturn entry points: old esp+8 (non-RT, regs->sp-8) and esp+4 (RT,
+regs->sp-4) (signal_32.c:152,182).
+
+Restorer selection (kernel signal_32.c:279-288 non-RT, 367-371 RT)
+-------------------------------------------------------------------
+SA_RESTORER (0x04000000, uapi asm/signal.h:64) set -> pretcode = sa_restorer.
+Else (non-RT): vdso + vdso32 sym___kernel_sigreturn; if no vdso at all,
+pretcode = &frame->retcode (the 8-byte in-frame stub above).
+Else (RT): vdso + sym___kernel_rt_sigreturn (no in-frame fallback on master).
+glibc i386: sets SA_RESTORER (+__restore/__restore_rt) ONLY when there is no
+vDSO (dl_sysinfo_dso == NULL); with a vDSO it passes sa_restorer = NULL and
+no SA_RESTORER (glibc sysdeps/unix/sysv/linux/i386/libc_sigaction.c:27-37,
+same logic in glibc 2.28). musl: ALWAYS sets SA_RESTORER
+(src/signal/sigaction.c:48-50; i386 restore.s: __restore = popl; mov $119;
+int 0x80, __restore_rt = mov $173; int 0x80).
+
+Live frame observed (probe/sigframe_probe.out, QEMU linux-user i386)
+---------------------------------------------------------------------
+fpstate                  = 0x40800150          (fpstate % 64 = 16)
+fpstate[0x6e].magic      = 0xffff   (QEMU's value; kernel writes 0x0000)
+sw_reserved.magic1       = 0x46505853
+sw_reserved.extended_size= 2812     (= xstate_size 2696 + 4 + 112)
+sw_reserved.xfeatures    = 0x000000000000021f
+sw_reserved.xstate_size  = 2696
+(fpstate + 112) % 64     = 0
+magic2 @ +112+xstate_size= 0x46505845

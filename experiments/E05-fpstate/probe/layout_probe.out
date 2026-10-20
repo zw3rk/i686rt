@@ -1,0 +1,81 @@
+struct sigcontext_32         size 0x0058 (88) align 4
+  gs                     000000  2
+  __gsh                  0x0002  2
+  fs                     0x0004  2
+  __fsh                  0x0006  2
+  es                     0x0008  2
+  __esh                  0x000a  2
+  ds                     0x000c  2
+  __dsh                  0x000e  2
+  di                     0x0010  4
+  si                     0x0014  4
+  bp                     0x0018  4
+  sp                     0x001c  4
+  bx                     0x0020  4
+  dx                     0x0024  4
+  cx                     0x0028  4
+  ax                     0x002c  4
+  trapno                 0x0030  4
+  err                    0x0034  4
+  ip                     0x0038  4
+  cs                     0x003c  2
+  __csh                  0x003e  2
+  flags                  0x0040  4
+  sp_at_signal           0x0044  4
+  ss                     0x0048  2
+  __ssh                  0x004a  2
+  fpstate                0x004c  4
+  oldmask                0x0050  4
+  cr2                    0x0054  4
+struct _fpstate_32           size 0x0270 (624) align 4
+  cw                     000000  4
+  sw                     0x0004  4
+  tag                    0x0008  4
+  ipoff                  0x000c  4
+  cssel                  0x0010  4
+  dataoff                0x0014  4
+  datasel                0x0018  4
+  _st                    0x001c  80
+  status                 0x006c  2
+  magic                  0x006e  2
+  _fxsr_env              0x0070  24
+  mxcsr                  0x0088  4
+  reserved               0x008c  4
+  _fxsr_st               0x0090  128
+  _xmm                   0x0110  128
+  padding1               0x0190  176
+  padding2               0x0240  48
+  (union sw_reserved)    0x0240  48
+struct _fpx_sw_bytes         size 0x0030 (48) align 4
+  magic1                 000000  4
+  extended_size          0x0004  4
+  xfeatures              0x0008  8
+  xstate_size            0x0010  4
+  padding                0x0014  28
+struct ucontext_ia32         size 0x0074 (116) align 4
+  uc_flags               000000  4
+  uc_link                0x0004  4
+  uc_stack               0x0008  12
+  uc_mcontext            0x0014  88
+  uc_sigmask             0x006c  8
+struct sigframe_ia32         size 0x02dc (732) align 4
+  pretcode               000000  4
+  sig                    0x0004  4
+  sc                     0x0008  88
+  fpstate_unused         0x0060  624
+  extramask              0x02d0  4
+  retcode                0x02d4  8
+struct rt_sigframe_ia32      size 0x010c (268) align 4
+  pretcode               000000  4
+  sig                    0x0004  4
+  pinfo                  0x0008  4
+  puc                    0x000c  4
+  info                   0x0010  128
+  uc                     0x0090  116
+  retcode                0x0104  8
+checks:
+  sizeof(_fpstate_32) == 624 : ok
+  sw_reserved offset 0x240 == 112 (fregs_state) + 464 (fxsave sw area) : ok
+  mxcsr at 0x88 == 112 + 24 (FXSAVE MXCSR offset) : ok
+  _xmm at 0x110 == 112 + 160 (FXSAVE XMM offset) : ok
+  sizeof(sigcontext_32) == 88 : ok
