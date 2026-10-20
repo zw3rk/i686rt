@@ -1,0 +1,7 @@
+--- stock handlers: direct exec ---
+rc=42
+--- qemu-i386 handler disabled: direct exec ---
+rc=126
+sh: 4: /tmp/hello-i386: Exec format error
+enabled
+handler-restored

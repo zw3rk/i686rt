@@ -1,0 +1,4 @@
+$ /Users/angerman/Projects/zw3rk/hyper-linux/_build/hl --fs-mode=legacy --audio-backend null /nix/store/fsqxl9xnppms64abzv3syajrmh4lz389-hl-x64-test-binaries-x86_64-unknown-linux-musl-0.1.0/bin/test-hello
+hl: rosetta: VZ_CAPS: binary path exceeds the 42-byte caps field (111 bytes) — publishing /proc/self/fd/3 (the pre-opened binary) instead of a truncated path so AOT stays enabled: /nix/store/fsqxl9xnppms64abzv3syajrmh4lz389-hl-x64-test-binaries-x86_64-unknown-linux-musl-0.1.0/bin/test-hello
+hello
+exit=0

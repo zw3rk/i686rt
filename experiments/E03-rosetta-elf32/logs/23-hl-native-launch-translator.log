@@ -1,0 +1,3 @@
+$ /Users/angerman/Projects/zw3rk/hyper-linux/_build/hl --fs-mode=legacy --audio-backend null /Library/Apple/usr/libexec/oah/RosettaLinux/rosetta ./hello-i386
+hl: ELF does not fit guest address space or overlaps hl-internal memory: /Library/Apple/usr/libexec/oah/RosettaLinux/rosetta
+exit=1

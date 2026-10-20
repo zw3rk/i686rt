@@ -1,0 +1,4 @@
+$ /Users/angerman/Projects/zw3rk/hyper-linux/_build/hl --fs-mode=legacy --audio-backend null ./hello-i386
+./hello-i386: not a 64-bit ELF
+hl: failed to load ELF: ./hello-i386
+exit=1

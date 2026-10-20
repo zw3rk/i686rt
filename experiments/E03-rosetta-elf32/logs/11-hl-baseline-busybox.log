@@ -1,0 +1,17 @@
+$ /Users/angerman/Projects/zw3rk/hyper-linux/_build/hl --fs-mode=legacy --audio-backend null /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox sh -c echo baseline-busybox-ok; uname -m; ls -l ./hello-i386; ls -l /Library/Apple/usr/libexec/oah/RosettaLinux/
+hl: rosetta: VZ_CAPS: binary path exceeds the 42-byte caps field (103 bytes) — publishing /proc/self/fd/3 (the pre-opened binary) instead of a truncated path so AOT stays enabled: /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox
+baseline-busybox-ok
+hl: android: props: fork import master=-1 regions=0
+/etc/profiles/per-user/angerman/bin/uname: not an ELF file
+hl: rosetta: VZ_CAPS: binary path exceeds the 42-byte caps field (103 bytes) — publishing /proc/self/fd/3 (the pre-opened binary) instead of a truncated path so AOT stays enabled: /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox
+x86_64
+hl: android: props: fork import master=-1 regions=0
+/etc/profiles/per-user/angerman/bin/ls: not an ELF file
+hl: rosetta: VZ_CAPS: binary path exceeds the 42-byte caps field (103 bytes) — publishing /proc/self/fd/3 (the pre-opened binary) instead of a truncated path so AOT stays enabled: /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox
+-rwxr-xr-x    1 501      staff           96 Oct 20 21:59 ./hello-i386
+/etc/profiles/per-user/angerman/bin/ls: not an ELF file
+hl: rosetta: VZ_CAPS: binary path exceeds the 42-byte caps field (103 bytes) — publishing /proc/self/fd/3 (the pre-opened binary) instead of a truncated path so AOT stays enabled: /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox
+total 524
+-rwxr-xr-x    1 root     root       1726504 Feb 20  2026 rosetta
+-rwxr-xr-x    1 root     root        383560 Feb 20  2026 rosettad
+exit=0

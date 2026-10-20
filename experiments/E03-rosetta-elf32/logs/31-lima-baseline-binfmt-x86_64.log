@@ -1,0 +1,5 @@
+$ /nix/store/piidmzyl8dvi91i5y6hs8kaclbalk7bf-lima-2.1.4/bin/limactl shell hl-rosetta -- sh -c /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox echo direct-binfmt-ok; /nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox uname -m; echo rc=$?
+direct-binfmt-ok
+x86_64
+rc=0
+exit=0
