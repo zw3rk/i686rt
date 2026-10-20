@@ -57,3 +57,21 @@ test-p0-lima: ## Phase 0 Lima placeholder; the real RC0 check is nix build .#i68
 
 clean: ## Remove build artifacts
 	rm -rf $(BUILD_DIR)
+
+## ------------------------------------------------------------------ ##
+##  Phase 1 — i386 fixtures and checks (docker linux/386 oracle, E06)  ##
+## ------------------------------------------------------------------ ##
+
+fixtures: tools/build_fixture.sh tests/hello.c tests/test_p1_isa.c ## Build i386 static ELF fixtures into _build (docker, linux/386)
+	@mkdir -p $(BUILD_DIR)
+	tools/build_fixture.sh tests/hello.c $(BUILD_DIR)/hello
+	tools/build_fixture.sh tests/test_p1_isa.c $(BUILD_DIR)/test_p1_isa
+
+test-p1-fixture: fixtures ## Run test_p1_isa under the native i386 docker oracle (must print PASS)
+	docker run --rm --platform linux/386 -v "$(CURDIR)/$(BUILD_DIR)":/w alpine:3.20 /w/test_p1_isa
+
+test-p1-lima: ## RC1 on lima (aarch64): run the fixture under i686rt (coordinator executes at S1)
+	@echo "RC1 runs on the lima aarch64 host (coordinator executes this at S1):"
+	@echo "  ./result/bin/i686rt -- _build/test_p1_isa    # must print PASS"
+
+.PHONY: fixtures test-p1-fixture test-p1-lima
