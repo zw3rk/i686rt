@@ -157,11 +157,12 @@ def emit_header(table, source):
     out.append("")
     out.append("/* Numbers for the syscall set implemented by src/os/syscalls.c.")
     out.append(" * The generator cross-checks these against the table above. */")
-    macro_width = max(len("I686__NR_" + name) for name in IMPLEMENTED)
-    for name in sorted(IMPLEMENTED, key=lambda n: IMPLEMENTED[n]):
+    # S2: emit macros for EVERY assigned nr (lanes previously pinned their
+    # own with citations; the full generated set supersedes them).
+    macro_width = max(len("I686__NR_" + table[nr]) for nr in table)
+    for nr in sorted(table):
         out.append(
-            "#define %-*s %dU" % (macro_width, "I686__NR_" + name, IMPLEMENTED[name])
-        )
+            "#define %-*s %dU" % (macro_width, "I686__NR_" + table[nr], nr))
     out.append("")
     out.append("#endif /* %s */" % GUARD)
     out.append("")

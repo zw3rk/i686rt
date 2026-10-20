@@ -79,6 +79,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "os/marshal.h"
+#include "os/proc.h"
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -493,11 +496,16 @@ static long sys_open(i686_ctx_t *ctx, uint32_t path_va, uint32_t flags, uint32_t
 {
     char path[PATH_BUF];
     long hf = i686_open_flags_to_host(flags);
+    long pfd;
     if (hf < 0) {
         return hf;
     }
     if (fetch_path(ctx, path_va, path) != 0) {
         return -EFAULT;
+    }
+    pfd = i686_proc_open_at(ctx, path); /* S2 wiring (src/os/proc.{h,c}) */
+    if (pfd != I686_PROC_NOT_MATCHED) {
+        return pfd;
     }
     return host_ret_(open(path, (int)hf, (mode_t)mode));
 }

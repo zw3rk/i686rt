@@ -15,6 +15,12 @@
 
 #include <stdint.h>
 
+/* darwin's sys/signal.h defines sa_handler as a macro; our field name
+ * collides on host-native builds (S2 guard per L2e escalation). */
+#ifdef sa_handler
+#undef sa_handler
+#endif
+
 /* ---- time (32-bit) ---------------------------------------------------- */
 typedef struct { int32_t tv_sec; int32_t tv_nsec; } i686_timespec_t;
 typedef struct { int32_t tv_sec; int32_t tv_usec; } i686_timeval_t;
@@ -166,8 +172,9 @@ typedef struct {
     uint32_t offset;
 } i686_mmap_arg_struct_t;
 
-/* ---- old select(82): fd_set-ish arg block ------------------------------ */
+/* ---- old select(82): kernel compat_sel_arg_struct (5 words, S2 fix) ---- */
 typedef struct {
+    uint32_t n;
     uint32_t in, out, exc;   /* pointers to 128-byte fd_sets */
     uint32_t timeout;        /* pointer to i686_timeval_t */
 } i686_select_args_t;

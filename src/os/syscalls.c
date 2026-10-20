@@ -351,6 +351,173 @@ static int64_t r_waitpid(i686_ctx_t *ctx)
                      ctx->gpr[I686_REG_EDX], 0U);
 }
 
+
+/* ---- in-process execve (S2 coordinator design) ------------------------ */
+/* Reload a new i386 image into the same process: marshal argv/envp, tear
+ * down all guest regions except the vDSO, load the new ELF, build a fresh
+ * i386 stack (auxv per E07), and restart guest execution at the new entry.
+ * The interpreter loop simply continues; its next decode is at the new EIP.
+ * This is what busybox's applet dispatch (execve("/proc/self/exe", ...))
+ * rides on, with /proc/self/exe virtualized to ctx->exec_path. */
+#define I686_EXEC_MAX_ARGS 4096U
+
+static char **marshal_strv(i686_ctx_t *ctx, uint32_t va, size_t *out_n)
+{
+    char **v;
+    size_t n = 0U;
+    size_t i;
+    uint32_t elem;
+
+    *out_n = 0U;
+    if (va == 0U) {
+        v = malloc(sizeof(char *));
+        if (v != NULL) {
+            v[0] = NULL;
+        }
+        return v;
+    }
+    for (i = 0U; i < I686_EXEC_MAX_ARGS; i++) {
+        if (i686_copy_from_guest(ctx, &elem, va + (uint32_t)(4U * i), 4U) != 0) {
+            return NULL;
+        }
+        if (elem == 0U) {
+            break;
+        }
+        n++;
+    }
+    if (n == I686_EXEC_MAX_ARGS) {
+        return NULL; /* -E2BIG */
+    }
+    v = malloc(sizeof(char *) * (n + 1U));
+    if (v == NULL) {
+        return NULL;
+    }
+    for (i = 0U; i < n; i++) {
+        char buf[4096];
+        (void)i686_copy_from_guest(ctx, &elem, va + (uint32_t)(4U * i), 4U);
+        if (i686_fetch_cstr(ctx, elem, buf, sizeof(buf)) != 0) {
+            size_t j;
+            for (j = 0U; j < i; j++) {
+                free(v[j]);
+            }
+            free(v);
+            return NULL;
+        }
+        v[i] = malloc(strlen(buf) + 1U);
+        if (v[i] == NULL) {
+            size_t j;
+            for (j = 0U; j < i; j++) {
+                free(v[j]);
+            }
+            free(v);
+            return NULL;
+        }
+        memcpy(v[i], buf, strlen(buf) + 1U);
+    }
+    v[n] = NULL;
+    *out_n = n;
+    return v;
+}
+
+static void free_strv(char **v)
+{
+    size_t i;
+    if (v == NULL) {
+        return;
+    }
+    for (i = 0U; v[i] != NULL; i++) {
+        free(v[i]);
+    }
+    free(v);
+}
+
+static void guest_regions_teardown(i686_ctx_t *ctx)
+{
+    size_t r, w = 0U;
+
+    for (r = 0U; r < ctx->region_count; r++) {
+        i686_region_t *reg = &ctx->regions[r];
+        int keep = strcmp(reg->name, "[vdso]") == 0;
+        if (!keep) {
+            (void)munmap(i686_guest_ptr(ctx, reg->start),
+                         (size_t)(reg->end - reg->start));
+        } else {
+            ctx->regions[w] = *reg;
+            w++;
+        }
+    }
+    ctx->region_count = w;
+    ctx->brk_base = 0U;
+    ctx->brk_curr = 0U;
+    ctx->mmap_cursor = 0U; /* rt32_vm re-seeds the cursor on next mmap */
+}
+
+static int64_t r_execve(i686_ctx_t *ctx)
+{
+    char path[4096];
+    char **argv;
+    char **envp;
+    size_t argc = 0U;
+    size_t envc = 0U;
+    rt32_elf_info_t info;
+    uint32_t sp = 0U;
+    int fd;
+
+    if (i686_fetch_cstr(ctx, ctx->gpr[I686_REG_EBX], path, sizeof(path)) != 0) {
+        return -EFAULT;
+    }
+    argv = marshal_strv(ctx, ctx->gpr[I686_REG_ECX], &argc);
+    if (argv == NULL) {
+        return -E2BIG;
+    }
+    envp = marshal_strv(ctx, ctx->gpr[I686_REG_EDX], &envc);
+    if (envp == NULL) {
+        free_strv(argv);
+        return -E2BIG;
+    }
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        free_strv(argv);
+        free_strv(envp);
+        return -errno;
+    }
+    guest_regions_teardown(ctx);
+    if (rt32_elf_load(ctx, fd, path, &info) != 0) {
+        (void)close(fd);
+        free_strv(argv);
+        free_strv(envp);
+        return -ENOEXEC;
+    }
+    (void)close(fd);
+
+    ctx->exec_path = path; /* fresh auxv AT_EXECFN source */
+    if (rt32_stack_setup(ctx, &info, (int)argc, argv, envp, &sp) != 0) {
+        free_strv(argv);
+        free_strv(envp);
+        return -ENOMEM;
+    }
+    /* Update the startup metadata AFTER stack setup consumed them. */
+    ctx->guest_argc = (int)argc;
+    ctx->guest_argv = argv;      /* ownership moves to ctx */
+    ctx->host_envp = envp;
+    /* argv[0] preserved verbatim (busybox applet dispatch). */
+
+    memset(ctx->gpr, 0, sizeof(ctx->gpr));
+    ctx->gpr[I686_REG_ESP] = sp;
+    ctx->eip = info.entry;
+    ctx->eflags = 0x202U;
+    ctx->lazy_op = I686_FOP_NONE;
+    ctx->seg_sel[I686_SEG_CS] = 0x23U;
+    ctx->seg_sel[I686_SEG_DS] = 0x2bU;
+    ctx->seg_sel[I686_SEG_ES] = 0x2bU;
+    ctx->seg_sel[I686_SEG_SS] = 0x2bU;
+    ctx->seg_sel[I686_SEG_FS] = 0U;
+    ctx->seg_sel[I686_SEG_GS] = 0U;
+    memset(ctx->seg_base, 0, sizeof(ctx->seg_base));
+    return 0;
+}
+
 long i686_handle_syscall(i686_ctx_t *ctx)
 {
     long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
@@ -380,6 +547,7 @@ void i686_syscalls_init_once(void)
     i686_sys_register(I686__NR_set_thread_area, r_set_thread_area);
     i686_sys_register(I686__NR_uname, r_uname);
     i686_sys_register(I686__NR_getpid, r_getpid);
+    i686_sys_register(I686__NR_execve, r_execve);
     i686_sys_register(NR_fork, r_fork);
     i686_sys_register(NR_vfork, r_fork);
     i686_sys_register(NR_wait4, r_wait4);

@@ -468,15 +468,41 @@ uint32_t i686_oflags_g2h(uint32_t g)
     return g & I686_O_KNOWN & ~(uint32_t)I686_GO_LARGEFILE;
 }
 
+/* S2 arbitration: the four O_ bits whose i386 and aarch64 encodings
+ * differ (empirically verified by the L2f lane; both sides hard-coded):
+ * O_DIRECT 0x4000 <-> 0x10000, O_DIRECTORY 0x10000 <-> 0x4000,
+ * O_NOFOLLOW 0x20000 <-> 0x8000, O_LARGEFILE guest 0x8000 (host no-op). */
+#define I686_HO_DIRECT_ 0x10000u
+#define I686_HO_NOFOLLOW_ 0x8000u
+
+/* L2f owns the full table (src/os/sys_pass.c). */
+long i686_open_flags_to_host(uint32_t guest_flags);
+
 uint32_t i686_oflags_h2g(uint32_t h)
 {
-    return h & I686_O_KNOWN;
+    uint32_t g = h & I686_O_KNOWN;
+    if ((g & I686_HO_DIRECT_) != 0U) {
+        g = (g & ~I686_HO_DIRECT_) | I686_GO_DIRECT;
+    }
+    if ((g & I686_HO_NOFOLLOW_) != 0U) {
+        g = (g & ~I686_HO_NOFOLLOW_) | I686_GO_NOFOLLOW;
+    }
+    if ((g & I686_HO_LARGEFILE) != 0U) { /* host O_LARGEFILE slot holds
+        O_NOFOLLOW on arm64; that bit is handled above, nothing to do */
+    }
+    return g & I686_O_KNOWN;
 }
 
-/* F_SETFL argument subset (kernel SETFL_MASK + FASYNC). */
+/* F_SETFL argument subset (kernel SETFL_MASK + FASYNC), guest bits
+ * translated to host (O_DIRECT moves; O_LARGEFILE is a 64-bit no-op). */
 uint32_t i686_setfl_to_host(uint32_t g)
 {
-    return g & I686_SETFL_ALLOWED;
+    uint32_t allowed = g & I686_SETFL_ALLOWED;
+    if ((allowed & I686_GO_DIRECT) != 0U) {
+        allowed = (allowed & ~I686_GO_DIRECT) | I686_HO_DIRECT_;
+    }
+    allowed &= ~I686_GO_LARGEFILE;
+    return allowed;
 }
 
 /* Guest fcntl cmd -> host cmd.  fcntl64_entry selects the fcntl64(221)
