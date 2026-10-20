@@ -32,6 +32,7 @@
 
 #include "i686rt.h"
 #include "os/syscalls_i386.h"
+#include "os/marshal.h"
 #include "rt32/rt32.h"
 
 /* i386 GDT TLS entries GDT_ENTRY_TLS_MIN..+2 (6..8); selectors with RPL 3,
@@ -193,52 +194,87 @@ const char *i686_syscall_name(long nr)
     return i686_sysent[(size_t)nr].name;
 }
 
+/* Registry adapters: i686_sys_fn handlers take only ctx; args come from
+ * the i386 register block (EBX..EBP) exactly as the old switch did. */
+static int64_t r_read(i686_ctx_t *ctx)
+{
+    return sys_read(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                    ctx->gpr[I686_REG_EDX]);
+}
+
+static int64_t r_write(i686_ctx_t *ctx)
+{
+    return sys_write(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                     ctx->gpr[I686_REG_EDX]);
+}
+
+static int64_t r_exit(i686_ctx_t *ctx)
+{
+    /* Terminal: the engine loop stops via i686_syscall_is_exit(); the
+     * guest exit status rides back in EAX and our return value. */
+    return (int64_t)(int32_t)ctx->gpr[I686_REG_EBX];
+}
+
+static int64_t r_brk(i686_ctx_t *ctx)
+{
+    return sys_brk(ctx, ctx->gpr[I686_REG_EBX]);
+}
+
+static int64_t r_mmap2(i686_ctx_t *ctx)
+{
+    return sys_mmap2(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                     ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
+                     ctx->gpr[I686_REG_EDI], ctx->gpr[I686_REG_EBP]);
+}
+
+static int64_t r_set_thread_area(i686_ctx_t *ctx)
+{
+    return sys_set_thread_area(ctx, ctx->gpr[I686_REG_EBX]);
+}
+
+static int64_t r_uname(i686_ctx_t *ctx)
+{
+    return sys_uname(ctx, ctx->gpr[I686_REG_EBX]);
+}
+
+static int64_t r_getpid(i686_ctx_t *ctx)
+{
+    return sys_getpid(ctx);
+}
+
 long i686_handle_syscall(i686_ctx_t *ctx)
 {
-    uint32_t nr = ctx->gpr[I686_REG_EAX];
-    uint32_t a0 = ctx->gpr[I686_REG_EBX];
-    uint32_t a1 = ctx->gpr[I686_REG_ECX];
-    uint32_t a2 = ctx->gpr[I686_REG_EDX];
-    uint32_t a3 = ctx->gpr[I686_REG_ESI];
-    uint32_t a4 = ctx->gpr[I686_REG_EDI];
-    uint32_t a5 = ctx->gpr[I686_REG_EBP];
+    long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
+    long ret;
 
     ctx->syscalls_executed++;
 
-    long ret;
-    switch (nr) {
-    case I686__NR_read:
-        ret = sys_read(ctx, a0, a1, a2);
-        break;
-    case I686__NR_write:
-        ret = sys_write(ctx, a0, a1, a2);
-        break;
-    case I686__NR_exit:
-    case I686__NR_exit_group:
-        /* Terminal: the engine loop stops via i686_syscall_is_exit();
-         * the guest exit status rides back in EAX and our return value. */
-        ret = (long)(int32_t)a0;
-        break;
-    case I686__NR_brk:
-        ret = sys_brk(ctx, a0);
-        break;
-    case I686__NR_mmap2:
-        ret = sys_mmap2(ctx, a0, a1, a2, a3, a4, a5);
-        break;
-    case I686__NR_set_thread_area:
-        ret = sys_set_thread_area(ctx, a0);
-        break;
-    case I686__NR_uname:
-        ret = sys_uname(ctx, a1);
-        break;
-    case I686__NR_getpid:
-        ret = sys_getpid(ctx);
-        break;
-    default:
-        ret = -ENOSYS; /* guest sees -38 = -ENOSYS in EAX */
-        break;
-    }
-
+    i686_syscalls_init_once();
+    ret = (long)i686_sys_dispatch(ctx, nr);
     ctx->gpr[I686_REG_EAX] = (uint32_t)ret;
     return ret;
+}
+
+void i686_syscalls_init_once(void)
+{
+    static int s_done;
+    if (s_done) {
+        return;
+    }
+    s_done = 1;
+    i686_sys_register(I686__NR_read, r_read);
+    i686_sys_register(I686__NR_write, r_write);
+    i686_sys_register(I686__NR_exit, r_exit);
+    i686_sys_register(I686__NR_exit_group, r_exit);
+    i686_sys_register(I686__NR_brk, r_brk);
+    i686_sys_register(I686__NR_mmap2, r_mmap2);
+    i686_sys_register(I686__NR_set_thread_area, r_set_thread_area);
+    i686_sys_register(I686__NR_uname, r_uname);
+    i686_sys_register(I686__NR_getpid, r_getpid);
+    i686_syscalls_stat_init();
+    i686_syscalls_sock_init();
+    i686_syscalls_ipc_init();
+    i686_syscalls_time_init();
+    i686_syscalls_misc_init();
+    i686_syscalls_pass_init();
 }
