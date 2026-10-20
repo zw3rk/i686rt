@@ -18,6 +18,16 @@ needed file outside ownership, ambiguity).
 | L0b | `lane/0-l0b` `../i686rt-l0b` | `flake.nix`, `flake.lock` | `nix build .#i686rt` → static-PIE aarch64 ELF (main.c only; rt32 not yet present pre-merge) |
 | L0c | `lane/0-l0c` `../i686rt-l0c` | `Makefile`, `LICENSE`, `.gitignore` | `nix develop nixpkgs#pkgsCross.aarch64-multiplatform-musl -c make build` → `_build/i686rt`, `file` shows `static-pie` |
 
+Coordinator amendment (2026-10-21, after L0c escalation): `nix develop
+nixpkgs#pkgsCross.aarch64-multiplatform-musl` is broken on this host (the
+cross stdenv's env-derivation fails under the nix daemon with an empty log;
+suspect stale `__impureHostDeps` referencing a path absent on macOS 26.5.2).
+All Phase 0 lane checks that need the aarch64 musl cross toolchain use the
+equivalent `nix shell nixpkgs#pkgsCross.aarch64-multiplatform-musl.stdenv.cc`
+form instead (compiler is gcc-flavored: `aarch64-unknown-linux-musl-gcc`).
+Verified outcomes stand: L0b `nix build .#i686rt` → static-PIE (plain form);
+L0c cross build → static-PIE via nix shell with `CC` override.
+
 ## Card L0a — vendor a32rt ISA-agnostic core into `src/rt32/` (rt32_ prefix)
 
 Scope: copy-first vendoring (D13). Copy from `../a32rt/src/` and mechanically
