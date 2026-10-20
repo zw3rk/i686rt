@@ -38,6 +38,10 @@
 #include "i686rt.h"
 #include "os/syscalls_i386.h"
 #include "os/marshal.h"
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+
 #include "rt32/rt32.h"
 
 /* i386 GDT TLS entries GDT_ENTRY_TLS_MIN..+2 (6..8); selectors with RPL 3,
