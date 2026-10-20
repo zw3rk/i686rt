@@ -77,3 +77,19 @@ test-p1-lima: ## RC1 on lima (aarch64): run the fixture under i686rt (coordinato
 	@echo "  ./result/bin/i686rt -- _build/test_p1_isa    # must print PASS"
 
 .PHONY: fixtures test-p1-fixture test-p1-lima
+
+## ------------------------------------------------------------------ ##
+##  Phase 2 — L2h: i686 busybox fixture + RC2 targets                   ##
+## ------------------------------------------------------------------ ##
+
+busybox: ## Fetch the Alpine i686 static busybox into _build (tools/fetch_busybox.sh)
+	@mkdir -p $(BUILD_DIR)
+	tools/fetch_busybox.sh
+
+test-p2-lima: busybox ## RC2 (coordinator, aarch64 docker VM): busybox sh under i686rt interp (must print ok)
+	I686RT_ENGINE=interp ./$(BUILD_DIR)/i686rt -- ./$(BUILD_DIR)/busybox-i686 sh -c 'ls / && echo ok'
+
+test-p2-busybox-oracle: busybox ## Oracle self-check: run the fetched i686 busybox under docker linux/386 (must print ok)
+	docker run --rm --platform linux/386 -v "$(CURDIR)/$(BUILD_DIR)":/w alpine:3.20 /w/busybox-i686 sh -c 'echo ok'
+
+.PHONY: busybox test-p2-lima test-p2-busybox-oracle
