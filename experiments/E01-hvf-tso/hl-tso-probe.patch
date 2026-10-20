@@ -1,0 +1,33 @@
+diff --git a/src/hl.c b/src/hl.c
+index 312984a..359f379 100644
+--- a/src/hl.c
++++ b/src/hl.c
+@@ -1920,6 +1920,28 @@ too_many_regions:
+     g.exit = vexit;
+     g.vcpu_valid = 1;
+ 
++    /* E01-PROBE (exp/e01-tso): can HVF set Apple's ACTLR_EL1.EnTSO bit
++     * (bit 1, per Hypervisor/hv_vcpu_types.h and AsahiLinux docs) on a
++     * guest vCPU? Read, set bit 1, log the hv_return_t, read back. */
++    {
++        uint64_t actlr_before = 0;
++        uint64_t actlr_after = 0;
++        hv_return_t grc = hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ACTLR_EL1,
++                                              &actlr_before);
++        fprintf(stderr, "E01-PROBE: get ACTLR_EL1 rc=%d before=0x%llx\n",
++                (int)grc, (unsigned long long)actlr_before);
++        hv_return_t src = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ACTLR_EL1,
++                                              actlr_before | (1ULL << 1));
++        fprintf(stderr, "E01-PROBE: set ACTLR_EL1|EnTSO rc=%d "
++                "wrote=0x%llx\n", (int)src,
++                (unsigned long long)(actlr_before | (1ULL << 1)));
++        grc = hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ACTLR_EL1, &actlr_after);
++        fprintf(stderr, "E01-PROBE: get ACTLR_EL1 rc=%d after=0x%llx "
++                "entso_stuck=%d\n", (int)grc,
++                (unsigned long long)actlr_after,
++                (actlr_after & (1ULL << 1)) != 0);
++    }
++
+     if (need_rosetta) {
+         /* Rosetta phase 2: kbuf dual-mapping, vDSO, fd 3, argv, proc state.
+          * Needs vcpu handle for TCR_EL1/TTBR1_EL1 sysreg writes.
