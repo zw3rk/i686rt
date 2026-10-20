@@ -81,9 +81,15 @@ int i686_interp_run(i686_ctx_t *ctx)
             return I686_EXIT_UNDEF;
         }
         if (s_trace) {
-            (void)fprintf(stderr, "T %08x op=%u len=%u esp=%08x\n",
-                          ctx->eip, (unsigned)insn.op, insn.len,
-                          ctx->gpr[I686_REG_ESP]);
+            uint32_t b;
+            fprintf(stderr, "T %08x op=%u len=%u b=", ctx->eip,
+                    (unsigned)insn.op, insn.len);
+            for (b = 0U; b < insn.len && b < 8U; b++) {
+                const volatile uint8_t *p =
+                    (const volatile uint8_t *)i686_guest_ptr(ctx, ctx->eip + b);
+                fprintf(stderr, "%02x", *p);
+            }
+            fprintf(stderr, " esp=%08x\n", ctx->gpr[I686_REG_ESP]);
         }
         r = fn(ctx, &insn);
         ctx->blocks_executed++;
@@ -99,6 +105,16 @@ int i686_interp_run(i686_ctx_t *ctx)
         case I686_EXIT_SYSCALL: {
             long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
             long rv = i686_handle_syscall(ctx);
+            if (s_trace) {
+                if (nr == 4 || nr == 3) {
+                    (void)fprintf(stderr, "S %ld(%u,%08x,%u) -> %ld\n", nr,
+                                  ctx->gpr[I686_REG_EBX],
+                                  ctx->gpr[I686_REG_ECX],
+                                  ctx->gpr[I686_REG_EDX], rv);
+                } else {
+                    (void)fprintf(stderr, "S %ld -> %ld\n", nr, rv);
+                }
+            }
             if (i686_syscall_is_exit(nr)) {
                 ctx->exit_reason = I686_EXIT_SYSCALL;
                 ctx->exit_arg = (uint32_t)rv; /* process exit status */

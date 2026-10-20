@@ -240,10 +240,12 @@ static const i686_group_t *group_lookup(int is_0f, uint8_t opcode)
 }
 
 /* Single-register encodings with no modrm byte in the stream (40+r INC/DEC,
- * 50+r PUSH/POP, B0+r/B8+r MOV r,imm): the register rides the opcode. */
+ * 50+r PUSH/POP, 90+r XCHG eAX,r (90 itself is NOP), B0+r/B8+r MOV r,imm):
+ * the register rides the opcode. */
 static unsigned synth_reg_opcode(uint8_t b1)
 {
-    return (b1 >= 0x40U && b1 <= 0x5fU) || (b1 >= 0xb0U && b1 <= 0xbfU);
+    return (b1 >= 0x40U && b1 <= 0x5fU) || (b1 >= 0x90U && b1 <= 0x97U) ||
+           (b1 >= 0xb0U && b1 <= 0xbfU);
 }
 
 /* 0F C8+r BSWAP r32: register rides the second opcode byte. */
