@@ -1,0 +1,74 @@
+E07 — i386 vDSO symbol -> ELF symbol VERSION table
+Fetched 2026-10-20. Sources: bminor/glibc master, torvalds/linux master + v6.1,
+qemu master (linux-user/i386), plus a qemu-user-synthetic vdso dump (docker
+--platform linux/386 alpine). See FINDINGS.md for file:line citations.
+
+Legend: Y = present with that version; - = absent.
+
+ 1. glibc i386 LOOKUP list (sysdeps/unix/sysv/linux/i386/sysdep.h:252-260;
+    version = VDSO_NAME "LINUX_2.6", VDSO_HASH 61765110 = SysV elf_hash("LINUX_2.6")):
+
+    __vdso_clock_gettime                    LINUX_2.6
+    __vdso_clock_gettime64                  LINUX_2.6
+    __vdso_gettimeofday                     LINUX_2.6
+    __vdso_time                             LINUX_2.6
+    __vdso_clock_getres                     LINUX_2.6
+    (no __vdso_getcpu lookup on i386; no __vdso_clock_getres_time64 lookup)
+
+ 2. Symbol -> version matrix (kernel-provided vs glibc-expected vs qemu):
+
+    symbol                                  version     kernel-master  kernel-v6.1  glibc-i386-wants  qemu-vdso.ld
+    --------------------------------------- ----------- -------------- ------------ ---------------- -------------
+    __kernel_vsyscall                       LINUX_2.5   Y (e_entry)    Y (e_entry)  via AT_SYSINFO    Y (e_entry)
+    __kernel_sigreturn                      LINUX_2.5   Y              Y            -                 Y
+    __kernel_rt_sigreturn                   LINUX_2.5   Y              Y            -                 Y
+    __vdso_clock_gettime                    LINUX_2.6   Y [a]          Y            Y                 Y
+    __vdso_gettimeofday                     LINUX_2.6   Y [a]          Y            Y                 Y
+    __vdso_time                             LINUX_2.6   Y [a]          Y            Y                 Y
+    __vdso_clock_getres                     LINUX_2.6   Y [a]          Y            Y                 Y
+    __vdso_clock_gettime64                  LINUX_2.6   Y              Y            Y                 Y
+    __vdso_clock_getres_time64              LINUX_2.6   Y              -            -                 -
+    __vdso_getcpu                           LINUX_2.6   Y              -            -                 Y
+    __vdso_futex_robust_list32_try_unlock   LINUX_2.6   Y [b]          -            -                 -
+
+    [a] guarded by CONFIG_COMPAT_32BIT_TIME (=y on 32-bit kernels) on master
+    [b] guarded by CONFIG_FUTEX_ROBUST_UNLOCK (new post-6.1 addition)
+    kernel master source: arch/x86/entry/vdso/vdso32/vdso32.lds.S:22-47
+    kernel v6.1  source: arch/x86/entry/vdso/vdso32/vdso32.lds.S:22-40
+    No LINUX_2.12 (or any other verdef) exists in arch/x86/entry/vdso*/.
+
+ 3. auxv contract for i386 processes (ARCH_DLINFO_IA32, arch/x86/include/asm/elf.h:289-296):
+
+    AT_SYSINFO      (32) = vdso_base + vdso32_image.sym___kernel_vsyscall  (== base + e_entry)
+    AT_SYSINFO_EHDR (33) = vdso_base
+    Both are emitted; AT_SYSINFO is consumed by glibc only when AT_SYSINFO_EHDR != NULL
+    (sysdeps/unix/sysv/linux/dl-parse_auxv.h:57-61); fallback GLRO(dl_sysinfo) = e_entry + l_addr
+    (elf/setup-vdso.h:109-110); final fallback _dl_sysinfo_int80 = "int $0x80; ret".
+
+ 4. TCB slot for the SYSINFO pointer:
+
+    tcbhead_t.sysinfo at offset 0x10  ->  ENTER_KERNEL "call *%gs:SYSINFO_OFFSET"
+    (sysdeps/unix/sysv/linux/i386/sysdep.h:117; SYSINFO_OFFSET defined
+    sysdeps/i386/nptl/tcb-offsets.sym:10 = offsetof(tcbhead_t, sysinfo);
+    layout sysdeps/i386/nptl/tls.h:33-54: tcb 0x00, dtv 0x04, self 0x08,
+    multiple_threads 0x0c, sysinfo 0x10, stack_guard 0x14, pointer_guard 0x18,
+    gscope_flag 0x1c, feature_1 0x20, __private_tm[3] 0x24, __private_ss 0x30
+    (_Static_assert'ed), ssp_base 0x34)
+
+ 5. Dump: qemu-user synthetic i386 vDSO (docker 29.8.2 aarch64, --platform linux/386
+    alpine, 2026-10-20; PROVENANCE: qemu linux-user image, not a native kernel vdso32):
+
+    maps:    408a9000-408aa000 r-xp [vdso]
+    auxv:    AT_SYSINFO=0x408a9554  AT_SYSINFO_EHDR=0x408a9000
+    ELF:     ELF32 LSB ET_DYN EM_386, 1 PT_LOAD (RWX, 0xae8), e_entry=0x554
+    dynsym:  __kernel_vsyscall    0x554   (== AT_SYSINFO - base)
+             __vdso_clock_gettime 0x557
+             __vdso_clock_gettime64 0x56b
+             __vdso_clock_getres  0x57f
+             __vdso_gettimeofday  0x593
+             __vdso_time          0x5a7
+             __vdso_getcpu        0x5b7
+             __kernel_sigreturn   0x5ce
+             __kernel_rt_sigreturn 0x5d7
+    verdef:  linux-gate.so.1 (base), LINUX_2.6 (ndx 2), LINUX_2.5 (ndx 3)
+    note:    qemu image omits DT_VERSYM; the kernel's image carries it.
