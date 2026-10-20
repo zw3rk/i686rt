@@ -1,0 +1,319 @@
+# E04 sources — i386 compat TASK_SIZE on x86_64 Linux
+# Fetched 2026-10-20 with `curl -s` from raw.githubusercontent.com.
+# master      = torvalds/linux @ f47d223627f80cb7a1eb14c585fe6cb35de5e984 (2026-10-20;
+#               post-v7.3, 7.4-rc cycle; mainline release v7.3 = 2026-10-18).
+# stable refs = torvalds/linux tags v6.12 (LTS; 6.12.y current 6.12.113),
+#               v5.15, v4.19, v3.17, v2.6.12 (first git commit, 2005).
+# Line numbers are as fetched on 2026-10-20.
+
+=== 1. arch/x86/include/asm/page_64_types.h (master f47d223627f8), lines 53-70 ===
+
+#define TASK_SIZE_MAX		task_size_max()
+#define DEFAULT_MAP_WINDOW	((1UL << 47) - PAGE_SIZE)
+
+/* This decides where the kernel will search for a free chunk of vm
+ * space during mmap's.
+ */
+#define IA32_PAGE_OFFSET	((current->personality & ADDR_LIMIT_3GB) ? \
+					0xc0000000 : 0xFFFFe000)
+
+#define TASK_SIZE_LOW		(test_thread_flag(TIF_ADDR32) ? \
+					IA32_PAGE_OFFSET : DEFAULT_MAP_WINDOW)
+#define TASK_SIZE		(test_thread_flag(TIF_ADDR32) ? \
+					IA32_PAGE_OFFSET : TASK_SIZE_MAX)
+#define TASK_SIZE_OF(child)	((test_tsk_thread_flag(child, TIF_ADDR32)) ? \
+					IA32_PAGE_OFFSET : TASK_SIZE_MAX)
+
+#define STACK_TOP		TASK_SIZE_LOW
+#define STACK_TOP_MAX		TASK_SIZE_MAX
+
+=== 2. arch/x86/include/asm/page_64.h (master), lines 130-146 (context for TASK_SIZE_MAX) ===
+
+static __always_inline unsigned long task_size_max(void)
+{
+	unsigned long ret;
+
+	alternative_io("movq %[small],%0","movq %[large],%0",
+			X86_FEATURE_LA57,
+			"=r" (ret),
+	...
+	// 4-level: (1UL << 47) - PAGE_SIZE; LA57: (1UL << 56) - PAGE_SIZE
+
+=== 3. arch/x86/include/asm/page_32_types.h (master), lines 44-53 (native i386) ===
+
+/*
+ * User space process size: 3GB (default).
+ */
+#define IA32_PAGE_OFFSET	__PAGE_OFFSET
+#define TASK_SIZE		__PAGE_OFFSET
+#define TASK_SIZE_LOW		TASK_SIZE
+#define TASK_SIZE_MAX		TASK_SIZE
+#define DEFAULT_MAP_WINDOW	TASK_SIZE
+#define STACK_TOP		TASK_SIZE
+#define STACK_TOP_MAX		STACK_TOP
+
+   with lines 17-18:
+#define __PAGE_OFFSET_BASE	_AC(CONFIG_PAGE_OFFSET, UL)
+#define __PAGE_OFFSET		__PAGE_OFFSET_BASE
+
+=== 4. arch/x86/Kconfig (master), lines 1434-1455 (native i386 PAGE_OFFSET) ===
+
+	config VMSPLIT_3G
+		bool "3G/1G user/kernel split"
+	config VMSPLIT_3G_OPT
+		depends on !X86_PAE
+		bool "3G/1G user/kernel split (for full 1G low memory)"
+	config VMSPLIT_2G
+		bool "2G/2G user/kernel split"
+	config VMSPLIT_2G_OPT
+		depends on !X86_PAE
+		bool "2G/2G user/kernel split (for full 2G low memory)"
+	config VMSPLIT_1G
+		bool "1G/3G user/kernel split"
+endchoice
+
+config PAGE_OFFSET
+	hex
+	default 0xB0000000 if VMSPLIT_3G_OPT
+	default 0x80000000 if VMSPLIT_2G
+	default 0x78000000 if VMSPLIT_2G_OPT
+	default 0x40000000 if VMSPLIT_1G
+	default 0xC0000000
+	depends on X86_32
+
+   Note: no CONFIG_X86_4G option exists in mainline Kconfig (checked master;
+   the 4G/4G user/kernel split was a 2.4-era vendor/out-of-tree patch set).
+
+=== 5. arch/x86/include/asm/processor.h (master), lines 691-696 ===
+
+/* This decides where the kernel will search for a free chunk of vm
+ * space during mmap's.
+ */
+#define __TASK_UNMAPPED_BASE(task_size)	(PAGE_ALIGN(task_size / 3))
+#define TASK_UNMAPPED_BASE		__TASK_UNMAPPED_BASE(TASK_SIZE_LOW)
+
+=== 6. arch/x86/include/asm/thread_info.h (master), lines 103, 116 ===
+
+#define TIF_ADDR32		27	/* 32-bit address space on 64 bits */
+...
+#define _TIF_ADDR32		BIT(TIF_ADDR32)
+
+=== 7. arch/x86/kernel/process_64.c (master), lines 773-783 ===
+
+void set_personality_ia32(bool x32)
+{
+	/* Make sure to be in 32bit mode */
+	set_thread_flag(TIF_ADDR32);
+
+	if (x32)
+		__set_personality_x32();
+	else
+		__set_personality_ia32();
+}
+EXPORT_SYMBOL_GPL(set_personality_ia32);
+
+   and lines 755-771 (__set_personality_ia32: sets MM_CONTEXT_UPROBE_IA32,
+   personality |= force_personality32, orig_ax = __NR_ia32_execve,
+   status |= TS_COMPAT).
+
+=== 8. arch/x86/include/asm/elf.h (master), lines 176-177, 233-234, 301-307 ===
+
+#define COMPAT_SET_PERSONALITY(ex)			\
+	set_personality_ia32((ex).e_machine == EM_X86_64)
+...
+#define ELF_ET_DYN_BASE		(mmap_is_ia32() ? 0x000400000UL : \
+						  (DEFAULT_MAP_WINDOW / 3 * 2))
+...
+static inline int mmap_is_ia32(void)
+{
+	return IS_ENABLED(CONFIG_X86_32) ||
+	       (IS_ENABLED(CONFIG_COMPAT) &&
+		test_thread_flag(TIF_ADDR32));
+}
+
+=== 9. arch/x86/mm/mmap.c (master), lines 31-34, 62-68, 82-95, 133-144, 146-158, 197-202 ===
+
+unsigned long task_size_32bit(void)
+{
+	return IA32_PAGE_OFFSET;
+}
+...
+static int mmap_is_legacy(void)
+{
+	if (current->personality & ADDR_COMPAT_LAYOUT)
+		return 1;
+
+	return sysctl_legacy_va_layout;
+}
+...
+static unsigned long mmap_base(unsigned long rnd, unsigned long task_size,
+			       const struct rlimit *rlim_stack)
+{
+	unsigned long gap = rlim_stack->rlim_cur;
+	unsigned long pad = stack_maxrandom_size(task_size) + stack_guard_gap;
+...
+#ifdef CONFIG_HAVE_ARCH_COMPAT_MMAP_BASES
+	/*
+	 * The mmap syscall mapping base decision depends solely on the
+	 * syscall type (64-bit or compat). This applies for 64bit
+	 * applications and 32bit applications. The 64bit syscall uses
+	 * mmap_base, the compat syscall uses mmap_compat_base.
+	 */
+	arch_pick_mmap_base(&mm->mmap_compat_base, &mm->mmap_compat_legacy_base,
+			arch_rnd(mmap32_rnd_bits), task_size_32bit(),
+			rlim_stack);
+#endif
+...
+unsigned long get_mmap_base(int is_legacy)
+{
+	struct mm_struct *mm = current->mm;
+
+#ifdef CONFIG_HAVE_ARCH_COMPAT_MMAP_BASES
+	if (in_32bit_syscall()) {
+		return is_legacy ? mm->mmap_compat_legacy_base
+				 : mm->mmap_compat_base;
+	}
+#endif
+	return is_legacy ? mm->mmap_legacy_base : mm->mmap_base;
+}
+...
+bool mmap_address_hint_valid(unsigned long addr, unsigned long len)
+{
+	if (TASK_SIZE - len < addr)
+		return false;
+
+	return (addr > DEFAULT_MAP_WINDOW) == (addr + len > DEFAULT_MAP_WINDOW);
+}
+
+   Doc comment above it (lines 163-165): "On 32bit this only checks whether
+   @addr + @len is <= TASK_SIZE."
+
+=== 10. arch/x86/kernel/sys_x86_64.c (master), lines 99-121, 147-151, 183-188, 196-230 (excerpts) ===
+
+static void find_start_end(unsigned long addr, unsigned long flags,
+		unsigned long *begin, unsigned long *end)
+{
+	...
+	*begin	= get_mmap_base(1);
+	if (in_32bit_syscall())
+		*end = task_size_32bit();
+	else
+		*end = task_size_64bit(addr > DEFAULT_MAP_WINDOW);
+}
+...
+	/* requested length too big for entire address space */
+	if (len > TASK_SIZE)
+		return -ENOMEM;
+
+	/* No address checking. See comment at mmap_address_hint_valid() */
+	if (flags & MAP_FIXED)
+		return addr;
+	...
+	/* requesting a specific address */
+	if (addr) {
+		addr &= PAGE_MASK;
+		if (!mmap_address_hint_valid(addr, len))
+			goto get_unmapped_area;
+	...
+	/*
+	 * If hint address is above DEFAULT_MAP_WINDOW, look for unmapped area
+	 * in the full address space.
+	 *
+	 * !in_32bit_syscall() check to avoid high addresses for x32
+	 * (and make it no op on native i386).
+	 */
+	if (addr > DEFAULT_MAP_WINDOW && !in_32bit_syscall())
+		info.high_limit += TASK_SIZE_MAX - DEFAULT_MAP_WINDOW;
+
+=== 11. mm/mmap.c (master), lines 827-875 (excerpts) and 954-955 ===
+
+__get_unmapped_area(struct file *file, unsigned long addr, unsigned long len, ...)
+{
+	...
+	/* Careful about overflows.. */
+	if (len > TASK_SIZE)
+		return -ENOMEM;
+	...
+	if (addr > TASK_SIZE - len)
+		return -ENOMEM;
+	if (offset_in_page(addr))
+		return -EINVAL;
+...
+/* enforced gap between the expanding stack and other mappings. */
+unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
+
+   (256 pages = 1 MiB default; tunable via stack_guard_gap= boot param,
+   mm/mmap.c:957-968.)
+
+=== 12. mm/mremap.c (master), lines 1901-1912 ===
+
+	/* Is the new length silly? */
+	if (vrm->new_len > TASK_SIZE)
+		return -EINVAL;
+	...
+	/* Is the new address silly? */
+	if (vrm->new_addr > TASK_SIZE - vrm->new_len)
+		return -EINVAL;
+
+=== 13. include/uapi/linux/personality.h (master), lines 16-24, 56-57 ===
+
+	ADDR_COMPAT_LAYOUT =	0x0200000,
+	...
+	ADDR_LIMIT_32BIT =	0x0800000,
+	...
+	ADDR_LIMIT_3GB = 	0x8000000,
+...
+	PER_LINUX32 =		0x0008,
+	PER_LINUX32_3GB =	0x0008 | ADDR_LIMIT_3GB,
+
+=== 14. Cross-version: IA32_PAGE_OFFSET / TASK_SIZE for compat (x86_64) ===
+
+v2.6.12  include/asm-x86_64/processor.h:163-172:
+	#define TASK_SIZE	(0x800000000000UL - 4096)          [64-bit only]
+	#define IA32_PAGE_OFFSET ((current->personality & ADDR_LIMIT_3GB) ? 0xc0000000 : 0xFFFFe000)
+	#define TASK_UNMAPPED_32 PAGE_ALIGN(IA32_PAGE_OFFSET/3)
+	(TASK_SIZE had no TIF_IA32 ternary yet; ia32 compat syscall paths
+	 used IA32_PAGE_OFFSET directly.)
+
+v3.17  arch/x86/include/asm/processor.h:903-907:
+	#define IA32_PAGE_OFFSET	((current->personality & ADDR_LIMIT_3GB) ? \
+					0xc0000000 : 0xFFFFe000)
+	#define TASK_SIZE		(test_thread_flag(TIF_IA32) ? \
+					IA32_PAGE_OFFSET : TASK_SIZE_MAX)
+
+v4.19  arch/x86/include/asm/processor.h:891-897:
+	same, keyed on TIF_ADDR32 (renamed from TIF_IA32).
+
+v5.15  arch/x86/include/asm/page_64_types.h:70-76: same as v6.12.
+v6.12  arch/x86/include/asm/page_64_types.h:70-76:
+	#define IA32_PAGE_OFFSET	((current->personality & ADDR_LIMIT_3GB) ? \
+					0xc0000000 : 0xFFFFe000)
+	#define TASK_SIZE_LOW		(test_thread_flag(TIF_ADDR32) ? \
+					IA32_PAGE_OFFSET : DEFAULT_MAP_WINDOW)
+	#define TASK_SIZE		(test_thread_flag(TIF_ADDR32) ? \
+					IA32_PAGE_OFFSET : TASK_SIZE_MAX)
+
+master (post-7.3): see section 1 above; identical values, only line numbers moved.
+
+=== 15. Emulation corroboration attempt (docker, 2026-10-20) ===
+
+$ docker version --format '{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}'
+linux/arm64 29.8.2
+
+$ docker run --rm --platform linux/386 alpine:latest cat /proc/self/maps | tail
+4a4000-4c6000 r--p /bin/busybox
+...
+4c9000-4ca000 ---p [heap]
+4ca000-4cb000 rw-p
+40000000-40001000 ---p
+40001000-40801000 rw-p [stack]
+40801000-40812000 r--p /lib/ld-musl-i386.so.1
+...
+408a9000-408ac000 ... [vdso]
+
+  -> The host kernel is aarch64 (Docker Desktop VM); the 386 binary runs under
+  qemu-user, which virtualizes /proc/self/maps to guest-side entries in its own
+  synthetic layout (top = 0x408ac000, [stack] at 0x40001000). This reflects
+  qemu's layout policy, NOT an x86_64 kernel's compat TASK_SIZE, and an
+  aarch64 kernel has no ia32 compat mode at all. Result discarded as distorted;
+  kernel source is the ground truth. (No x86_64 Linux host was available.)
