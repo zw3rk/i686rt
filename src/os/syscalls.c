@@ -12,7 +12,9 @@
  *
  * Implemented in Phase 1 (smoke set): read(3), write(4), exit(1),
  * exit_group(252), brk(45), mmap2(192), set_thread_area(243), uname(122),
- * getpid(20).  Every other number returns -ENOSYS in EAX.
+ * getpid(20).  Phase 2 L2f adds fork(2)/vfork(190)/wait4(114)/waitpid(7)
+ * (rusage converted to the kernel i386 layout); the layout-neutral set
+ * lives in src/os/sys_pass.c.  Every other number returns -ENOSYS in EAX.
  *
  * Exit contract (for the engine loop in src/interp/interp.c): exit(1) and
  * exit_group(252) never return to the guest.  The loop checks
@@ -28,6 +30,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "i686rt.h"
@@ -242,6 +247,110 @@ static int64_t r_getpid(i686_ctx_t *ctx)
     return sys_getpid(ctx);
 }
 
+/* Phase 2 L2f additions — process creation and reaping.  Numbers from
+ * the generated table in os/syscalls_i386.h. */
+#define NR_waitpid 7U /* [7]   {"waitpid"} */
+#define NR_fork     2U /* [2]   {"fork"}    */
+#define NR_wait4  114U /* [114] {"wait4"}   */
+#define NR_vfork  190U /* [190] {"vfork"}   */
+
+/* wait4(2) is a BSD extension hidden from strict _POSIX_C_SOURCE
+ * builds; declare the (musl) prototype verbatim. */
+pid_t wait4(pid_t, int *, int, struct rusage *);
+
+/*
+ * i686_rusage_to_guest (src/os/sys_pass.c): converts the host 64-bit
+ * struct rusage into the 72-byte kernel i386 layout (2 x {u32 sec, u32
+ * usec} + 14 x u32, arch/x86/include/uapi/asm/resource.h).  Declared
+ * here rather than in frozen marshal.h; unit-tested via test_l2f.c.
+ */
+int i686_rusage_to_guest(i686_ctx_t *ctx, uint32_t ru_va, const struct rusage *ru);
+
+/*
+ * fork(2) and vfork(190) both map onto host fork().
+ *
+ * The whole guest state lives in the [G, G+4 GiB) window, which rt32
+ * maps MAP_PRIVATE anonymous: the host fork's copy-on-write duplication
+ * of that mapping IS fork semantics for the guest — parent and child
+ * see identical guest memory, stack, and fd table, and diverge page by
+ * page on write, exactly like a native i386 fork.  In the child the
+ * syscall returns 0 (EAX), in the parent the child pid, and both simply
+ * CONTINUE in the interpreter loop from the instruction after int 0x80:
+ * no guest re-init, no re-exec, nothing is duplicated except memory.
+ *
+ * Double-cleanup is not an issue in v1: the runtime registers no host
+ * atexit handlers and keeps no stdio buffers that the child could
+ * flush again (trace output uses write(2)); the child eventually calls
+ * exit/exit_group, which is terminal in the engine loop, so parent and
+ * child never both run the host cleanup path — each exits exactly once.
+ * Region teardown (/proc/self/maps bookkeeping) is likewise per-process
+ * host memory, and the COW window means neither side corrupts the other.
+ *
+ * vfork(190) is served by the same host fork(): the kernel contract
+ * (parent suspended until the child execs or exits) is relaxed in v1 —
+ * the parent races ahead instead.  Guests that vfork precisely to
+ * execve immediately still behave acceptably, and execve itself is the
+ * coordinator's S2 work.  clone(120) stays -ENOSYS until Phase 4.
+ */
+static int64_t r_fork(i686_ctx_t *ctx)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        return -errno;
+    }
+    if (pid == 0) {
+        /* Child: a fresh host pid, reported by getpid(20) from now on. */
+        ctx->host_tid = (int)getpid();
+        return 0;
+    }
+    return (int64_t)pid;
+}
+
+static long sys_wait4(i686_ctx_t *ctx, int32_t pid, uint32_t status_va,
+                      uint32_t options, uint32_t ru_va)
+{
+    int status = 0;
+    struct rusage ru;
+    struct rusage *rup = (ru_va != 0U) ? &ru : NULL;
+    pid_t r = wait4((pid_t)pid, &status, (int)options, rup);
+
+    if (r < 0) {
+        return -errno;
+    }
+    if (status_va != 0U) {
+        if (status_va < 0x1000U) {
+            return -EFAULT; /* null-page guard, Phase 1 convention */
+        }
+        uint8_t le[4];
+        guest_store_le32(le, (uint32_t)status);
+        int rc = i686_copy_to_guest(ctx, status_va, le, sizeof le);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    if (rup != NULL) {
+        int rc = i686_rusage_to_guest(ctx, ru_va, rup);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    return (long)r;
+}
+
+static int64_t r_wait4(i686_ctx_t *ctx)
+{
+    return sys_wait4(ctx, (int32_t)ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                     ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI]);
+}
+
+static int64_t r_waitpid(i686_ctx_t *ctx)
+{
+    /* waitpid(7): wait4 with no rusage pointer. */
+    return sys_wait4(ctx, (int32_t)ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                     ctx->gpr[I686_REG_EDX], 0U);
+}
+
 long i686_handle_syscall(i686_ctx_t *ctx)
 {
     long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
@@ -271,6 +380,10 @@ void i686_syscalls_init_once(void)
     i686_sys_register(I686__NR_set_thread_area, r_set_thread_area);
     i686_sys_register(I686__NR_uname, r_uname);
     i686_sys_register(I686__NR_getpid, r_getpid);
+    i686_sys_register(NR_fork, r_fork);
+    i686_sys_register(NR_vfork, r_fork);
+    i686_sys_register(NR_wait4, r_wait4);
+    i686_sys_register(NR_waitpid, r_waitpid);
     i686_syscalls_stat_init();
     i686_syscalls_sock_init();
     i686_syscalls_ipc_init();
