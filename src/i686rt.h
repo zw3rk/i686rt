@@ -68,6 +68,7 @@
 #define I686_EXIT_UNDEF   3U /* undecodable insn: interpreter single-step (D2) */
 #define I686_EXIT_FAULT   4U /* guest memory fault; ctx->fault_addr set */
 #define I686_EXIT_TRAP    5U /* int3/int1 debug trap */
+#define I686_EXIT_HLT     6U /* guest executed hlt (diagnostic stop) */
 
 /* Architectural limits, cache capacities, page/window constants (D4, E04). */
 #define I686_MAX_REGIONS     512U
