@@ -145,3 +145,19 @@ reload + L2h auxv + vDSO) and run RC2.
 Sync S2: batch review, merge all lanes, coordinator integration (execve),
 RC2: `make test-p2-lima` (busybox `sh -c 'ls / && echo ok'` → `ok`, interp,
 aarch64 docker VM with the recorded lima deviation).
+
+## S2 progress record (2026-10-21)
+
+- All eight lanes merged; coordinator fixes applied: i686_select_args_t
+  5-word form, sa_handler darwin guard, full I686__NR_* macro generation
+  (462), /proc wiring into sys_open, fcntl O_DIRECT four-bit arbitration
+  (L2f's table wins), in-process execve (regions teardown minus [vdso],
+  fresh i386 stack/auxv, registry preserved).
+- Interpreter fix from the RC2 chase: 0x91-0x97 XCHG eAX,r synthesis
+  (was a no-op swap; musl PIC conventions corrupted argv/applet state).
+  busybox `echo hi` now prints and exits 0 under interp.
+- RC2 remains open: `busybox sh -c 'ls / && echo ok'` crashes in sh init
+  (~37k insns in, corrupted return slot on a function epilogue; -O0 vs
+  -O2 divergence (127 vs SIGSEGV) points at UB in our C; UBSan is not
+  available for cross-musl; next step: targeted watchpoint on the
+  caller frame or bisect the trace writes).
