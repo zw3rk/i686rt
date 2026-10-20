@@ -5,12 +5,16 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Vendored from a32rt/src/stack32.c @ d84feb3 (D13): renamed a32_→rt32_,
- * retyped on i686_ctx_t.  auxv contents are still ARM-flavored and are
- * rewritten for i386 in Phase 2 (SPEC D12).
+ * retyped on i686_ctx_t.  The auxv section was rewritten for i386 in
+ * Phase 2 (SPEC D12, E07): the table itself is built by
+ * i686_auxv_build_i386() in src/os/proc.c (shared definition, L2h).
  */
 
 #define _GNU_SOURCE
 #include "rt32.h"
+
+#include "os/proc.h"
+#include "os/vdso.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -21,49 +25,6 @@
 
 #define RT32_STACK_TOP  0xE0000000U
 #define RT32_STACK_SIZE (8U * 1024U * 1024U)
-
-/* Standard Linux ELF auxiliary vector types */
-#define AT_NULL         0U
-#define AT_PHDR         3U
-#define AT_PHENT        4U
-#define AT_PHNUM        5U
-#define AT_PAGESZ       6U
-#define AT_BASE         7U
-#define AT_FLAGS        8U
-#define AT_ENTRY        9U
-#define AT_UID          11U
-#define AT_EUID         12U
-#define AT_GID          13U
-#define AT_EGID         14U
-#define AT_PLATFORM     15U
-#define AT_HWCAP        16U
-#define AT_CLKTCK       17U
-#define AT_SECURE       23U
-#define AT_RANDOM       25U
-#define AT_HWCAP2       26U
-#define AT_EXECFN       31U
-
-/* ARMv7 / ARMv8 AArch32 HWCAP bits */
-#define ARM_HWCAP_HALF      (1U << 1)
-#define ARM_HWCAP_THUMB     (1U << 2)
-#define ARM_HWCAP_FAST_MULT (1U << 4)
-#define ARM_HWCAP_VFP       (1U << 6)
-#define ARM_HWCAP_EDSP      (1U << 7)
-#define ARM_HWCAP_NEON      (1U << 12)
-#define ARM_HWCAP_VFPv3     (1U << 13)
-#define ARM_HWCAP_TLS       (1U << 15)
-#define ARM_HWCAP_VFPv4     (1U << 16)
-#define ARM_HWCAP_IDIVA     (1U << 17)
-#define ARM_HWCAP_IDIVT     (1U << 18)
-#define ARM_HWCAP_VFPD32    (1U << 19)
-#define ARM_HWCAP_LPAE      (1U << 20)
-
-/* ARMv8 AArch32 HWCAP2 bits */
-#define ARM_HWCAP2_AES      (1U << 0)
-#define ARM_HWCAP2_PMULL    (1U << 1)
-#define ARM_HWCAP2_SHA1     (1U << 2)
-#define ARM_HWCAP2_SHA2     (1U << 3)
-#define ARM_HWCAP2_CRC32    (1U << 4)
 
 static uint32_t push_bytes(i686_ctx_t *ctx, uint32_t *sp, const void *data, size_t len)
 {
@@ -108,6 +69,13 @@ int rt32_stack_setup(i686_ctx_t *ctx, const rt32_elf_info_t *elf_info,
         return -1;
     }
 
+    /* Map the synthetic i386 vDSO FIRST (SPEC D12, E07): the AT_SYSINFO /
+     * AT_SYSINFO_EHDR entries below need live addresses.  i686_vdso_map
+     * is idempotent and records the "[vdso]" window region; when mapping
+     * fails it returns 0, we emit no vDSO entries, and glibc falls back
+     * to its own int $0x80 trampoline (E07) — never fatal. */
+    uint32_t vdso_mapped = i686_vdso_map(ctx);
+
     uint32_t stack_base = RT32_STACK_TOP - RT32_STACK_SIZE;
     void *host_stack = i686_guest_ptr(ctx, stack_base);
     void *res = mmap(host_stack, RT32_STACK_SIZE, PROT_READ | PROT_WRITE,
@@ -130,7 +98,7 @@ int rt32_stack_setup(i686_ctx_t *ctx, const rt32_elf_info_t *elf_info,
         }
     }
     uint32_t at_random_va   = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
-    uint32_t at_platform_va = push_cstring(ctx, &sp, "v8l");
+    uint32_t at_platform_va = push_cstring(ctx, &sp, "i686");
     const char *execfn_str  = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : guest_argv[0];
     uint32_t at_execfn_va   = push_cstring(ctx, &sp, execfn_str);
     if (at_random_va == 0U || at_platform_va == 0U || at_execfn_va == 0U) {
@@ -148,36 +116,35 @@ int rt32_stack_setup(i686_ctx_t *ctx, const rt32_elf_info_t *elf_info,
 
     sp &= ~0xFU;
 
-    uint32_t hwcap = ARM_HWCAP_HALF | ARM_HWCAP_THUMB | ARM_HWCAP_FAST_MULT |
-                     ARM_HWCAP_VFP | ARM_HWCAP_EDSP | ARM_HWCAP_NEON |
-                     ARM_HWCAP_VFPv3 | ARM_HWCAP_TLS | ARM_HWCAP_VFPv4 |
-                     ARM_HWCAP_IDIVA | ARM_HWCAP_IDIVT | ARM_HWCAP_VFPD32 |
-                     ARM_HWCAP_LPAE;
-    uint32_t hwcap2 = ARM_HWCAP2_AES | ARM_HWCAP2_PMULL | ARM_HWCAP2_SHA1 |
-                      ARM_HWCAP2_SHA2 | ARM_HWCAP2_CRC32;
-    uint32_t auxv[40];
-    size_t   aux_idx = 0;
-#define PUSH_AUX(k, v) do { auxv[aux_idx++] = (k); auxv[aux_idx++] = (v); } while (0)
-    PUSH_AUX(AT_PHDR,     elf_info->phdr_vaddr);
-    PUSH_AUX(AT_PHENT,    elf_info->phent);
-    PUSH_AUX(AT_PHNUM,    elf_info->phnum);
-    PUSH_AUX(AT_PAGESZ,   I686_PAGE_SIZE);
-    PUSH_AUX(AT_BASE,     elf_info->interp_base);
-    PUSH_AUX(AT_FLAGS,    0U);
-    PUSH_AUX(AT_ENTRY,    elf_info->entry);
-    PUSH_AUX(AT_UID,      (uint32_t)getuid());
-    PUSH_AUX(AT_EUID,     (uint32_t)geteuid());
-    PUSH_AUX(AT_GID,      (uint32_t)getgid());
-    PUSH_AUX(AT_EGID,     (uint32_t)getegid());
-    PUSH_AUX(AT_PLATFORM, at_platform_va);
-    PUSH_AUX(AT_HWCAP,    hwcap);
-    PUSH_AUX(AT_CLKTCK,   100U);
-    PUSH_AUX(AT_SECURE,   0U);
-    PUSH_AUX(AT_RANDOM,   at_random_va);
-    PUSH_AUX(AT_HWCAP2,   hwcap2);
-    PUSH_AUX(AT_EXECFN,   at_execfn_va);
-    PUSH_AUX(AT_NULL,     0U);
-#undef PUSH_AUX
+    /* i386 auxv (SPEC D12, E07): i686_auxv_build_i386 emits the pinned
+     * entry order with AT_HWCAP = the D10 CPUID.1.EDX mask and the
+     * vDSO pair only when the mapping above succeeded. */
+    uint32_t at_sysinfo      = 0U;
+    uint32_t at_sysinfo_ehdr = 0U;
+    if (vdso_mapped != 0U) {
+        at_sysinfo_ehdr = ctx->vdso_base;             /* set by i686_vdso_map */
+        at_sysinfo      = i686_vdso_vsyscall_addr(ctx);
+    }
+
+    i686_auxv_i386_args_t aux_args;
+    memset(&aux_args, 0, sizeof(aux_args));
+    aux_args.phdr_vaddr     = elf_info->phdr_vaddr;
+    aux_args.phent          = elf_info->phent; /* 56: sizeof(Elf32_Phdr) */
+    aux_args.phnum          = elf_info->phnum;
+    aux_args.interp_base    = elf_info->interp_base;
+    aux_args.entry          = elf_info->entry;
+    aux_args.at_random_va   = at_random_va;
+    aux_args.at_platform_va = at_platform_va;
+    aux_args.at_execfn_va   = at_execfn_va;
+    aux_args.vdso_base      = at_sysinfo_ehdr;
+    aux_args.vsyscall_addr  = at_sysinfo;
+
+    uint32_t auxv[I686_AUXV_I386_MAX_WORDS];
+    size_t   aux_idx = i686_auxv_build_i386(&aux_args, auxv,
+                                            I686_AUXV_I386_MAX_WORDS);
+    if (aux_idx == 0U) {
+        return -1;
+    }
 
     /* Frame layout: argc, argv[0..argc-1], NULL, envp[0..envc-1], NULL, auxv[] (16B-aligned) */
     size_t total_words   = 1U + ((size_t)argc + 1U) + ((size_t)envc + 1U) + aux_idx;
