@@ -27,6 +27,7 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -437,23 +438,7 @@ static void free_strv(char **v)
 
 static void guest_regions_teardown(i686_ctx_t *ctx)
 {
-    size_t r, w = 0U;
-
-    for (r = 0U; r < ctx->region_count; r++) {
-        i686_region_t *reg = &ctx->regions[r];
-        int keep = strcmp(reg->name, "[vdso]") == 0;
-        if (!keep) {
-            (void)munmap(i686_guest_ptr(ctx, reg->start),
-                         (size_t)(reg->end - reg->start));
-        } else {
-            ctx->regions[w] = *reg;
-            w++;
-        }
-    }
-    ctx->region_count = w;
-    ctx->brk_base = 0U;
-    ctx->brk_curr = 0U;
-    ctx->mmap_cursor = 0U; /* rt32_vm re-seeds the cursor on next mmap */
+    rt32_vm_reset_for_exec(ctx);
 }
 
 static int64_t r_execve(i686_ctx_t *ctx)

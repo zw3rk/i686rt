@@ -156,8 +156,9 @@ static int h_imul3(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint32_t imm = insn->opnd[2] == I686_OPND_I8SX
                        ? (uint32_t)md_sext(insn->imm & 0xFFU, 8)
                        : (insn->pfx_opsize ? (insn->imm & 0xFFFFU) : insn->imm);
-    int64_t p = md_sext(x86_reg_read(ctx, insn->modrm_reg, w), w) *
-                md_sext(x86_rm_read(ctx, insn, w), w) * md_sext(imm, w);
+    /* dst(Gv) is the DESTINATION only: Gv = Ev * imm (two-factor product;
+     * the old three-factor product poisoned every SWAR string scan). */
+    int64_t p = md_sext(x86_rm_read(ctx, insn, w), w) * md_sext(imm, w);
     uint32_t res = (uint32_t)p;
 
     x86_reg_write(ctx, insn->modrm_reg, w, res);

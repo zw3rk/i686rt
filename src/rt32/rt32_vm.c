@@ -492,6 +492,36 @@ int rt32_vm_record_region(i686_ctx_t *ctx, uint32_t start, uint32_t end,
     return rc;
 }
 
+
+/* Exec teardown: drop every region except the vdso from the AUTHORITATIVE
+ * global list (ctx->regions is a mirror; vm_sync_from_ctx never copies it
+ * back, so a ctx-only clear is undone by the next vm_sync_to_ctx). */
+void rt32_vm_reset_for_exec(i686_ctx_t *ctx)
+{
+    vm_lock_acquire();
+    size_t w = 0U;
+    for (size_t r = 0U; r < g_vm_region_count; r++) {
+        if (strcmp(g_vm_regions[r].name, "[vdso]") == 0) {
+            g_vm_regions[w] = g_vm_regions[r];
+            w++;
+        }
+    }
+    g_vm_region_count = w;
+    g_vm_brk_base  = 0U;
+    g_vm_brk_curr  = 0U;
+    g_vm_mmap_cursor = 0U;
+    vm_lock_release();
+
+    /* Mirror the cleared state into the caller's ctx. */
+    ctx->brk_base    = 0U;
+    ctx->brk_curr    = 0U;
+    ctx->mmap_cursor = 0U;
+    ctx->region_count = (w <= I686_MAX_REGIONS) ? w : I686_MAX_REGIONS;
+    if (ctx->region_count > 0U) {
+        memcpy(ctx->regions, g_vm_regions, ctx->region_count * sizeof(i686_region_t));
+    }
+}
+
 uint32_t rt32_vm_brk(i686_ctx_t *ctx, uint32_t new_brk)
 {
     if (!ctx) {

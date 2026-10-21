@@ -43,6 +43,7 @@ int      rt32_vm_init(i686_ctx_t *ctx, uint64_t requested_window);
 int      rt32_vm_record_region(i686_ctx_t *ctx, uint32_t start, uint32_t end,
                               uint32_t prot, uint32_t flags, const char *name);
 uint32_t rt32_vm_brk(i686_ctx_t *ctx, uint32_t new_brk);
+void rt32_vm_reset_for_exec(i686_ctx_t *ctx);
 uint32_t rt32_vm_mmap2(i686_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
                        uint32_t flags, int fd, uint32_t pgoffset);
 int      rt32_vm_mprotect(i686_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot);
