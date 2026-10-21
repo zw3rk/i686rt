@@ -186,7 +186,7 @@ static void cmps_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
         uint32_t a = mem_read(ctx, str_addr(ctx, I686_REG_ESI, src_base, addr16), w);
         uint32_t b = mem_read(ctx, str_addr(ctx, I686_REG_EDI, dst_base, addr16), w);
 
-        i686_flags_sub(ctx, a, b, w);
+        i686_flags_sub(ctx, a & mask, b & mask, w * 8U);
         str_bump(ctx, I686_REG_ESI, step, addr16);
         str_bump(ctx, I686_REG_EDI, step, addr16);
         if (is_rep) {
@@ -271,10 +271,15 @@ static void scas_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
     uint32_t remaining = iteration_count(ctx, insn);
 
     while (remaining > 0U) {
-        uint32_t a = x86_reg_read(ctx, I686_REG_EAX, w);
+        /* SCAS compares only the width-sized low bits of EAX; the lazy
+         * SUB must carry the masked operands (and a BITS width) so a
+         * later jcc materializes the width-correct ZF, not a 32-bit one
+         * polluted by upper EAX garbage (S2 fix: musl strrchr relies on
+         * exactly this after repne scasb). */
+        uint32_t a = x86_reg_read(ctx, I686_REG_EAX, w) & mask;
         uint32_t b = mem_read(ctx, str_addr(ctx, I686_REG_EDI, dst_base, addr16), w);
 
-        i686_flags_sub(ctx, a, b, w);
+        i686_flags_sub(ctx, a, b, w * 8U);
         str_bump(ctx, I686_REG_EDI, step, addr16);
         if (is_rep) {
             rep_count_dec(ctx, insn);

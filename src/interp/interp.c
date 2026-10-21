@@ -14,6 +14,7 @@
 #include <stdlib.h>
 
 #include "interp/interp.h"
+#include "os/marshal.h"
 
 /* Long i686_handle_syscall / int i686_syscall_is_exit (src/os/syscalls.c) */
 long i686_handle_syscall(i686_ctx_t *ctx);
@@ -111,6 +112,13 @@ int i686_interp_run(i686_ctx_t *ctx)
                                   ctx->gpr[I686_REG_EBX],
                                   ctx->gpr[I686_REG_ECX],
                                   ctx->gpr[I686_REG_EDX], rv);
+                } else if (nr == 5 || nr == 195 || nr == 196 || nr == 383 ||
+                           nr == 11) {
+                    /* Raw arg only: fetching the string can fault on
+                     * garbage pointers until Phase 4 installs the
+                     * fault-to-EFAULT machinery. */
+                    (void)fprintf(stderr, "S %ld(%08x) -> %ld\n", nr,
+                                  ctx->gpr[I686_REG_EBX], rv);
                 } else {
                     (void)fprintf(stderr, "S %ld -> %ld\n", nr, rv);
                 }

@@ -217,6 +217,30 @@ static int run_guest(i686_ctx_t *ctx)
     ctx->seg_base[I686_SEG_FS] = 0;
     ctx->seg_base[I686_SEG_GS] = 0;
 
+#ifdef I686RT_STRTRACE
+    {
+        uint32_t *fr = (uint32_t *)i686_guest_ptr(ctx, ctx->gpr[I686_REG_ESP]);
+        uint32_t argc2 = fr[0];
+        uint32_t k;
+        for (k = 0U; k < argc2 && k < 16U; k++) {
+            const char *g = (const char *)i686_guest_ptr(ctx, fr[1 + k]);
+            (void)fprintf(stderr, "ARGV %u @%08x = \"%s\"\n", k, fr[1 + k], g);
+        }
+        {
+            uint32_t q;
+            for (q = 0U; q < 0x60U; q += 16U) {
+                const uint8_t *b = (const uint8_t *)i686_guest_ptr(ctx, 0xdfffff00U + q);
+                uint32_t j;
+                (void)fprintf(stderr, "D %08x:", 0xdfffff00U + q);
+                for (j = 0U; j < 16U; j++) {
+                    (void)fprintf(stderr, " %02x", b[j]);
+                }
+                (void)fprintf(stderr, "\n");
+            }
+        }
+    }
+#endif
+
     if (ctx->engine == I686_ENGINE_DBT) {
         (void)fprintf(stderr, "i686rt: dbt engine lands in phase 3; "
                               "using interpreter\n");
@@ -252,6 +276,28 @@ int main(int argc, char **argv)
     ctx.host_envp = environ;
 
     st = run_guest(&ctx);
+#ifdef I686RT_STRTRACE
+    {
+        /* dump printable strings in the guest heap for tokenizer forensics */
+        uint32_t q;
+        unsigned run = 0;
+        char buf[80];
+        for (q = 0x40002000U; q < 0x40004000U; q++) {
+            uint8_t ch = *(const uint8_t *)i686_guest_ptr(&ctx, q);
+            int printable = ch >= 0x20U && ch < 0x7fU;
+            if (printable && run < sizeof(buf) - 1U) {
+                buf[run++] = (char)ch;
+            } else {
+                if (run >= 4U) {
+                    buf[run] = 0;
+                    (void)fprintf(stderr, "HS %08x \"%s\"\n", q - run, buf);
+                }
+                run = 0;
+            }
+        }
+    }
+#endif
+
     if (st < 0) {
         return 1;
     }

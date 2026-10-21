@@ -11,6 +11,7 @@
  * the /r reg field to a concrete op through i686_group_tab_1b/_0f.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "x86/decode.h"
@@ -25,12 +26,20 @@ static uint8_t fetch8(i686_ctx_t *ctx, uint32_t va)
     return *p;
 }
 
-/* 8-bit register file mapping: 0..3 = AL,CL,DL,BL; 4..7 = AH,CH,DH,BH. */
+/* 8-bit register file mapping: 0..3 = AL,CL,DL,BL (low bytes of
+ * EAX..EBX); 4..7 = AH,CH,DH,BH (HIGH bytes of EAX,ECX,EDX,EBX — NOT
+ * of ESP..EDI).  S2 fix: the old `gpr[reg & 7]` high-byte mapping sent
+ * AH-class accesses into ESP/EBP/ESI/EDI, corrupting the guest stack. */
 uint32_t x86_reg_read(const i686_ctx_t *ctx, uint8_t reg, unsigned width)
 {
-    uint32_t v = ctx->gpr[reg & 7U];
+    uint32_t v;
+    if (width == 8U && reg >= 4U) {
+        v = ctx->gpr[reg - 4U];
+        return (v >> 8) & 0xffU;
+    }
+    v = ctx->gpr[reg & 7U];
     if (width == 8) {
-        return (reg < 4U) ? (v & 0xffU) : ((v >> 8) & 0xffU);
+        return v & 0xffU;
     }
     if (width == 16) {
         return v & 0xffffU;
@@ -40,11 +49,17 @@ uint32_t x86_reg_read(const i686_ctx_t *ctx, uint8_t reg, unsigned width)
 
 void x86_reg_write(i686_ctx_t *ctx, uint8_t reg, unsigned width, uint32_t val)
 {
-    uint32_t old = ctx->gpr[reg & 7U];
+    uint32_t old;
     uint32_t v;
+    if (width == 8U && reg >= 4U) {
+        old = ctx->gpr[reg - 4U];
+        v = (old & ~0xff00U) | ((val & 0xffU) << 8);
+        ctx->gpr[reg - 4U] = v;
+        return;
+    }
+    old = ctx->gpr[reg & 7U];
     if (width == 8) {
-        v = (reg < 4U) ? ((old & ~0xffU) | (val & 0xffU))
-                       : ((old & ~0xff00U) | ((val & 0xffU) << 8));
+        v = (old & ~0xffU) | (val & 0xffU);
     } else if (width == 16) {
         v = (old & 0xffff0000U) | (val & 0xffffU);
     } else {
@@ -90,6 +105,11 @@ uint32_t x86_ea_compute(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static uint32_t mem_load(i686_ctx_t *ctx, uint32_t va, unsigned width)
 {
+#ifdef I686RT_STRTRACE
+    if ((va >= 0xdffffc00U && va < 0xdfffff80U) || (va >= 0x40001000U && va < 0x40005000U) || (va >= 0x8150000U && va < 0x8160000U)) {
+        fprintf(stderr, "R %08x w%u at eip=%08x\n", va, width, ctx->eip);
+    }
+#endif
     const volatile uint8_t *p =
         (const volatile uint8_t *)i686_guest_ptr(ctx, va);
     uint8_t buf[4];

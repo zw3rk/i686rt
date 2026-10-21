@@ -97,6 +97,7 @@
  * src/os/syscalls_i386.h (quoted as [nr] {"name"}). */
 #define NR_unlink        10U /* [10]  {"unlink"}       */
 #define NR_open           5U /* [5]   {"open"}         */
+#define NR_writev         146U /* [146] {"writev"}       */
 #define NR_close          6U /* [6]   {"close"}        */
 #define NR_lseek         19U /* [19]  {"lseek"}        */
 #define NR_link           9U /* [9]   {"link"}         */
@@ -1025,6 +1026,54 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
 /* Registry adapters (args from EBX..EBP per the i386 syscall ABI)      */
 /* ------------------------------------------------------------------ */
 
+
+/* writev(146) — iovec array in guest memory (L2f passthrough family,
+ * S2 coordinator addition: busybox sh error paths print via writev). */
+struct i686_iov_local {
+    uint32_t base;
+    uint32_t len;
+};
+
+static int64_t r_writev(i686_ctx_t *ctx)
+{
+    int fd = (int)ctx->gpr[I686_REG_EBX];
+    uint32_t iov_va = ctx->gpr[I686_REG_ECX];
+    uint32_t cnt = ctx->gpr[I686_REG_EDX];
+    int64_t total = 0;
+    uint32_t i;
+
+    if (cnt > 1024U) {
+        return -EINVAL; /* UIO_MAXIOV */
+    }
+    for (i = 0U; i < cnt; i++) {
+        struct i686_iov_local iov;
+        char stk[512];
+        uint32_t off;
+        if (i686_copy_from_guest(ctx, &iov, iov_va + 8U * i, sizeof(iov)) != 0) {
+            return -EFAULT;
+        }
+        for (off = 0U; off < iov.len; off += sizeof(stk)) {
+            uint32_t chunk = iov.len - off;
+            ssize_t n;
+            if (chunk > sizeof(stk)) {
+                chunk = (uint32_t)sizeof(stk);
+            }
+            if (i686_copy_from_guest(ctx, stk, iov.base + off, chunk) != 0) {
+                return -EFAULT;
+            }
+            n = write(fd, stk, chunk);
+            if (n < 0) {
+                return (total > 0) ? total : -(int64_t)errno;
+            }
+            total += n;
+            if ((size_t)n < chunk) {
+                return total;
+            }
+        }
+    }
+    return total;
+}
+
 static int64_t r_open(i686_ctx_t *ctx)
 {
     return sys_open(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
@@ -1357,6 +1406,7 @@ void i686_syscalls_pass_init(void)
      *   execve(11)/execveat(358) — coordinator in-process exec at S2.
      * getpid(20) stays in src/os/syscalls.c (Phase 1 adapter). */
     i686_sys_register(NR_open, r_open);
+    i686_sys_register(NR_writev, r_writev);
     i686_sys_register(NR_close, r_close);
     i686_sys_register(NR_lseek, r_lseek);
     i686_sys_register(NR_unlink, r_unlink);
