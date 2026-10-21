@@ -63,3 +63,21 @@ after 2 failed attempts / needed file outside ownership / ambiguity).
   the dispatch chain (see master translate.c); lanes only add the file.
   Unit: docker arm64 micro-driver comparing against a host __sync
   oracle over a shared window page, ~12 cases → L4C OK.
+
+## S4 progress (2026-10-21)
+
+- All three lanes merged. Coordinator wiring landed: sigreturn(119)/
+  rt_sigreturn(173) registered; host SIGSEGV/SIGBUS/SIGILL/SIGFPE
+  handler + sigsetjmp checkpoint converts window faults into guest
+  FAULT exits -> i686_deliver_sync; async pending delivery at interp
+  safe points; the two frame bugs L4a flagged fixed (rt pinfo/puc
+  fixed frame VAs; sigreturn non-RT base = frame+8 for the popped
+  pretcode+sig convention); blocked-mask via i686_current_ctx.
+- test_p4_threads_signals: ORACLE PASS (qemu 386). Under i686rt interp:
+  rt_sigaction OK, then hangs in a tight loop around guest 0x080492xx
+  after sigaction setup — 54k traced insns, no further syscalls.
+  Suspects: (a) futex WAIT returns immediately (v1 stopgap) so the
+  parent spin-waits on a value the child never writes, or the child
+  host-thread never runs/crashes; (b) fault->handler->sigreturn loop.
+  Next: trace the child thread / check clone child actually starts;
+  fix futex FUTEX_WAIT to actually block on a host futex.
