@@ -170,3 +170,20 @@ aarch64 docker VM with the recorded lima deviation).
   memory values feeding it). 37k-insn crash later is downstream
   corruption. Next: gdb both builds side by side at guest 0x0806320d,
   compare ctx->eflags/lazy state and guest memory at [eax+ecx-1].
+
+## RC2 debug state (turn N)
+
+- Fixed and working after the xchg fix: busybox `echo hi` end-to-end.
+- sh `-c`/script modes: ash tokenizes multi-word lines as ONE word
+  ("echo ok" exec'd whole). qemu-vs-ours checkpoint diff (tool: parse
+  qemu -d in_asm,exec,nochain Trace lines for TB-start eips; walk our
+  T-trace; collapse qemu rep-chunking repeats) pins the FIRST semantic
+  divergence to musl init env processing at 0x81177b9: our getenv-family
+  lookup returns NULL where qemu finds a value. The compare engine is
+  the strncmp at 0x8113904 (stack-slot pointer pairs at (%esp)/0x1c(%esp),
+  advanced by addl $1,(%esp) / addl $1,0x1c(%esp) at 0x8113922).
+  Symptom cluster: repeated same-address reads at the s2 pointer.
+  Next: gdb dump BOTH slots (%esp and %esp+0x1c) plus al/cl per
+  iteration at 0x8113932 for the LC_ALL-family lookups; the mismatching
+  iteration is the bug. q3 trace: /tmp/i686smoke/qs3.txt; ours:
+  /tmp/scr1.txt (sh /w/script).
