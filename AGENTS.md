@@ -9,6 +9,21 @@ technical spec, §4 phases and §4.C concurrency plan); `GOAL.md` adds the
 coordinator/worker-lane workflow. `../a32rt` and `../hyper-linux` are
 read-only references.
 
+## Test process lifecycle
+
+- Bound every test and debugger run by an explicit wall-clock deadline,
+  including inside Docker when possible. Give exploratory containers CPU
+  and memory limits appropriate to the test.
+- Track each container with a unique name or `--cidfile`; arrange cleanup
+  by that identity on completion, timeout, cancellation, and error. Stop
+  and remove only containers owned by the current task.
+- ZCode `TaskStop` success, a host `timeout`, and Docker `--rm` do not prove
+  the container exited. Verify with `docker inspect` or `docker ps` after
+  cancelling a job, before retrying, and before ending the session. Stop
+  surviving containers explicitly; `--rm` only cleans up after exit.
+- Stop a hung run before launching another diagnostic. Keep bounded logs
+  and diagnose the hang instead of accumulating duplicate test processes.
+
 ## Project invariants
 
 - `i686rt` is a standalone, zero-dependency Curated C11 + minimal AArch64

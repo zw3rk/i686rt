@@ -81,3 +81,22 @@ after 2 failed attempts / needed file outside ownership / ambiguity).
   host-thread never runs/crashes; (b) fault->handler->sigreturn loop.
   Next: trace the child thread / check clone child actually starts;
   fix futex FUTEX_WAIT to actually block on a host futex.
+
+## Diagnostic cleanup (2026-10-22)
+
+Six Docker diagnostics launched on October 21 survived their ZCode
+`TaskStop` acknowledgments: `festive_haibt`, `compassionate_carver`,
+`distracted_antonelli`, `angry_sinoussi`, `friendly_hawking`, and
+`reverent_shirley`. Four i686rt processes consumed about one CPU core each
+for 16–19 hours; the two QEMU probes were blocked in futex waits. The main
+session ended with an error at 14:55 KST on October 21, and its worker had
+already completed. Orphaned 120/300-second host timeout wrappers also
+survived, so neither task cancellation nor host timeout was effective
+container cleanup.
+
+All six containers were explicitly stopped at 07:18 KST on October 22 at
+the user's request. Their `--rm` policy removes container-local state;
+host-mounted test files remain. The S4 hang above remains unresolved.
+Before resuming diagnostics, follow the test process lifecycle rules in
+`AGENTS.md`: bound runs, clean up by container identity, and verify exit
+directly before retrying or leaving the session.
