@@ -34,6 +34,13 @@ void i686_interp_register(uint16_t op, i686_interp_fn fn);
  * fault, fatal undecodable).  Returns the last exit_reason. */
 int i686_interp_run(i686_ctx_t *ctx);
 
+/* Execute exactly ONE guest insn (DBT fallback, D2). Returns 0, or the
+ * terminal exit reason. */
+int i686_interp_step(i686_ctx_t *ctx);
+
+/* DBT engine loop (src/dbt/engine.c). */
+int i686_dbt_run(i686_ctx_t *ctx);
+
 /* Per-module handler registration (defined by the handler files). */
 void i686_interp_alu_init(void);        /* src/interp/h_alu.c       */
 void i686_interp_mov_init(void);        /* src/interp/h_mov.c       */

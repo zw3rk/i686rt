@@ -127,6 +127,25 @@ def print_context(path, events, index):
         print("  > event %-6d %s: <end of trace>" % (index, path))
 
 
+def compare_native(a_events, b_events, fa, fb):
+    """DBT-native mode: one side has no T events (native execution, no
+    per-insn trace). Compare the syscall (S) sequences only."""
+    a_s = [e for e in a_events if e.kind == 'S']
+    b_s = [e for e in b_events if e.kind == 'S']
+    n = min(len(a_s), len(b_s))
+    for i in range(n):
+        if a_s[i].key != b_s[i].key:
+            print(f"DIFFTRACE: DIVERGENCE (native syscall compare) at syscall {i}")
+            print(f"  a: {a_s[i].raw}   b: {b_s[i].raw}")
+            return 1
+    if len(a_s) != len(b_s):
+        print(f"DIFFTRACE: DIVERGENCE syscall count a={len(a_s)} b={len(b_s)}")
+        return 1
+    print(f"DIFFTRACE: EQUAL (DBT-native: syscall traces only) "
+          f"events: {len(a_s)}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Compare two i686rt I686RT_TRACE streams and report "
@@ -145,6 +164,11 @@ def main(argv=None):
 
     ta, sa = counts(events_a)
     tb, sb = counts(events_b)
+
+    # DBT-native mode: one side ran natively (no per-insn trace); the
+    # meaningful differential is the syscall sequence.
+    if (ta == 0) != (tb == 0):
+        return compare_native(events_a, events_b, args.file_a, args.file_b)
 
     prefix = 0
     limit = min(len(events_a), len(events_b))

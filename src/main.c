@@ -241,14 +241,17 @@ static int run_guest(i686_ctx_t *ctx)
     }
 #endif
 
-    if (ctx->engine == I686_ENGINE_DBT) {
-        (void)fprintf(stderr, "i686rt: dbt engine lands in phase 3; "
-                              "using interpreter\n");
-        ctx->engine = I686_ENGINE_INTERP;
+    if (ctx->engine < 0) {
+        ctx->engine = I686_ENGINE_INTERP; /* default oracle (D2) */
     }
-
     i686_interp_init_all();
-    r = i686_interp_run(ctx);
+    if (ctx->engine == I686_ENGINE_DBT) {
+        extern void i686_dbt_trace_enable(int);
+        i686_dbt_trace_enable(getenv("I686RT_TRACE") != NULL);
+        r = i686_dbt_run(ctx);
+    } else {
+        r = i686_interp_run(ctx);
+    }
     if (r == I686_EXIT_SYSCALL) {
         return (int)(ctx->exit_arg & 0xffU);
     }
@@ -262,7 +265,7 @@ int main(int argc, char **argv)
     int st;
 
     memset(&ctx, 0, sizeof(ctx));
-    ctx.engine = I686_ENGINE_INTERP; /* interpreter is the default oracle (D2) */
+    ctx.engine = -1; /* unset: --engine or I686RT_ENGINE; INTERP default */
 
     path_idx = parse_args(&ctx, argc, argv);
     if (path_idx < 0) {

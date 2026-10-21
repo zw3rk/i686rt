@@ -66,6 +66,14 @@ static inline unsigned i686_w(unsigned x86_reg) { return x86_reg & 7U; }
  * docs/lanes/phase-3.md). Each returns 0 on success, -1 when the insn
  * must fall back to interpret-one (D2): translate.c then emits an
  * UNDEF exit with the insn length recorded. */
+/* Block translator (src/dbt/translate.c): emits one block starting at
+ * eip into code (cap bytes); returns emitted length or 0. */
+size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
+                          size_t cap);
+
+/* DBT engine loop (src/dbt/engine.c). */
+int i686_dbt_run(i686_ctx_t *ctx);
+
 int i686_emit_alu(i686_emit_ctx_t *e, const x86_insn_t *insn);
 int i686_emit_mov(i686_emit_ctx_t *e, const x86_insn_t *insn);
 int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn);

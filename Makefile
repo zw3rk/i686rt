@@ -18,13 +18,14 @@ endif
 # src/main.c calls setenv(3), which musl hides under strict -std=c11 unless a
 # POSIX feature-test macro is visible; expose exactly that (keeps -pedantic
 # and every prescribed warning intact).
-CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc
+CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 LDFLAGS ?= -static-pie
 
 # src/main.c plus every vendored rt32 core file present; src/rt32/ arrives
 # with lane L0a, so pre-merge this globs to nothing and main.c builds alone.
 SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
-        $(wildcard src/interp/*.c) $(wildcard src/os/*.c)
+        $(wildcard src/interp/*.c) $(wildcard src/os/*.c) \
+        $(wildcard src/dbt/*.c) src/trampoline.S
 HDRS := src/i686rt.h include/a32host.h $(wildcard src/rt32/*.h) \
          $(wildcard src/x86/*.h) $(wildcard src/interp/*.h) $(wildcard src/os/*.h)
 

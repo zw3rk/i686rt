@@ -61,6 +61,49 @@ static void diag(const char *what, const i686_ctx_t *ctx, uint16_t op)
                   what, ctx->eip, i686_op_name(op), ctx->gpr[I686_REG_ESP]);
 }
 
+/* DBT fallback hook: execute exactly ONE guest insn via the interpreter
+ * handlers (D2). Returns 0 on success, or the terminal exit reason. */
+int i686_interp_step(i686_ctx_t *ctx)
+{
+    x86_insn_t insn;
+    i686_interp_fn fn;
+    int r;
+
+    if (x86_decode(ctx, ctx->eip, &insn) != 0) {
+        ctx->exit_reason = I686_EXIT_UNDEF;
+        ctx->exit_arg = 0;
+        diag("undecodable instruction", ctx, 0);
+        return I686_EXIT_UNDEF;
+    }
+    fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
+    if (fn == NULL) {
+        ctx->exit_reason = I686_EXIT_UNDEF;
+        ctx->exit_arg = insn.op;
+        diag("unimplemented opcode", ctx, insn.op);
+        return I686_EXIT_UNDEF;
+    }
+    r = fn(ctx, &insn);
+    ctx->blocks_executed++;
+    if (r == I686_INTERP_CONTINUE) {
+        return 0;
+    }
+    switch (r) {
+    case I686_EXIT_SYSCALL: {
+        long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
+        long rv = i686_handle_syscall(ctx);
+        if (i686_syscall_is_exit(nr)) {
+            ctx->exit_reason = I686_EXIT_SYSCALL;
+            ctx->exit_arg = (uint32_t)rv;
+            return I686_EXIT_SYSCALL;
+        }
+        return 0;
+    }
+    default:
+        ctx->exit_reason = (uint32_t)r;
+        return r;
+    }
+}
+
 int i686_interp_run(i686_ctx_t *ctx)
 {
     for (;;) {

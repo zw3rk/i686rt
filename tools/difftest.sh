@@ -75,10 +75,10 @@ echo "difftest: runner=$runner guest=$1" >&2
 # Two engine runs of the same guest.  I686RT_* plumbing (WINDOW, SYSROOT,
 # CACHE, X87, ...) passes through from the environment to both runs.
 set +e
-I686RT_ENGINE=interp I686RT_TRACE=1 "$runner" -- "$@" \
+I686RT_ENGINE=interp I686RT_TRACE=1 I686RT_DIFFPAD=x "$runner" -- "$@" \
     >"$tmp/stdout.interp" 2>"$tmp/trace.interp"
 rc_interp=$?
-I686RT_ENGINE=dbt I686RT_TRACE=1 "$runner" -- "$@" \
+I686RT_ENGINE=dbt I686RT_TRACE=1 I686RT_DIFFPAD=xxxx "$runner" -- "$@" \
     >"$tmp/stdout.dbt" 2>"$tmp/trace.dbt"
 rc_dbt=$?
 set -e

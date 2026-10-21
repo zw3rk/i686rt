@@ -179,6 +179,55 @@ static void l3c_flags_to_nzcv(i686_emit_ctx_t *e)
 {
     a64_buf_t *b = &e->buf;
 
+    /* S3 seam fix: L3a ops leave a pending lazy descriptor; materialize
+     * it into ctx->eflags before rebuilding NZCV from memory. Guest
+     * GPRs park in ctx->gpr[0..7] across the AAPCS call. */
+    {
+        extern void i686_dbt_flags_sync(i686_ctx_t *);
+        a64_emit_str_imm_w(b, 0U, A64_XCTX, 0U);
+        a64_emit_str_imm_w(b, 1U, A64_XCTX, 4U);
+        a64_emit_str_imm_w(b, 2U, A64_XCTX, 8U);
+        a64_emit_str_imm_w(b, 3U, A64_XCTX, 12U);
+        a64_emit_str_imm_w(b, 4U, A64_XCTX, 16U);
+        a64_emit_str_imm_w(b, 5U, A64_XCTX, 20U);
+        a64_emit_str_imm_w(b, 6U, A64_XCTX, 24U);
+        a64_emit_str_imm_w(b, 7U, A64_XCTX, 28U);
+        /* Full 64-bit helper address into x17: raw X-form MOVZ/MOVK
+         * (W-forms zero the upper half — fatal under static-PIE). */
+        {
+            uintptr_t fn = (uintptr_t)&i686_dbt_flags_sync;
+            unsigned i;
+            for (i = 0U; i < 4U; i++) {
+                uint32_t hw = (uint32_t)((fn >> (16U * i)) & 0xFFFFU);
+                uint32_t insn;
+                if (i == 0U) {
+                    insn = 0xD2800000U; /* MOVZ Xd */
+                } else if (hw != 0U) {
+                    insn = 0xF2800000U; /* MOVK Xd */
+                } else {
+                    continue;
+                }
+                a64_emit(b, insn | (i << 21) | (hw << 5) | 17U);
+            }
+        }
+        /* x0 = ctx (AAPCS arg0; MOV X0,X19 = AA1F0260). BLR x17 clobbers
+         * x30 (lr): park the block's return address in callee-saved x28
+         * (MOV X28,X30 = AA1F03DC) and restore after (MOV X30,X28 =
+         * AA1F039E), or the exit `ret` returns to the post-call insn. */
+        a64_emit(b, 0xAA1F0260U); /* x0 = x19 */
+        a64_emit(b, 0xAA1F03DCU); /* x28 = x30 */
+        a64_emit(b, 0xD63F0220U); /* blr x17 */
+        a64_emit(b, 0xAA1F039EU); /* x30 = x28 */
+        a64_emit_ldr_imm_w(b, 0U, A64_XCTX, 0U);
+        a64_emit_ldr_imm_w(b, 1U, A64_XCTX, 4U);
+        a64_emit_ldr_imm_w(b, 2U, A64_XCTX, 8U);
+        a64_emit_ldr_imm_w(b, 3U, A64_XCTX, 12U);
+        a64_emit_ldr_imm_w(b, 4U, A64_XCTX, 16U);
+        a64_emit_ldr_imm_w(b, 5U, A64_XCTX, 20U);
+        a64_emit_ldr_imm_w(b, 6U, A64_XCTX, 24U);
+        a64_emit_ldr_imm_w(b, 7U, A64_XCTX, 28U);
+    }
+
     a64_emit_ldr_imm_w(b, L3C_W8, A64_XCTX, 36U); /* ctx->eflags */
     /* w9 = 0x0FFFFFFF (NZCV low 27 architectural bits are RES1) */
     a64_emit_movz_w(b, L3C_W9, 0xFFFFU, 0U);
