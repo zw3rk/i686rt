@@ -82,6 +82,7 @@
 
 #include "os/marshal.h"
 #include "os/proc.h"
+#include "os/threads.h"
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -485,6 +486,8 @@ static struct {
     uint32_t restorer;
     uint64_t mask;
 } s_sigact[65];
+
+uint64_t i686_sigmask_get(void); /* fwd (below) */
 
 /* Phase 4: exported view for src/os/signals_i386.c (frame builder). */
 struct i686_gsigaction {
@@ -1483,4 +1486,12 @@ void i686_syscalls_pass_init(void)
     i686_sys_register(NR_set_tid_address, r_set_tid_address);
     i686_sys_register(NR_personality, r_personality);
     i686_sys_register(NR_futex, r_futex);
+}
+
+/* Guest blocked-sigmask view for signal delivery (ctx->sig_mask is the
+ * authoritative store maintained by sys_rt_sigprocmask). */
+uint64_t i686_sigmask_get(void)
+{
+    i686_ctx_t *ctx = i686_current_ctx();
+    return (ctx != NULL) ? ctx->sig_mask : 0ULL;
 }

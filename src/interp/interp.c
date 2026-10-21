@@ -10,11 +10,47 @@
  * stop with a diagnostic — never an abort (D2).
  */
 
+#include <setjmp.h>
+#include <string.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "interp/interp.h"
 #include "os/marshal.h"
+
+/* Host-fault -> guest-fault checkpoint (Phase 4).  The handler runs on
+ * the faulting host thread; sigsetjmp/siglongjmp restores the interp
+ * loop with the fault recorded. */
+static sigjmp_buf s_fault_jmp;
+static volatile sig_atomic_t s_in_run;
+static volatile uint64_t s_fault_addr;
+
+static volatile sig_atomic_t s_fault_sig;
+
+static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
+{
+    (void)uc_;
+    if (s_in_run) {
+        s_fault_addr = (uint64_t)(uintptr_t)si->si_addr;
+        s_fault_sig = sig;
+        siglongjmp(s_fault_jmp, 1);
+    }
+    _exit(128 + sig);
+}
+
+static void host_faults_install(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = host_fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    (void)sigaction(SIGSEGV, &sa, NULL);
+    (void)sigaction(SIGBUS, &sa, NULL);
+    (void)sigaction(SIGILL, &sa, NULL);
+    (void)sigaction(SIGFPE, &sa, NULL);
+}
 
 /* Long i686_handle_syscall / int i686_syscall_is_exit (src/os/syscalls.c) */
 long i686_handle_syscall(i686_ctx_t *ctx);
@@ -106,7 +142,33 @@ int i686_interp_step(i686_ctx_t *ctx)
 
 int i686_interp_run(i686_ctx_t *ctx)
 {
+    static int s_faults_installed;
+    if (!s_faults_installed) {
+        s_faults_installed = 1;
+        host_faults_install();
+    }
+    s_in_run = 1;
     for (;;) {
+        if (sigsetjmp(s_fault_jmp, 1) != 0) {
+            /* Host fault inside guest execution: map to a guest exit. */
+            uint64_t fa = (uint64_t)s_fault_addr;
+            s_in_run = 1;
+            if (fa >= ctx->guest_base &&
+                fa < ctx->guest_base + 0x100000000ULL) {
+                ctx->fault_addr = (uint32_t)(fa - ctx->guest_base);
+            } else {
+                ctx->fault_addr = (uint32_t)fa;
+            }
+            {
+                extern int i686_deliver_sync(i686_ctx_t *, int);
+                if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
+                    continue; /* guest handler installed; resume at it */
+                }
+                diag("guest fault (host)", ctx, 0);
+                ctx->exit_reason = I686_EXIT_FAULT;
+                return I686_EXIT_FAULT;
+            }
+        }
         x86_insn_t insn;
         i686_interp_fn fn;
         int r;
@@ -140,8 +202,9 @@ int i686_interp_run(i686_ctx_t *ctx)
 
         if (r == I686_INTERP_CONTINUE) {
             if (ctx->pending_signals != 0U) {
-                /* Signal delivery lands in Phase 4; safe-point check kept
-                 * so the contract is visible from day one. */
+                /* Async delivery: lowest pending, unblocked signal. */
+                extern int i686_deliver_pending(i686_ctx_t *);
+                (void)i686_deliver_pending(ctx);
             }
             continue;
         }

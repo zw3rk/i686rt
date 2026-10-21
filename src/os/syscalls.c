@@ -544,6 +544,12 @@ void i686_syscalls_init_once(void)
     i686_sys_register(I686__NR_uname, r_uname);
     i686_sys_register(I686__NR_getpid, r_getpid);
     i686_sys_register(I686__NR_execve, r_execve);
+    {
+        extern int64_t i686_sys_sigreturn(i686_ctx_t *);
+        extern int64_t i686_sys_rt_sigreturn(i686_ctx_t *);
+        i686_sys_register(I686__NR_sigreturn, i686_sys_sigreturn);
+        i686_sys_register(I686__NR_rt_sigreturn, i686_sys_rt_sigreturn);
+    }
     i686_sys_register(NR_fork, r_fork);
     i686_sys_register(NR_vfork, r_fork);
     i686_sys_register(NR_wait4, r_wait4);

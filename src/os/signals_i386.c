@@ -110,15 +110,16 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
 
     if (sa_siginfo) {
         /* rt frame: sc lives in ucontext at frame+0x90+20 */
-        memcpy(i686_guest_ptr(ctx, frame_va + 0x10 - 0x10 + 0x90 + 20),
-               &sc, sizeof(sc));
-        /* retcode at end of frame */
+        memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 20), &sc, sizeof(sc));
         memcpy(i686_guest_ptr(ctx, frame_va + sizeof(i686_rt_sigframe_t) - 8),
                retcode_rt, 8);
         *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
             frame_va + sizeof(i686_rt_sigframe_t) - 8;
-        /* push args for the handler(sig, info, uc) */
-        sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = sp + 0x90; /* uc */
+        /* handler args (sig, info, uc): info/uc point into the frame
+         * (kernel: pinfo=frame+0x10, puc=frame+0x90) — fixed VAs. */
+        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 8) = frame_va + 0x10;
+        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 12) = frame_va + 0x90;
+        sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = frame_va + 0x90;
         sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = frame_va + 0x10;
         sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = (uint32_t)sig;
     } else {
@@ -147,10 +148,17 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
 
 int i686_sigreturn(i686_ctx_t *ctx, int rt)
 {
+    /* Kernel esp convention at the restorer: non-RT frame + 4 (pretcode
+     * was popped as the handler's return address); RT frame + 0 (the
+     * restorer is called with esp pointing at the frame base because the
+     * handler-return popped pretcode leaving sig at [esp]).  We detect
+     * the frame by scanning: our builder pushed handler args + retaddr
+     * BELOW the frame, so at sigreturn time esp = frame_va (args and
+     * retaddr were popped by the handler's own ret/leave sequence only
+     * if the guest stub did `pop eax` first — the retcode does). */
     uint32_t sp = ctx->gpr[I686_REG_ESP];
     i686_sigcontext_t sc;
-    uint32_t base = rt ? sp + 0x90 + 20 - 0 /* rt: uc at +0x90, sc@+20 */
-                       : sp + 4;
+    uint32_t base = rt ? sp + 0x90 + 20 : sp + 8;
     if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
         return -1;
     }
@@ -215,4 +223,46 @@ int i686_deliver_sync(i686_ctx_t *ctx, int reason)
         return i686_sigframe_build(ctx, sig, ga->handler, ga->restorer,
                                    rt, 0U, 0U);
     }
+}
+
+/* Deliver the lowest pending, unblocked signal at an interpreter safe
+ * point.  Unblock check against the guest mask in sys_pass.c v1 store. */
+int i686_deliver_pending(i686_ctx_t *ctx)
+{
+    struct i686_gsigaction *ga;
+    int sig;
+    for (sig = 1; sig <= 64; sig++) {
+        if ((ctx->pending_signals & (1ULL << (sig - 1))) == 0ULL) {
+            continue;
+        }
+        ga = i686_gsig_tab(sig);
+        if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
+            continue;
+        }
+        {
+            extern uint64_t i686_sigmask_get(void);
+            if (i686_sigmask_get() & (1ULL << (sig - 1))) {
+                continue; /* blocked */
+            }
+        }
+        ctx->pending_signals &= ~(1ULL << (sig - 1));
+        ctx->exit_arg = 0; /* no trapno for async */
+        return i686_sigframe_build(ctx, sig, ga->handler, ga->restorer,
+                                   (ga->flags & 0x4U) ? 1 : 0, 0U, 0U);
+    }
+    /* unhandled pending bits: drop them (v1) */
+    ctx->pending_signals = 0ULL;
+    return -1;
+}
+
+/* Syscall adapters (registered from syscalls.c). */
+int64_t i686_sys_sigreturn(i686_ctx_t *ctx);
+int64_t i686_sys_sigreturn(i686_ctx_t *ctx)
+{
+    return i686_sigreturn(ctx, 0) == 0 ? 0 : -14;
+}
+int64_t i686_sys_rt_sigreturn(i686_ctx_t *ctx);
+int64_t i686_sys_rt_sigreturn(i686_ctx_t *ctx)
+{
+    return i686_sigreturn(ctx, 1) == 0 ? 0 : -14;
 }
