@@ -93,3 +93,26 @@ test-p2-busybox-oracle: busybox ## Oracle self-check: run the fetched i686 busyb
 	docker run --rm --platform linux/386 -v "$(CURDIR)/$(BUILD_DIR)":/w alpine:3.20 /w/busybox-i686 sh -c 'echo ok'
 
 .PHONY: busybox test-p2-lima test-p2-busybox-oracle
+
+## ------------------------------------------------------------------ ##
+##  Phase 3 — L3d: differential trace harness (interp vs dbt)          ##
+## ------------------------------------------------------------------ ##
+
+difftest: build fixtures ## Differential-trace test_p1_isa under interp vs dbt (tools/difftest.sh; DIFFTEST: EQUAL)
+	tools/difftest.sh $(BUILD_DIR)/test_p1_isa
+
+test-p3-lima: fixtures busybox ## RC3 differential: test_p1_isa + busybox echo smoke, interp vs dbt (single PASS)
+	@set -e; \
+	mkdir -p $(BUILD_DIR)/bb; \
+	for a in sh ls echo cat; do ln -sf ../busybox-i686 $(BUILD_DIR)/bb/$$a; done; \
+	tools/difftest.sh $(BUILD_DIR)/test_p1_isa >$(BUILD_DIR)/difftest-p1.log || { \
+	  cat $(BUILD_DIR)/difftest-p1.log; echo "FAIL: test_p1_isa difftest not EQUAL"; exit 1; }; \
+	out=$$(PATH="$(CURDIR)/$(BUILD_DIR)/bb:$$PATH" \
+	  tools/difftest.sh $(BUILD_DIR)/busybox-i686 sh -c 'echo ok'); \
+	case "$$out" in *DIFFTEST: EQUAL*) ;; *) \
+	  printf '%s\n' "$$out"; echo "FAIL: busybox difftest not EQUAL"; exit 1;; esac; \
+	case "$$out" in *ok*) ;; *) \
+	  printf '%s\n' "$$out"; echo "FAIL: busybox output missing ok"; exit 1;; esac; \
+	echo PASS
+
+.PHONY: difftest test-p3-lima
