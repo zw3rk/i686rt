@@ -4,3 +4,4 @@ result
 __pycache__/
 *.py[cod]
 /result
+_sysroot/
