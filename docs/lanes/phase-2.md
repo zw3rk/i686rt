@@ -187,3 +187,20 @@ aarch64 docker VM with the recorded lima deviation).
   iteration at 0x8113932 for the LC_ALL-family lookups; the mismatching
   iteration is the bug. q3 trace: /tmp/i686smoke/qs3.txt; ours:
   /tmp/scr1.txt (sh /w/script).
+
+## RC2 record (2026-10-21) — PASSED
+
+`I686RT_ENGINE=interp i686rt -- busybox-i686 sh -c 'ls / && echo ok'`
+on the aarch64 docker VM (lima deviation per Phase 1): lists `/` and
+prints `ok`, exit 0. Environment note: the multicall busybox symlinks
+(bin/ls -> busybox-i686 etc.) must precede the host PATH so `ls` execs
+the i386 binary (the container's native /bin/ls is correctly rejected
+by our ELF gate). This exercises fork + wait4 + in-process execve over
+the vDSO-preserving region reset, writev, getdents, and the full
+two-word command pipeline.
+
+Final interpreter fixes in the chain: (1) 0x91-0x97 XCHG eAX,r no-op;
+(2) AH-class 8-bit register mapping; (3) scas/cmps width-masked lazy
+flags; (4) three-operand imul product; (5) vm-global exec teardown.
+All were invisible to the Phase 1 fixture (single-register focus) and
+to lane unit doubles; the busybox differential exposed them.
