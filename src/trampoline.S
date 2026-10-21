@@ -36,6 +36,8 @@ i686_jit_run_block:
     ldr     x20, [x19, #112]        /* x20 = xG (guest_base) */
     mov     x21, x2                 /* x21 = cur_entry */
     mov     x22, x3                 /* x22 = &g_cache_epoch */
+    mov     x23, x1                 /* x23 = code_ptr (stash: the GPR load
+                                       below writes w1, clobbering x1) */
 
     /* EFLAGS: DBT v1 keeps flags in NZCV only within a block; restore the
      * architectural EFLAGS copy is unnecessary — blocks materialize on
@@ -47,7 +49,7 @@ i686_jit_run_block:
 
     /* v1 dispatch loop: single block per call; chaining/IBTC/RAS slots
      * (Phase 3.1 follow-up) integrate here. */
-    blr     x1                      /* call emitted code */
+    blr     x23                     /* call emitted code (stashed ptr) */
 
     /* Store GPRs back (w0..w7 -> gpr[0..7]); exit state was written to
      * ctx by the emitted epilogue. */
