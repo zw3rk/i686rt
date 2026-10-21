@@ -79,6 +79,9 @@ int i686_emit_mov(i686_emit_ctx_t *e, const x86_insn_t *insn);
 int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn);
 int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn);
 
+/* LOCK-prefixed RMW via LSE atomics (src/dbt/emit_atomic.c, L4c). */
+int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn);
+
 /* Lazy flags ABI under DBT (D6): cmp/test/sub/add set an in-block NZCV
  * directly (CMN/SUBS) and mark ctx->lazy_op = I686_FOP_A64NZCV (a new
  * constant local to dbt: materialize = copy NZCV to eflags mask);
