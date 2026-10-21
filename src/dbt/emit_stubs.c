@@ -1,6 +1,10 @@
 /* Coordinator-owned v1 stubs: the lane modules replace these bodies.
  * translate.c links against them from day one so the DBT engine path
- * compiles and runs (every op falls back to interpret-one, D2). */
+ * compiles and runs (every op falls back to interpret-one, D2).
+ *
+ * L3c: i686_emit_branch/i686_emit_string now live in
+ * src/dbt/emit_branch.c and src/dbt/emit_string.c (lane 3-l3c).
+ * i686_emit_alu/i686_emit_mov remain stubs until L3a/L3b land. */
 #include "dbt/emit.h"
 
 int i686_emit_alu(i686_emit_ctx_t *e, const x86_insn_t *insn)
@@ -8,14 +12,6 @@ int i686_emit_alu(i686_emit_ctx_t *e, const x86_insn_t *insn)
     (void)e; (void)insn; return -1;
 }
 int i686_emit_mov(i686_emit_ctx_t *e, const x86_insn_t *insn)
-{
-    (void)e; (void)insn; return -1;
-}
-int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
-{
-    (void)e; (void)insn; return -1;
-}
-int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
     (void)e; (void)insn; return -1;
 }
