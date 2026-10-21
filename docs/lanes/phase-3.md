@@ -108,3 +108,22 @@ with `CC=aarch64-unknown-linux-musl-gcc`.
 Coordinator (after S3 merge): wire engine=dbt into main.c (translate
 caching in a simple per-EIP hash, call i686_jit_run_block), then RC3 =
 `make test-p3-lima` PASS + busybox smoke under dbt.
+
+## S3 record (2026-10-21) — RC3 PASSED
+
+All four lanes merged. Coordinator integration: engine=dbt in main.c
+(per-EIP direct-mapped cache, mmap RWX blocks), one-step D2 fallback
+via i686_interp_step, DBT syscall S-tracing, flags seam
+(i686_dbt_flags_sync materializing lazy descriptors in front of L3c's
+NZCV rebuild), and three emitter-level fixes found by engine-level
+testing: full 64-bit helper addresses (X-form movz/movk; W-forms
+truncate under static-PIE), x0=ctx for the helper's AAPCS arg0, and the
+lr-park (x28) around in-block blr — without it every block containing a
+helper call returns to the post-call insn and hangs. L3c's SUBS-polarity
+condition map ratified (card's B/AE rows were inverted).
+
+RC3 acceptance, aarch64 docker VM (lima deviation per Phase 1):
+- I686RT_ENGINE=dbt test_p1_isa → PASS, exit 0 (fully native, 0 T-events)
+- busybox echo hi / sh -c 'echo ok' under dbt → correct output, exit 0
+- difftest test_p1_isa → DIFFTEST: EQUAL
+- difftest busybox sh -c 'echo ok' → DIFFTEST: EQUAL, output contains ok
