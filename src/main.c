@@ -244,6 +244,12 @@ static int run_guest(i686_ctx_t *ctx)
     if (ctx->engine < 0) {
         ctx->engine = I686_ENGINE_INTERP; /* default oracle (D2) */
     }
+    {
+        extern void i686_threads_main_init(i686_ctx_t *);
+        extern void i686_signals_i386_init(void);
+        i686_threads_main_init(ctx);
+        i686_signals_i386_init();
+    }
     i686_interp_init_all();
     if (ctx->engine == I686_ENGINE_DBT) {
         extern void i686_dbt_trace_enable(int);

@@ -191,6 +191,13 @@ static long sys_set_thread_area(i686_ctx_t *ctx, uint32_t ud_va)
     return 0;
 }
 
+/* Cross-module by-nr re-entry (clone.c uses fork). */
+int64_t i686_sys_call_nr(long nr, i686_ctx_t *ctx)
+{
+    i686_syscalls_init_once();
+    return i686_sys_dispatch(ctx, nr);
+}
+
 int i686_syscall_is_exit(long nr)
 {
     return (nr == (long)I686__NR_exit || nr == (long)I686__NR_exit_group) ? 1 : 0;

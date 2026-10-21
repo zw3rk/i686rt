@@ -486,6 +486,26 @@ static struct {
     uint64_t mask;
 } s_sigact[65];
 
+/* Phase 4: exported view for src/os/signals_i386.c (frame builder). */
+struct i686_gsigaction {
+    uint32_t handler;
+    uint32_t flags;
+    uint32_t restorer;
+    uint32_t mask[2];
+};
+struct i686_gsigaction *i686_gsig_tab(int signum)
+{
+    static struct i686_gsigaction v;
+    if (signum < 1 || signum > 64) {
+        return NULL;
+    }
+    v.handler = s_sigact[signum].handler;
+    v.flags = s_sigact[signum].flags;
+    v.restorer = s_sigact[signum].restorer;
+    memcpy(v.mask, &s_sigact[signum].mask, sizeof(v.mask));
+    return &v;
+}
+
 /* prctl PR_{GET,SET}_NAME: TASK_COMM_LEN = 16 NUL-padded bytes. */
 static char s_comm[16];
 

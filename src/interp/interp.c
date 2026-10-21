@@ -178,19 +178,26 @@ int i686_interp_run(i686_ctx_t *ctx)
             ctx->exit_reason = I686_EXIT_HLT;
             return I686_EXIT_HLT;
         case I686_EXIT_TRAP:
-            diag("debug trap", ctx, insn.op);
-            ctx->exit_reason = I686_EXIT_TRAP;
-            ctx->exit_arg = insn.op;
-            return I686_EXIT_TRAP;
         case I686_EXIT_FAULT:
-            diag("guest fault", ctx, insn.op);
-            ctx->exit_reason = I686_EXIT_FAULT;
-            return I686_EXIT_FAULT;
-        case I686_EXIT_UNDEF:
-            diag("opcode refused", ctx, insn.op);
-            ctx->exit_reason = I686_EXIT_UNDEF;
-            ctx->exit_arg = insn.op;
-            return I686_EXIT_UNDEF;
+        case I686_EXIT_UNDEF: {
+            /* Phase 4: map the fault to a guest signal and deliver
+             * (SIGSEGV/SIGFPE/SIGILL per the kernel table). If no
+             * handler is installed the diag+stop path stands. */
+            extern int i686_deliver_sync(i686_ctx_t *, int reason);
+            int rs = i686_deliver_sync(ctx, r);
+            if (rs == 0) {
+                continue; /* handler installed; resume at it */
+            }
+            diag(r == I686_EXIT_TRAP  ? "debug trap"
+               : r == I686_EXIT_FAULT ? "guest fault"
+                                      : "opcode refused",
+                 ctx, insn.op);
+            ctx->exit_reason = (uint32_t)r;
+            if (r != I686_EXIT_UNDEF) {
+                ctx->exit_arg = insn.op;
+            }
+            return r;
+        }
         default:
             ctx->exit_reason = (uint32_t)r;
             return r;
