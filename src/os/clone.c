@@ -144,7 +144,13 @@ static int64_t r_clone(i686_ctx_t *ctx)
         return i686_sys_call_nr(2 /* fork */, ctx);
     }
     if ((flags & I686_CLONE_THREAD) == 0U && (flags & I686_CLONE_VM) != 0U) {
-        return -EINVAL; /* v1: no CLONE_VM-without-THREAD users */
+        /* CLONE_VM|CLONE_VFORK (glibc posix_spawn — wine's wineserver
+         * launch, RC7b): the child only ever execve()s or _exit()s.
+         * Under the translator a host fork() copy gives exactly that
+         * observable behavior (the exec discards the copied memory);
+         * the parent's waitpid reaps the exec'd image's status. */
+        extern int64_t i686_sys_call_nr(long nr, i686_ctx_t *ctx);
+        return i686_sys_call_nr(2 /* fork */, ctx);
     }
 
     child = malloc(sizeof(*child));

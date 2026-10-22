@@ -105,7 +105,7 @@ static void diag(const char *what, const i686_ctx_t *ctx, uint16_t op)
                   what, ctx->eip, i686_op_name(op), ctx->gpr[I686_REG_ESP]);
     /* Region map on any fatal diagnostics: shows which mapping the
      * eip/fault_addr landed in and its neighbours (RC7b triage). */
-    if (ctx->regions != NULL && ctx->region_count > 0U) {
+    if (ctx->region_count > 0U) {
         size_t i;
         for (i = 0U; i < ctx->region_count; i++) {
             const i686_region_t *rg = &ctx->regions[i];
@@ -188,9 +188,9 @@ int i686_interp_run(i686_ctx_t *ctx)
                     continue; /* guest handler installed; resume at it */
                 }
                 (void)fprintf(stderr,
-                              "i686rt: interp: guest fault (host) at "
+                              "i686rt: interp: guest fault (host) pid=%d at "
                               "eip=0x%08x, fault_addr=0x%08x\n",
-                              ctx->eip, ctx->fault_addr);
+                              (int)getpid(), ctx->eip, ctx->fault_addr);
                 diag("guest fault (host)", ctx, 0);
                 ctx->exit_reason = I686_EXIT_FAULT;
                 return I686_EXIT_FAULT;
@@ -215,14 +215,21 @@ int i686_interp_run(i686_ctx_t *ctx)
         }
         if (s_trace) {
             uint32_t b;
-            fprintf(stderr, "T %08x op=%u len=%u b=", ctx->eip,
-                    (unsigned)insn.op, insn.len);
-            for (b = 0U; b < insn.len && b < 8U; b++) {
+            char tl[80];
+            int tn = 0;
+
+            tn = snprintf(tl, sizeof tl, "T %d %08x op=%u len=%u b=",
+                          (int)getpid(), ctx->eip, (unsigned)insn.op,
+                          insn.len);
+            for (b = 0U; b < insn.len && b < 8U && tn < (int)sizeof tl - 3;
+                 b++) {
                 const volatile uint8_t *p =
                     (const volatile uint8_t *)i686_guest_ptr(ctx, ctx->eip + b);
-                fprintf(stderr, "%02x", *p);
+                tn += snprintf(tl + tn, sizeof tl - (size_t)tn, "%02x", *p);
             }
-            fprintf(stderr, " esp=%08x\n", ctx->gpr[I686_REG_ESP]);
+            snprintf(tl + tn, sizeof tl - (size_t)tn, " esp=%08x\n",
+                     ctx->gpr[I686_REG_ESP]);
+            (void)write(2, tl, strlen(tl));
         }
         r = fn(ctx, &insn);
         ctx->blocks_executed++;

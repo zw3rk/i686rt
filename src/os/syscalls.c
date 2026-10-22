@@ -666,6 +666,10 @@ static int64_t r_execve(i686_ctx_t *ctx)
     memset(ctx->seg_base, 0, sizeof(ctx->seg_base));
     ctx->cs_d = 1U; /* exec reloads flat segment regs; the LDT itself
                      * persists (per-mm on i386), segment state resets */
+    {
+        extern void i686_seg_exec_reset_tls(i686_ctx_t *ctx);
+        i686_seg_exec_reset_tls(ctx);
+    }
     return 0;
 }
 
@@ -685,9 +689,10 @@ long i686_handle_syscall(i686_ctx_t *ctx)
     ret = (long)i686_sys_dispatch(ctx, nr);
     if (s_systrace) {
         (void)fprintf(stderr,
-                      "SYS %ld -> %ld (bx=%08x cx=%08x dx=%08x si=%08x)\n",
-                      nr, ret, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                      ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI]);
+                      "SYS %ld %ld -> %ld (bx=%08x cx=%08x dx=%08x si=%08x)\n",
+                      (long)getpid(), nr, ret, ctx->gpr[I686_REG_EBX],
+                      ctx->gpr[I686_REG_ECX], ctx->gpr[I686_REG_EDX],
+                      ctx->gpr[I686_REG_ESI]);
     }
     ctx->gpr[I686_REG_EAX] = (uint32_t)ret;
     return ret;

@@ -237,6 +237,27 @@ int i686_seg_load(i686_ctx_t *ctx, unsigned reg, uint16_t sel)
     return SEG_F_OK;
 }
 
+/* exec resets the thread's TLS bookkeeping (kernel start_thread: the
+ * new image's glibc auto-allocates GDT 6/7/8 again).  RC7b: without
+ * this, the Nth exec exhausts the three slots -> set_thread_area
+ * -ESRCH -> "Cannot allocate TLS block". */
+void i686_seg_exec_reset_tls(i686_ctx_t *ctx)
+{
+    i686_segstate_t *st = (ctx->ldt != NULL) ? (i686_segstate_t *)ctx->ldt
+                                            : NULL;
+    unsigned i;
+
+    for (i = 0U; i < (unsigned)I686_GDT_TLS_SLOTS; i++) {
+        ctx->gdt_tls_slots[i] = 0U;
+        if (st != NULL) {
+            st->gdt_used[i] = false;
+        }
+    }
+    if (st != NULL) {
+        st->gen++;
+    }
+}
+
 bool i686_seg_flat_cs(const i686_ctx_t *ctx)
 {
     /* 0x23 = __USER_CS alias installed at process start and execve;
