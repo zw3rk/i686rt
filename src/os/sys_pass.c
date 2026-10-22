@@ -103,6 +103,7 @@ long syscall(long, ...);
 #define NR_openat   295U /* [295] {"openat"} */
 #define NR_writev         146U /* [146] {"writev"}       */
 #define NR_close          6U /* [6]   {"close"}        */
+#define NR_readlink      85U /* [85]  {"readlink"}     */
 #define NR_lseek         19U /* [19]  {"lseek"}        */
 #define NR_link           9U /* [9]   {"link"}         */
 #define NR_mkdir         39U /* [39]  {"mkdir"}        */
@@ -553,6 +554,12 @@ static long sys_open(i686_ctx_t *ctx, uint32_t path_va, uint32_t flags, uint32_t
     if (fetch_path(ctx, path_va, path) != 0) {
         return -EFAULT;
     }
+    {
+        extern int i686_systrace_on(void);
+        if (i686_systrace_on()) {
+            (void)fprintf(stderr, "OPEN %s\n", path);
+        }
+    }
     pfd = i686_proc_open_at(ctx, path); /* S2 wiring (src/os/proc.{h,c}) */
     if (pfd != I686_PROC_NOT_MATCHED) {
         return pfd;
@@ -613,6 +620,100 @@ static long sys_symlink(i686_ctx_t *ctx, uint32_t target_va, uint32_t link_va)
         return -EFAULT;
     }
     return host_ret_(symlink(target, linkp));
+}
+
+/* /proc/<pid>/exe for OUR pid resolves to the exec image too (wine
+ * probes /proc/self/exe, /proc, /proc/<pid>, /proc/<pid>/exe in turn).
+ * Without this the HOST /proc leaks the translator's own binary path
+ * into the guest (RC7b T2).  Other pids: ENOENT (v1). */
+static int is_own_proc_exe(const char *linkp)
+{
+    const char *p;
+    long pid;
+    char *end;
+
+    if (strncmp(linkp, "/proc/", 6) != 0) {
+        return 0;
+    }
+    p = linkp + 6;
+    pid = strtol(p, &end, 10);
+    if (end == p || strcmp(end, "/exe") != 0) {
+        return 0;
+    }
+    return pid == (long)getpid();
+}
+
+/* readlink(85): /proc/self/exe resolves to the exec image (wine's
+ * loader locates its dll dir through it); other absolute paths try
+ * sysroot+path first (open_guest model), then the plain host path. */
+static long sys_readlink(i686_ctx_t *ctx, uint32_t link_va, uint32_t buf_va,
+                         uint32_t bufsiz)
+{
+    char linkp[PATH_BUF];
+    char target[PATH_BUF];
+    ssize_t n;
+
+    if (fetch_path(ctx, link_va, linkp) != 0) {
+        return -EFAULT;
+    }
+    {
+        extern int i686_systrace_on(void);
+        if (i686_systrace_on()) {
+            (void)fprintf(stderr, "READLINK %s\n", linkp);
+        }
+    }
+    if (bufsiz == 0U) {
+        return -EINVAL;
+    }
+    if (strcmp(linkp, "/proc/self/exe") == 0 || is_own_proc_exe(linkp)) {
+        const char *ep = (ctx->exec_path != NULL && ctx->exec_path[0] != '\0')
+                             ? ctx->exec_path
+                             : ((ctx->guest_argv != NULL &&
+                                 ctx->guest_argv[0] != NULL)
+                                    ? ctx->guest_argv[0]
+                                    : NULL);
+        if (ep == NULL || ep[0] == '\0') {
+            return -ENOENT;
+        }
+        n = (ssize_t)strlen(ep);
+        if (n > (ssize_t)bufsiz) {
+            n = (ssize_t)bufsiz;
+        }
+        if (i686_copy_to_guest(ctx, buf_va, ep, (size_t)n) != 0) {
+            return -EFAULT;
+        }
+        return (long)n;
+    }
+    if (linkp[0] == '/' && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
+        char sp[PATH_BUF];
+        size_t sl = strlen(ctx->sysroot);
+
+        if (sl + strlen(linkp) < sizeof sp) {
+            memcpy(sp, ctx->sysroot, sl);
+            strcpy(sp + sl, linkp);
+            n = readlink(sp, target, sizeof target - 1U);
+            if (n >= 0) {
+                if ((size_t)n > bufsiz) {
+                    n = (ssize_t)bufsiz;
+                }
+                if (i686_copy_to_guest(ctx, buf_va, target, (size_t)n) != 0) {
+                    return -EFAULT;
+                }
+                return (long)n;
+            }
+        }
+    }
+    n = readlink(linkp, target, sizeof target - 1U);
+    if (n < 0) {
+        return -errno;
+    }
+    if ((size_t)n > bufsiz) {
+        n = (ssize_t)bufsiz;
+    }
+    if (i686_copy_to_guest(ctx, buf_va, target, (size_t)n) != 0) {
+        return -EFAULT;
+    }
+    return (long)n;
 }
 
 static long sys_chmod(i686_ctx_t *ctx, uint32_t path_va, uint32_t mode)
@@ -1102,6 +1203,12 @@ static int64_t r_openat(i686_ctx_t *ctx)
     if (i686_fetch_cstr(ctx, ctx->gpr[I686_REG_ECX], path, sizeof path) != 0) {
         return -EFAULT;
     }
+    {
+        extern int i686_systrace_on(void);
+        if (i686_systrace_on()) {
+            (void)fprintf(stderr, "OPENAT %s\n", path);
+        }
+    }
     if (path[0] == '/' || dirfd == -100 /* AT_FDCWD */) {
         pfd = i686_proc_open_at(ctx, path);
         if (pfd != I686_PROC_NOT_MATCHED) {
@@ -1170,6 +1277,13 @@ static int64_t r_close(i686_ctx_t *ctx)
 {
     return host_ret_(close((int)ctx->gpr[I686_REG_EBX]));
 }
+
+static int64_t r_readlink(i686_ctx_t *ctx)
+{
+    return sys_readlink(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                        ctx->gpr[I686_REG_EDX]);
+}
+
 
 static int64_t r_lseek(i686_ctx_t *ctx)
 {
@@ -1495,6 +1609,7 @@ void i686_syscalls_pass_init(void)
     i686_sys_register(NR_openat, r_openat);
     i686_sys_register(NR_writev, r_writev);
     i686_sys_register(NR_close, r_close);
+    i686_sys_register(NR_readlink, r_readlink);
     i686_sys_register(NR_lseek, r_lseek);
     i686_sys_register(NR_unlink, r_unlink);
     i686_sys_register(NR_rmdir, r_rmdir);

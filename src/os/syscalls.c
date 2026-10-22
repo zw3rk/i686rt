@@ -618,7 +618,7 @@ static int64_t r_execve(i686_ctx_t *ctx)
                 free(argv[0]); /* script's own argv[0] is dropped */
                 free(argv);    /* array only; argv[1:] moved to na */
                 argv = na;
-                argc += (na[1] == script_copy) ? 2U : 1U;
+                argc += (na[1] == script_copy) ? 1U : 2U;
                 continue;
             }
             (void)lseek(fd, 0, SEEK_SET);
@@ -672,13 +672,29 @@ long i686_handle_syscall(i686_ctx_t *ctx)
 {
     long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
     long ret;
+    static int s_systrace = -1;
+
+    if (s_systrace < 0) {
+        s_systrace = getenv("I686RT_SYSTRACE") != NULL;
+    }
 
     ctx->syscalls_executed++;
 
     i686_syscalls_init_once();
     ret = (long)i686_sys_dispatch(ctx, nr);
+    if (s_systrace) {
+        (void)fprintf(stderr,
+                      "SYS %ld -> %ld (bx=%08x cx=%08x dx=%08x si=%08x)\n",
+                      nr, ret, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                      ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI]);
+    }
     ctx->gpr[I686_REG_EAX] = (uint32_t)ret;
     return ret;
+}
+
+int i686_systrace_on(void)
+{
+    return getenv("I686RT_SYSTRACE") != NULL;
 }
 
 void i686_syscalls_init_once(void)

@@ -197,6 +197,8 @@ static int run_guest(i686_ctx_t *ctx)
             (void)fprintf(stderr, "i686rt: exec path too long\n");
             return -1;
         }
+        int argv_owned = 0; /* guest_argv starts as main's argv slice */
+
         for (depth = 0U; depth < 5U; depth++) {
             char magic[2];
             char **na;
@@ -233,10 +235,13 @@ static int run_guest(i686_ctx_t *ctx)
                     free(script_copy);
                     return -1;
                 }
-                free(ctx->guest_argv[0]);
-                free(ctx->guest_argv);
+                if (argv_owned) {
+                    free(ctx->guest_argv[0]);
+                    free(ctx->guest_argv);
+                }
+                argv_owned = 1;
                 ctx->guest_argv = na;
-                ctx->guest_argc += (na[1] == script_copy) ? 2 : 1;
+                ctx->guest_argc += (na[1] == script_copy) ? 1 : 2;
                 ctx->exec_path = strdup(lpath); /* interpreter image */
                 continue;
             }

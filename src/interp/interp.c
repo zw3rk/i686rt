@@ -103,6 +103,21 @@ static void diag(const char *what, const i686_ctx_t *ctx, uint16_t op)
     (void)fprintf(stderr,
                   "i686rt: interp: %s at eip=0x%08x (%s), esp=0x%08x\n",
                   what, ctx->eip, i686_op_name(op), ctx->gpr[I686_REG_ESP]);
+    /* Region map on any fatal diagnostics: shows which mapping the
+     * eip/fault_addr landed in and its neighbours (RC7b triage). */
+    if (ctx->regions != NULL && ctx->region_count > 0U) {
+        size_t i;
+        for (i = 0U; i < ctx->region_count; i++) {
+            const i686_region_t *rg = &ctx->regions[i];
+            (void)fprintf(stderr,
+                          "MAP %08x-%08x %c%c%c %s\n",
+                          rg->start, rg->end,
+                          (rg->prot & 0x1U) ? 'r' : '-',
+                          (rg->prot & 0x2U) ? 'w' : '-',
+                          (rg->prot & 0x4U) ? 'x' : '-',
+                          rg->name[0] != '\0' ? rg->name : "");
+        }
+    }
 }
 
 /* DBT fallback hook: execute exactly ONE guest insn via the interpreter
@@ -172,6 +187,10 @@ int i686_interp_run(i686_ctx_t *ctx)
                 if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
                     continue; /* guest handler installed; resume at it */
                 }
+                (void)fprintf(stderr,
+                              "i686rt: interp: guest fault (host) at "
+                              "eip=0x%08x, fault_addr=0x%08x\n",
+                              ctx->eip, ctx->fault_addr);
                 diag("guest fault (host)", ctx, 0);
                 ctx->exit_reason = I686_EXIT_FAULT;
                 return I686_EXIT_FAULT;
