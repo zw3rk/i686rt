@@ -156,6 +156,11 @@ def contract_ids():
         "PREFETCH", "LDMXCSR", "STMXCSR", "EMMS",
     ]))
 
+    # RC7b triage T4 (docs/lanes/phase-7.md): 0F C7 /1 CMPXCHG8B m64 --
+    # ntdll.so's NtAllocateUuids interlocked loop runs `lock cmpxchg8b`
+    # during wine startup.
+    sections.append(("CMPXCHG8B (0F C7 /1, RC7b T4)", ["CMPXCHG8B"]))
+
     # Phase 5 (L5c) x87/MMX set.  D8-DF are group bytes: the modrm reg
     # field picks one of 8 ids per byte and the mod bit selects the memory
     # vs ST(i) form inside the handler (x87 second-byte fixed forms ride
@@ -285,7 +290,8 @@ TWOB_INVALID = {
     0xB2: "reserved", 0xB4: "reserved", 0xB5: "reserved",
     0xB8: "reserved (POP gs variant)", 0xB9: "reserved group",
     0xC3: "SSE excluded", 0xC4: "SSE excluded",
-    0xC5: "SSE excluded", 0xC6: "SSE excluded", 0xC7: "SSE excluded",
+    0xC5: "SSE excluded", 0xC6: "SSE excluded",
+    # (0xC7 CMPXCHG8B: RC7b T4 row)
 }
 TWOB_INVALID_RANGES = ((0xD0, 0xFF, "MMX/SSE excluded"),)
 
@@ -458,6 +464,11 @@ def build_twob():
     t[0xBF] = Desc("MOVSX_GvEw", ("R32", "RM16"))
     t[0xC0] = Desc("XADD_EbGb", ("RM8", "R8"), lock=1)
     t[0xC1] = Desc("XADD_EvGv", ("RM32", "R32"), lock=1)
+    # RC7b triage T4: 0F C7 /1 CMPXCHG8B m64 (ntdll.so's NtAllocateUuids
+    # runs `lock cmpxchg8b`); f0 legal, /1 only.  The m64 EA rides the
+    # RM32 modrm plumbing; the handler does the 8-byte access at EA.
+    t[0xC7] = Desc("CMPXCHG8B", ("RM32",), lock=1,
+                   note="m64 at EA; reg /1, mod!=3 (handler #UDs others)")
     for r in range(8):
         t[0xC8 + r] = Desc("BSWAP_Gv", ("R32",), modrm=0, note="rm=opcode&7")
     # Phase 5 shared spec (docs/lanes/phase-5.md "Generator rows"): SSE2
@@ -872,9 +883,10 @@ def generate():
     if dups:
         raise SystemExit("duplicate contract ids: %r" % dups)
     ids = sorted(set(ids))
-    if len(ids) != 358:
-        raise SystemExit("expected 358 contract ids (+S1 IMUL +S4 RDTSC "
-                         "+S5 x87 54 +S5 SSE 42 +RC7b T1 SSE2 movement 13), "
+    if len(ids) != 359:
+        raise SystemExit("expected 359 contract ids (+S1 IMUL +S4 RDTSC "
+                         "+S5 x87 54 +S5 SSE 42 +RC7b T1 SSE2 movement 13 "
+                         "+RC7b T4 CMPXCHG8B), "
                          "got %d" % len(ids))
 
     oneb = build_oneb()

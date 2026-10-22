@@ -80,6 +80,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <time.h>
+#include <poll.h>
 
 #ifdef __linux__
 #include <sys/epoll.h>
@@ -91,6 +92,7 @@
 #define L2E_NR_setrlimit      75U
 #define L2E_NR_getrlimit      76U
 #define L2E_NR_select         82U
+#define L2E_NR_poll          168U
 #define L2E_NR_mmap           90U
 #define L2E_NR_sysinfo       116U
 #define L2E_NR_newselect     142U
@@ -848,6 +850,37 @@ static int64_t r_newselect(i686_ctx_t *ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/* poll                                                                 */
+/* ------------------------------------------------------------------ */
+
+/* poll(168): struct pollfd { int fd; short events; short revents; } is
+ * 8 bytes with identical layout and identical POLL* bit values on i386
+ * and the aarch64 host (include/uapi/asm-generic/poll.h; x86 has no
+ * arch override), so the guest array is handed to the host poll() in
+ * place — the guest window is host-addressable memory (same convention
+ * as sys_read/sys_write in src/os/syscalls.c) and the host kernel
+ * writes revents straight back through the mapping.  wineserver's
+ * sock_check_pollhup() startup self-test and its client loop run on
+ * this (RC7b T4). */
+static int64_t r_poll(i686_ctx_t *ctx)
+{
+    uint32_t fds_va = ctx->gpr[I686_REG_EBX];
+    uint32_t nfds = ctx->gpr[I686_REG_ECX];
+    int32_t timeout = (int32_t)ctx->gpr[I686_REG_EDX];
+    int r;
+
+    if (nfds > 0U && fds_va < 0x1000U) {
+        return -EFAULT;
+    }
+    if ((uint64_t)fds_va + (uint64_t)nfds * 8U > 0x100000000ULL) {
+        return -EFAULT;
+    }
+    r = poll((struct pollfd *)(void *)i686_guest_ptr(ctx, fds_va),
+             (nfds_t)nfds, (int)timeout);
+    return (r < 0) ? -(long)errno : (int64_t)r;
+}
+
+/* ------------------------------------------------------------------ */
 /* epoll                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1190,6 +1223,7 @@ void i686_syscalls_misc_init(void)
     i686_sys_register((long)L2E_NR_getrlimit, r_getrlimit);
     i686_sys_register((long)L2E_NR_ugetrlimit, r_ugetrlimit);
     i686_sys_register((long)L2E_NR_select, r_old_select);
+    i686_sys_register((long)L2E_NR_poll, r_poll);
     i686_sys_register((long)L2E_NR_mmap, r_old_mmap);
     i686_sys_register((long)L2E_NR_sysinfo, r_sysinfo);
     i686_sys_register((long)L2E_NR_newselect, r_newselect);

@@ -716,3 +716,127 @@ Next blocker (coordinator-owned, src/os syscall layer): i386
 set_thread_area (243) — glibc i386 TLS requires it; also observed
 one garbled READLINK path print (/proc/8/<binary>) worth a look when
 that layer is next touched.  Per the card, chasing stopped here.
+
+## RC7b triage T4 record (2026-10-22) — root cause fixed; full check
+## ESCALATED (boot advances to multi-process wine, two deeper blockers)
+
+Lane T4 (worktree `../i686rt-t4`, branch `lane/7b-t4`, from master
+6038130).  Card: root-cause the fatal `call ebx` with ebx=0xffffffff
+in the posix_spawn child (fault eip=0xffffffff, esp≈0xdffff648).
+
+### A. Assigned root cause — clone(120) fork-path child loses newsp — FIXED
+
+Attribution (I686RT_TRACE, 66 MB trace; guest libc base 0x68043000 via
+the LOAD map vaddr==off 0x24000@0x68067000): faulting code is glibc's
+`clone` wrapper (libc vaddr 0x130c70, guest 0x68173cc4; NOT _dl_fixup,
+NOT TLS, NOT an unimplemented syscall — the spawn child executed
+exactly ONE syscall, the clone itself, before dying).  The wrapper
+pre-stores flags/fake-ret/fn/arg at [newsp..newsp+12]
+(0x130c8d: `andl $-0x10,%ecx; subl $0x1c,%ecx` + stores), does
+`int $0x80` with ECX = child esp, and the child path (EAX==0) pops
+fn into EBX off the NEW stack (`130cc4: pop edi/esi/ebx; test; je;
+mov %esi,%ebp; call *%ebx`).  `r_clone`'s CLONE_VM&&!CLONE_THREAD
+branch (posix_spawn: flags 0x4111 = CLONE_VM|CLONE_VFORK|SIGCHLD,
+newsp ECX=0x68351fe4) delegated to host fork() and never applied
+newsp — the child resumed on the PARENT's esp (trace: child T-lines
+esp=dffff630 identical to parent's), the three pops consumed the
+parent's callee-saves, and `call *%ebx` called the parent's saved
+EBX = 0xffffffff.  Kernel ABI: with CLONE_VM the child's ESP is the
+requested newsp; without CLONE_VM newsp is ignored (fork keeps the
+parent's ESP).
+
+Fix (src/os/clone.c): the CLONE_VM&&!CLONE_THREAD branch now forks
+inline; the child sets `ctx->host_tid` and, when newsp != 0,
+`ctx->gpr[I686_REG_ESP] = newsp` before returning 0.  The plain
+fork/vfork path is untouched.
+
+### B. Bring-up blockers found past the spawn (each verified by the
+###    boot advancing; fixes in this lane's commits)
+
+1. pipe2(331) unimplemented — glibc pipe() is pipe2(fds,0) since 2.27
+   with no ENOSYS fallback; wineserver's sock_check_pollhup() died
+   ("wineserver: pipe: Function not implemented").  Implemented
+   sys_pipe2 (sys_pass.c, dup3 convention: O_NONBLOCK/O_CLOEXEC
+   passthrough, __APPLE__ pipe+fcntl fallback, EFAULT closes both
+   fds per fs/pipe.c) + pipe(42) as pipe2(fds,0).
+2. poll(168) unimplemented — pollhup self-test's poll() returned
+   -ENOSYS so revents never got set ("sock_init: ERROR in
+   sock_check_pollhup()"); wineserver's whole client loop needs it.
+   Implemented r_poll (sys_misc.c): struct pollfd is 8 bytes with
+   identical POLL* bits on i386/aarch64, so the guest array is handed
+   to host poll() in place (sys_read pointer convention; EFAULT guards
+   like sys_read).
+3. pread64(180)/pwrite64(181) unimplemented — wineserver's
+   load_file() preads the nls casemap table; -ENOSYS surfaced as
+   "wineserver: invalid format for casemap table l_intl.nls".
+   Register ABI byte-verified from this sysroot's glibc 2.44 i386
+   pread64 wrapper (libc 0xf9c30): pos_lo=ESI, pos_hi=EDI, pad EBX-
+   block zero, buf rides ECX — the pad-less ia32 shim (modern
+   fs/read_write.c SYSCALL_DEFINE5(pread64, .., loff_t, pos)).
+   Implemented sys_pread64/sys_pwrite64 (sys_pass.c, window-pointer
+   passthrough).
+4. 0F C7 /1 CMPXCHG8B undecodable — ntdll.so's NtAllocateUuids
+   executes `lock cmpxchg8b (%ebp)` during wine startup
+   (`f0 0f c7 4d 00` at ntdll.so vaddr 0x35dca, guest 0x682c1dca,
+   load base 0x6828C000).  Added the union row (tools/gen_insn_tab.py
+   +0xC7 = I686_OP_CMPXCHG8B, union 358→359, RM32-kind modrm/EA
+   plumbing, lock=1; generator count check and tools/test_insn_tab.py
+   spot row updated; L1A OK) and the interpreter handler
+   (src/interp/h_alu.c: SDM semantics — EDX:EAX vs [EA], match ⇒
+   ECX:EBX stored + ZF=1, miss ⇒ EDX:EAX loaded + ZF=0, other flags
+   untouched, mod=3 and reg!=/1 are #UD; LDT 8-byte extent checked via
+   i686_seg_check_data; LOCK no-op per the file's oracle convention).
+   DBT declines the id generically to the D2 interpreter path (no
+   emitter added; interp is the check engine).
+
+With these, wineboot creates the prefix, wineserver boots and serves
+(socket file created; client/server 64-byte packet exchanges flow;
+multiple processes spawn and run — healthy ~16 ms epoll+clock loop
+observed in the server).
+
+### C. Remaining blockers (evidence for the coordinator; ESCALATE per
+###    the card after two failed full-check attempts — both spent)
+
+RC7b chain attempts: (1) baseline repro → the assigned `call ebx`
+crash (root-caused above); (2) post-fix chain (alpine arm64 container,
+prefix on container-local /root to avoid the macOS VirtioFS /w mount —
+/w-hosted prefixes are I/O-bound 10x+ slower but functional) →
+multi-process boot runs indefinitely without reaching cmd.exe.  Two
+independent post-boot pathologies, both translator-adjacent:
+
+a. A boot process burns CPU forever inside a static glibc function at
+   libc vaddr ≈0xd9043 (÷97/×25/×365-style extended-precision calendar
+   arithmetic; a caller return address on its stack lands inside
+   getenv+0x49 → getenv's strlen at 0xc2b20), zero syscalls for
+   15+ min at ~24K guest-insn/s.  gmtime itself is NOT the bug: a
+   sysroot-glibc gmtime probe over 12 timestamps (0..2^31-1, negatives)
+   is byte-identical between qemu-i386 and i686rt.  Suspect: corrupt
+   input (env block/time value) or a second static string/date
+   function miscompiling under a longer SEQUENCE (T2-style).
+b. A wine client thread livelocks INSIDE the translator: repeated
+   guest SIGSEGV → i686_sigframe_build writes a ~700-byte frame below
+   the thread's esp; the frame base crosses into a PROT_NONE stack
+   guard (host/guest identity window: guard 0x111000-0x120000 below
+   the 0x120000-0x220000 rw stack; gdb catch: SIGSEGV in host memcpy,
+   dest 0x11ffd0, 700 bytes).  The host fault handler re-enters
+   delivery, which faults identically — infinite retry, no guest
+   instructions execute (T-line count frozen while CPU burns).
+   Kernel-faithful behavior: when the sigframe cannot be written, the
+   kernel force-terminates (force_sigsegv → SIG_KILL) instead of
+   retrying.  Coordinator-owned: signals_i386.c delivery path, plus
+   why the thread's esp walks to the guard at all (deeper guest
+   recursion or a stale frame restore via the file-static
+   s_last_frame_va state across threads).
+
+### D. Regression checks (pre-flight, all rc=0)
+
+    dash -c echo          → XOK
+    sh -c exec sh -c ...  → reexec-ok
+    wine --version        → wine-10.0 (debian 10.0~repack-12+b1)
+    tools/test_insn_tab.py → L1A OK
+    build → zero new warnings (the emit_sse.c sse_emit_prefetch
+    unused-parameter warning pre-exists on 6038130; verified by
+    stashing this lane's diff and rebuilding).
+
+ACCEPTANCE: NOT passed — `wine cmd /c "echo ok"` does not yet print
+ok; escalation filed with the evidence above (section C).

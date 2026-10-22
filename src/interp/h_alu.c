@@ -451,6 +451,55 @@ static int h_XADD_EvGv(i686_ctx_t *ctx, const x86_insn_t *insn)
     return xadd_exec(ctx, insn, v_width(insn));
 }
 
+/* CMPXCHG8B m64 (0F C7 /1; the row carries modrm/RM32 for the EA
+ * plumbing, the 8-byte extent is handled here): compare EDX:EAX with
+ * [EA]; on match ZF=1 and [EA] <- ECX:EBX, else ZF=0 and
+ * EDX:EAX <- [EA].  All other flags are untouched (SDM CMPXCHG8B).
+ * mod=3 and reg != /1 are #UD; the LOCK prefix is a no-op under the
+ * same single-threaded oracle convention as CMPXCHG/XADD above.
+ * RC7b T4: ntdll.so's NtAllocateUuids interlocked loop executes
+ * `lock cmpxchg8b` during wine startup. */
+extern uint8_t x86_ea_seg(const x86_insn_t *insn);
+extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                                unsigned bytes);
+
+static int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    uint32_t ea, mlo, mhi, alo, ahi;
+    uint8_t *p;
+    uint32_t fl;
+
+    if (insn->modrm_mod == 3U || insn->modrm_reg != 1U) {
+        return I686_EXIT_UNDEF;
+    }
+    ea = x86_ea_compute(ctx, insn);
+    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, 8U);
+    p = (uint8_t *)i686_guest_ptr(ctx, ea);
+    mlo = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+          ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    mhi = (uint32_t)p[4] | ((uint32_t)p[5] << 8) |
+          ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+    alo = ctx->gpr[I686_REG_EAX];
+    ahi = ctx->gpr[I686_REG_EDX];
+    if (alo == mlo && ahi == mhi) {
+        p[0] = (uint8_t)(ctx->gpr[I686_REG_EBX] & 0xFFu);
+        p[1] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 8) & 0xFFu);
+        p[2] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 16) & 0xFFu);
+        p[3] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 24) & 0xFFu);
+        p[4] = (uint8_t)(ctx->gpr[I686_REG_ECX] & 0xFFu);
+        p[5] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 8) & 0xFFu);
+        p[6] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 16) & 0xFFu);
+        p[7] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 24) & 0xFFu);
+        fl = i686_flags_read(ctx) | I686_EF_ZF;
+    } else {
+        ctx->gpr[I686_REG_EAX] = mlo;
+        ctx->gpr[I686_REG_EDX] = mhi;
+        fl = i686_flags_read(ctx) & ~I686_EF_ZF;
+    }
+    ctx->eflags = fl;
+    return step(ctx, insn);
+}
+
 /* ---- module init ------------------------------------------------------ */
 
 /* Flag-op handlers live in h_flagsops.c and register from this single init
@@ -505,6 +554,7 @@ void i686_interp_alu_init(void)
     i686_interp_register(I686_OP_CMPXCHG_EvGv, h_CMPXCHG_EvGv);
     i686_interp_register(I686_OP_XADD_EbGb, h_XADD_EbGb);
     i686_interp_register(I686_OP_XADD_EvGv, h_XADD_EvGv);
+    i686_interp_register(I686_OP_CMPXCHG8B, h_CMPXCHG8B);
 
     i686_interp_flagsops_register();
 }
