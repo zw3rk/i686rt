@@ -144,9 +144,16 @@ def contract_ids():
         "PUNPCKHBW", "PUNPCKHWD", "PUNPCKHDQ",
         "PUNPCKLQDQ", "PUNPCKHQDQ",
         "PSHUFW", "CMPPS",
+        # RC7b triage T1 (sanctioned union extension, docs/lanes/
+        # phase-7.md): SSE2 data-movement + integer rows the wine32
+        # sysroot binaries actually execute.  One id per 0F byte;
+        # MOVDQA covers the 6F load / 7F store rows (MOVDQU + MMX MOVQ).
+        "MOVDQA", "MOVQ2DQ", "MOVNTDQ",
+        "PCMPGTB", "PSRLDQ", "PCMPEQB", "PCMPEQD",
         "PADDQ", "PMULLW", "PAND", "PANDN", "POR", "PXOR",
         "PMULUDQ", "PSUBD", "PSUBQ", "PADDD",
-        "LDMXCSR", "STMXCSR", "EMMS",
+        "PMINUB", "PMAXUB", "PSUBB", "PMOVMSKB",
+        "PREFETCH", "LDMXCSR", "STMXCSR", "EMMS",
     ]))
 
     # Phase 5 (L5c) x87/MMX set.  D8-DF are group bytes: the modrm reg
@@ -180,6 +187,9 @@ def contract_ids():
         "FCOMIP", "FISTP_m64",
         # 0F map
         "EMMS", "FXSAVE", "FXRSTOR",
+        # RC7b T1: 0F AE /7 joins the group (store fence; no-op in the
+        # single-threaded TSO guest model).
+        "SFENCE",
     ]))
     return sections
 
@@ -244,11 +254,12 @@ TWOB_INVALID = {
     0x05: "",
     0x06: "CLTS: excluded", 0x07: "",
     0x08: "", 0x09: "", 0x0A: "", 0x0C: "", 0x0D: "", 0x0E: "", 0x0F: "",
-    0x14: "SSE excluded", 0x15: "SSE excluded", 0x18: "SSE excluded",
+    0x14: "SSE excluded", 0x15: "SSE excluded",
     0x19: "SSE excluded", 0x1A: "SSE excluded", 0x1B: "SSE excluded",
     0x1C: "SSE excluded", 0x1D: "SSE excluded", 0x1E: "SSE excluded",
     0x1F: "SSE excluded (NOP variant)",
-    # (0x10-0x13, 0x16, 0x17 now MOVUPS/MOVLPS/MOVHPS rows, Phase 5)
+    # (0x10-0x13, 0x16, 0x17 now MOVUPS/MOVLPS/MOVHPS rows, Phase 5;
+    #  0x18 PREFETCH, RC7b T1)
     0x20: "MOV Cd/Td: excluded", 0x21: "", 0x22: "", 0x23: "",
     0x24: "MOV Rd/Td test: excluded", 0x25: "", 0x26: "", 0x27: "",
     # 0x28/0x29 MOVAPS, 0x2A CVTPI2PS, 0x2C CVTTPS2PI, 0x2E/0x2F
@@ -260,15 +271,15 @@ TWOB_INVALID = {
     0x51: "SSE excluded", 0x52: "SSE excluded", 0x53: "SSE excluded",
     0x5D: "MIN family (MINPS/MINSS/MINPD/MINSD): not in v1",
     0x5F: "MAX family (MAXPS/MAXSS/MAXPD/MAXSD): not in v1",
-    0x63: "PACKSSWB: not in v1", 0x64: "PCMPGTB: not in v1",
+    0x63: "PACKSSWB: not in v1",
     0x65: "PCMPGTW: not in v1", 0x66: "PCMPGTD: not in v1",
     0x67: "PACKUSWB: not in v1", 0x6B: "PACKSSDW: not in v1",
-    0x6F: "MOVDQA/MOVDQU (66/F3 0F 6F): not in v1",
-    0x71: "SSE excluded", 0x72: "SSE excluded", 0x73: "SSE excluded",
-    0x74: "SSE excluded", 0x75: "SSE excluded", 0x76: "SSE excluded",
+    # (0x64 PCMPGTB, 0x6F/0x7F MOVDQA family, 0x73 PSRLDQ, 0x74 PCMPEQB,
+    #  0x76 PCMPEQD: RC7b T1 rows)
+    0x71: "SSE excluded", 0x72: "SSE excluded",
+    0x75: "PCMPEQW: unused by the RC7b targets",
     0x78: "SSE excluded", 0x79: "SSE excluded", 0x7A: "SSE excluded",
     0x7B: "SSE excluded", 0x7C: "SSE excluded", 0x7D: "SSE excluded",
-    0x7F: "MOVDQA/MOVDQU/MMX MOVQ stores (0F 7F): not in v1",
     0xA6: "reserved", 0xA7: "reserved",
     0xAA: "RSM: excluded",
     0xB2: "reserved", 0xB4: "reserved", 0xB5: "reserved",
@@ -528,13 +539,46 @@ def build_twob():
     t[0xFB] = Desc("PSUBQ", ("R32", "RM32"), note="66 = xmm, plain = MMX")
     t[0xFE] = Desc("PADDD", ("R32", "RM32"), note="66 = xmm, plain = MMX")
 
+    # RC7b triage T1 (sanctioned union extension, docs/lanes/phase-7.md):
+    # the SSE2 data-movement + integer rows present in the wine32 sysroot
+    # binaries (glibc SSE2 memcpy/strcmp/strlen paths).  One id per byte;
+    # the plain (unprefixed) forms are the MMX variants of the same row.
+    t[0x18] = Desc("PREFETCH", ("RM32",),
+                   note="PREFETCHh hint: no memory access, no faults; "
+                        "66/F2/F3 forms undefined x86")
+    t[0x64] = Desc("PCMPGTB", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0x6F] = Desc("MOVDQA", ("R32", "RM32"),
+                   note="load; 66=MOVDQA (#GP on misaligned 16B EA), "
+                        "F3=MOVDQU, plain = MMX MOVQ load")
+    t[0x7F] = Desc("MOVDQA", ("RM32", "R32"),
+                   note="store forms of the 6F row (same rules)")
+    t[0x73] = Desc("PSRLDQ", ("R32", "RM32", "I8"),
+                   note="66 /2=PSRLDQ /3=PSLLDQ (128-bit byte shifts); "
+                        "plain /2=PSRLQ /6=PSLLQ (MMX)")
+    t[0x74] = Desc("PCMPEQB", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0x76] = Desc("PCMPEQD", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xD6] = Desc("MOVQ2DQ", ("RM32", "R32"),
+                   note="66=MOVQ m64/xmm-low <- xmm.d0; F2=MOVDQ2Q; "
+                        "F3=MOVQ2DQ xmm <- mm")
+    t[0xD7] = Desc("PMOVMSKB", ("R32", "RM32"),
+                   note="r32 <- byte sign mask; mod=3 required; "
+                        "66 = 16 bytes, plain = MMX 8")
+    t[0xDA] = Desc("PMINUB", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xDE] = Desc("PMAXUB", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xE7] = Desc("MOVNTDQ", ("RM32", "R32"),
+                   note="66=MOVNTDQ m128 (#GP on misaligned 16B EA), "
+                        "plain=MOVNTQ m64 (8B); NT = plain store here")
+    t[0xF8] = Desc("PSUBB", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+
     # Phase 5 L5c + SSE lanes: EMMS (x87 tag reset, rides the x87
     # handler set) and the 0F AE group /0-/3 (FXSAVE/FXRSTOR m512 from
     # L5c; LDMXCSR/STMXCSR m32 at /2,/3 from the SSE shared spec).
-    # /4-/7 (XSAVE family) stay INVALID.
+    # /4-/6 (XSAVE family, LFENCE/MFENCE) stay INVALID; RC7b T1 binds
+    # /7 SFENCE (present after NT-store blocks in the sysroot libc).
     t[0x77] = Desc("EMMS", modrm=0, note="x87 tag word reset (MMX done)")
     t[0xAE] = group_desc("0F AE group: FXSAVE /0, FXRSTOR /1, "
-                         "LDMXCSR /2, STMXCSR /3 (see i686_group_tab)")
+                         "LDMXCSR /2, STMXCSR /3, SFENCE /7 "
+                         "(see i686_group_tab)")
     return t
 
 
@@ -668,11 +712,11 @@ def build_groups():
                    "FUCOMIP rides FILD_m64 mod=3"))
     g.append(Group(1, 0xAE,
                    ["FXSAVE", "FXRSTOR", "LDMXCSR", "STMXCSR"]
-                   + ["INVALID"] * 4,
-                   [rm32, rm32, rm32, rm32] + [non] * 4, 0,
+                   + ["INVALID", "INVALID", "INVALID", "SFENCE"],
+                   [rm32, rm32, rm32, rm32, non, non, non, non], 0,
                    "0F AE: FXSAVE /0 and FXRSTOR /1 m512; LDMXCSR /2 and "
-                   "STMXCSR /3 m32 (Phase 5 shared spec); XSAVE-family "
-                   "/4-/7 declined"))
+                   "STMXCSR /3 m32 (Phase 5 shared spec); /4-/6 (XSAVE "
+                   "family, LFENCE/MFENCE) declined; SFENCE /7 (RC7b T1)"))
     return g
 
 
@@ -773,8 +817,8 @@ HEADER_NOTES = """\
  *    m32 integer arithmetic and FICOM, and the DA/DE C8-FF undefined
  *    second bytes -- decoded-but-declined modrm forms return UNDEF from
  *    their handlers instead), SSE3+ and the SSE/SSE2 leftovers not in
- *    the Phase 5 spec rows (MIN/MAX 5D/5F, MOVDQA/MOVDQU 6F/7F, 0F 2D,
- *    SHUFPS 0F C6, ...), BCD (27 2F 37 3F D4-D6),
+ *    the Phase 5 or RC7b T1 rows (MIN/MAX 5D/5F, SQRT family 51-53,
+ *    0F 2D, SHUFPS 0F C6, ...), BCD (27 2F 37 3F D4-D6),
  *    I/O (E4-E7 EC-EF 6C-6F), far transfers (9A EA CA CB),
  *    LES/LDS (C4 C5), BOUND/ARPL (62 63), PUSH/POP CS/SS (0E 16 17), and
  *    69/6B (IMUL Gv,Ev,Iz/Ib has no v1 contract id).
@@ -795,6 +839,26 @@ HEADER_NOTES = """\
  *    slot's handler.  Operand kinds on x87 rows are documentation only:
  *    RM32/RM16 stand for m32fp/m64fp/m80/m16/m512 (no 64/80-bit frozen
  *    kinds exist) and NONE marks implicit-stack forms.
+ *  - RC7b triage T1 (sanctioned union extension, docs/lanes/phase-7.md):
+ *    the SSE2 data-movement + integer rows the wine32 sysroot binaries
+ *    (dash, ld-linux.so.2, glibc 2.44 libc.so.6) actually execute
+ *    joined the union, one id per 0F byte as above: MOVDQA/MOVDQU +
+ *    MMX MOVQ (6F load / 7F store rows, one id), MOVQ2DQ (D6: 66/F2/F3
+ *    forms), MOVNTDQ/MOVNTQ (E7), PSRLDQ/PSLLDQ + MMX PSRLQ/PSLLQ (73),
+ *    PCMPGTB (64), PCMPEQB (74), PCMPEQD (76), PMOVMSKB (D7), PMINUB
+ *    (DA), PMAXUB (DE), PSUBB (F8), PREFETCHh (18; hint-NOP, no memory
+ *    access, no faults), and SFENCE via the 0F AE group /7 slot (fence
+ *    = no-op in the single-threaded TSO guest model).  66 0F 6F/7F and
+ *    the NT stores raise #GP(0) (trapno 13 via the seg-fault path,
+ *    eip unadvanced) on misaligned EAs in the interpreter; MOVAPS keeps
+ *    its documented v1 no-fault behavior, and the DBT emits plain Q
+ *    moves/stores without the alignment check (documented deviation).
+ *    Still left INVALID: the three-byte maps 0F 38/0F 3A (SSSE3/SSE4,
+ *    CPUID-gated off under the v1 feature set), 0F 01 (RDPKRU/XGETBV,
+ *    system class, OSXSAVE-gated), 0F C7 (XSAVEC), 0F AE /4-/6 (XSAVE
+ *    family; LFENCE/MFENCE not present in the targets), PCMPEQW 75
+ *    (present nowhere in the targets), and every row not appearing in
+ *    the sweep (MIN/MAX 5D/5F, SQRT 51-53, PACK/PCMPGTW-D, ...).
 """
 
 
@@ -808,9 +872,10 @@ def generate():
     if dups:
         raise SystemExit("duplicate contract ids: %r" % dups)
     ids = sorted(set(ids))
-    if len(ids) != 345:
-        raise SystemExit("expected 345 contract ids (+S1 IMUL +S4 RDTSC "
-                         "+S5 x87 54 +S5 SSE 42), got %d" % len(ids))
+    if len(ids) != 358:
+        raise SystemExit("expected 358 contract ids (+S1 IMUL +S4 RDTSC "
+                         "+S5 x87 54 +S5 SSE 42 +RC7b T1 SSE2 movement 13), "
+                         "got %d" % len(ids))
 
     oneb = build_oneb()
     twob = build_twob()

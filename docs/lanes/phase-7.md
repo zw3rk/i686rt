@@ -340,3 +340,130 @@ Deviations / notes:
 - RC7b itself (running `wine cmd /c echo ok` under i686rt --sysroot
   against this tree) is the coordinator's card, not this lane's.
 
+## RC7b triage T1 record (2026-10-22) — PASSED
+
+Lane T1 (`lane/7b-t1`, worktree `../i686rt-t1`): sanctioned instruction
+union extension (docs/lanes/phase-7.md RC7b context) so the Debian i386
+glibc 2.44 SSE2 paths run.  Worktree/branch sanity: clean on start,
+nothing pushed, no AI identity in the commit.
+
+### A. Sweep (capstone 5.0.7; linear sweep of every PT_LOAD PF_X segment
+plus a recursive pass from e_entry + every STT_FUNC symbol; instruction
+bytes classified by mandatory-prefix class (plain/66/F3/F2) against the
+parsed i686_insn_tab_0f rows)
+
+Sweep target files (staging sysroot, read-only):
+
+    usr/bin/dash                                   (149,332 B)
+    lib/i386-linux-gnu/ld-linux.so.2               (240,976 B)
+    usr/lib/i386-linux-gnu/libc.so.6             (2,366,024 B)
+
+Rows currently mapped I686_OP_INVALID that appear in the binaries
+(lin = linear-sweep hits, rec = recursive-pass hits; rec=0 means the
+bounded recursive pass did not reach the site, not unreachability --
+linear presence plus containing-function identity governs the
+classification; CPUID under i686rt advertises exactly
+FPU/TSC/CX8/CMOV/MMX/FXSR/SSE/SSE2, ECX=0, so SSSE3+/OSXSAVE-gated
+variants are never selected by glibc IFUNC):
+
+    bytes     forms                                  lin    rec  classify
+    0F 66 6F  MOVDQA load                             2302     4  IMPLEMENT
+    0F F3 6F  MOVDQU load                              697    77  IMPLEMENT
+    0F 66 7F  MOVDQA store                             957     0  IMPLEMENT
+    0F F3 7F  MOVDQU store                             497     0  IMPLEMENT
+    0F 66 D6  MOVQ m64/xmm-low <- xmm                  292     0  IMPLEMENT
+    0F 66 E7  MOVNTDQ (NT memset large path)           130     0  IMPLEMENT
+    0F 66 73  PSRLDQ/PSLLDQ                            184     0  IMPLEMENT
+    0F 66 74  PCMPEQB (strlen/strchr family)          1508     0  IMPLEMENT
+    0F 66 76  PCMPEQD                                  144   109  IMPLEMENT
+    0F 66 D7  PMOVMSKB                                1352    56  IMPLEMENT
+    0F 66 DA  PMINUB                                   351     0  IMPLEMENT
+    0F 66 DE  PMAXUB                                    18     0  IMPLEMENT
+    0F 66 F8  PSUBB                                    237    53  IMPLEMENT
+    0F 66 64  PCMPGTB                                  408     0  IMPLEMENT
+    0F 18     PREFETCHh (hint-NOP, same NT paths)      126     0  IMPLEMENT
+    0F AE /7  SFENCE (8 sites after NT-store blocks)    --     0  IMPLEMENT
+              (group slot; objdump-verified sites 0x19292b et al.)
+    0F 38/3A  pshufb/ptest/palignr/pcmpistri           1789    0  leave (3-byte maps; SSSE3/SSE4 CPUID-gated off)
+    0F 01     rdpkru/wrpkru/xgetbv                        5    0  leave (system class, OSXSAVE-gated)
+    0F C7     xsavec                                      2    0  leave (XSAVE family)
+    0F AE /4  xsave (ld-linux, OSXSAVE branch)            2    0  leave (XSAVE family)
+    0F AE /5-/6  lfence/mfence                       (absent -- objdump finds none)  leave
+    0F 75     PCMPEQW                               (absent everywhere)          leave
+
+Not present at all (plain or prefixed): 0F 6F/7F MMX MOVQ forms,
+0F 71/72 shift groups, 0F 75 PCMPEQW, MIN/MAX 5D/5F, SQRT 51-53,
+F2 0F xx of every row above (only three mid-instruction desync
+artifacts `f2 0f 00/03/f1`, not real instructions).  dash's own code
+and ld-linux carry none of the implemented forms (only the CPUID-gated
+xsave/xgetbv in ld-linux).
+
+### B. Implementation (one id per 0F byte, prefix variants in-handler)
+
+- tools/gen_insn_tab.py: +13 contract ids (MOVDQA, MOVQ2DQ, MOVNTDQ,
+  PCMPGTB, PSRLDQ, PCMPEQB, PCMPEQD, PMINUB, PMAXUB, PSUBB, PMOVMSKB,
+  PREFETCH, SFENCE); union 345 -> 358 ids, I686_OP_COUNT 359.  Rows:
+  6F load ("R32","RM32") / 7F store ("RM32","R32") share I686_OP_MOVDQA;
+  D6/E7 store-direction rows; 73 carries I8 (handler sub-dispatches
+  /2 /3 under 66, /2 /6 plain MMX); 18 PREFETCH (modrm-sized, no
+  access); SFENCE binds the 0F AE group /7 slot (opnd NONE).  Header
+  notes updated (RC7b T1 bullet + INVALID list).
+- src/x86/insn_tab.h regenerated; tools/test_insn_tab.py expectations
+  extended (13 ids, 14 spot rows, 0F AE group row); also chmod +x on
+  both tools so the acceptance chain runs verbatim.
+- src/interp/h_sse.c: handlers per existing conventions (src128/
+  int_vec_* / mm_rd/mm_wr, sse_done; sse_ea for the alignment check).
+  MOVDQA (66 0F 6F/7F) and MOVNTDQ/MOVNTQ (0F E7) raise #GP(0) on
+  misaligned EAs via the seg-fault channel (exit_arg=13, exit_dest=0,
+  fault_addr=EA, eip unadvanced, resumable); MOVAPS keeps its documented
+  v1 no-fault behavior.  PMOVMSKB rejects mod!=3 as UNDEF (#UD); plain
+  MMX variants of every row implemented as the correctness oracle.
+- src/dbt/emit_sse.c: emitters for the 66/F3 forms of every implemented
+  row (NEON, ctx-scratch conventions; new verified raw words: EXT,
+  CMEQ .16B/.4S, CMGT .16B, UMIN/UMAX .16B, SUB .16B, UMOV B-lane --
+  all checked against the cross assembler).  MOVDQA/MOVDQU emit plain
+  Q moves (alignment check is interpreter-only -- v1 MOVAPS-class
+  deviation, documented); MOVNTDQ emits a plain Q store; SFENCE and
+  PREFETCH emit nothing; MMX (plain) forms and F2 on 6F/7F decline to
+  the D2 oracle.
+- OUT-OF-SCOPE COORDINATION EDIT (disclosed, needs coordinator review):
+  the union growth collided with the Phase-7 synthetic registry ids
+  350..359 hard-coded in src/x86/decode.c AND src/interp/h_seg.c (the
+  h_seg.c _Static_assert fired, by design).  Both identical tables moved
+  lockstep to 460..469 (registry holds 512 slots; 91 headroom under the
+  cap, 100 above the enum).  Behavior-preserving: private registry
+  indices only; no seg/h_seg logic touched.
+
+### C. Acceptance check (single run, 2026-10-22)
+
+    tools/test_insn_tab.py && make build CC=<aarch64-unknown-linux-musl-gcc> \
+      && docker run --rm --name t1-check --platform linux/arm64 --memory 2g \
+         --cpus 2 -v /tmp/t1-check-stage:/w alpine:3.20 sh -c \
+         'export HOME=/tmp/h; mkdir -p /tmp/h; timeout 90 /w/i686rt \
+          --sysroot /w/sysroot -- /w/sysroot/usr/bin/sh -c "echo dash-ok"'
+
+Output, verbatim (rc=0; container gone -- `docker ps -a --filter
+name=t1-check` empty after the run):
+
+    L1A OK
+    BUILD-OK
+    dash-ok
+
+(check-chain rc=0, first attempt; build log zero warnings.  Pre-flight
+runs against throwaway trees preceded it: default engine and
+I686RT_ENGINE=dbt both print dash-ok.)
+
+Deviations / notes:
+- The h_seg.c/decode.c synthetic-id renumber above is the only
+  out-of-scope touch; everything else is inside the card (tools/,
+  insn_tab.h, h_sse.c, emit_sse.c, decode.c, phase-7.md).  src/os/*,
+  src/main.c, seg.c, tests/golden/* untouched (golden outputs
+  unverified-by-construction: no fixture rerun, no generator output
+  change on any previously-ratified row).
+- MOVDQA alignment #GP is interpreter-only; DBT emits unaligned-capable
+  Q moves (same class as the ratified v1 MOVAPS deviation).  A guest
+  that takes the fault under DBT silently proceeds instead of #GP.
+- The sweep counts are static-analysis evidence (both passes bounded);
+  reachability under the v1 CPUID argued per row above, not proven by
+  execution for rec=0 rows.
+

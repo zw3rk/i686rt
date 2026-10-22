@@ -65,24 +65,26 @@ extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
                                 unsigned bytes);
 
 /* Synthetic opcode ids for bytes whose generated insn_tab rows are
- * INVALID.  The interp registry holds 512 slots and the frozen enum ends
- * at I686_OP_COUNT (346); ids 350..359 are Phase-7 private.  MUST match
+ * INVALID.  The interp registry holds 512 slots and the enum ends
+ * at I686_OP_COUNT (359 after the RC7b T1 union extension); ids
+ * 460..469 are Phase-7 private (moved up from 350 by the sanctioned
+ * union extension — docs/lanes/phase-7.md T1 record).  MUST match
  * the identical table in src/x86/decode.c (decode.c synthesizes, this
  * file registers the handlers). */
 enum {
-    I686_OP7_POP_SS = 350, /* 17                       */
-    I686_OP7_CALLF  = 351, /* 9A Ap (m16:16 / m16:32)  */
-    I686_OP7_JMPF   = 352, /* EA Ap                    */
-    I686_OP7_LES    = 353, /* C4 r,mp16:16/32          */
-    I686_OP7_LDS    = 354, /* C5 r,mp                  */
-    I686_OP7_RETF   = 355, /* CB                       */
-    I686_OP7_LSS    = 356, /* 0F B2 r,mp               */
-    I686_OP7_LFS    = 357, /* 0F B4 r,mp               */
-    I686_OP7_LGS    = 358, /* 0F B5 r,mp               */
-    I686_OP7_PRIV   = 359  /* E4-E7/EC-EF, 0F 20-23 (16-bit code) */
+    I686_OP7_POP_SS = 460, /* 17                       */
+    I686_OP7_CALLF  = 461, /* 9A Ap (m16:16 / m16:32)  */
+    I686_OP7_JMPF   = 462, /* EA Ap                    */
+    I686_OP7_LES    = 463, /* C4 r,mp16:16/32          */
+    I686_OP7_LDS    = 464, /* C5 r,mp                  */
+    I686_OP7_RETF   = 465, /* CB                       */
+    I686_OP7_LSS    = 466, /* 0F B2 r,mp               */
+    I686_OP7_LFS    = 467, /* 0F B4 r,mp               */
+    I686_OP7_LGS    = 468, /* 0F B5 r,mp               */
+    I686_OP7_PRIV   = 469  /* E4-E7/EC-EF, 0F 20-23 (16-bit code) */
 };
 
-_Static_assert(I686_OP_COUNT <= 350u, "Phase-7 synthetic op ids collide with the frozen enum");
+_Static_assert(I686_OP_COUNT <= 460u, "Phase-7 synthetic op ids collide with the frozen enum");
 
 /* ------------------------------------------------------------------ */
 /* Shared helpers                                                      */

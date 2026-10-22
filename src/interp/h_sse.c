@@ -39,16 +39,19 @@
  *    results and every conversion, but f64 arithmetic itself is
  *    host-nearest in v1 (documented gap).
  *
- * Other v1 notes: no alignment fault is raised for the aligned forms
- * (MOVAPS/MOVAPD on unaligned EAs simply load/store); MOVMSKPS/PD and
- * LDMXCSR/STMXCSR reject the reserved mod=3 / memory forms as
- * I686_EXIT_UNDEF (matching #UD); PAUSE (F3 90) already decodes to NOP
- * and needs nothing here; FXSAVE/XSAVE-family rows were declined in
- * the generator and never reach a handler.  MMX registers alias the
- * low 8 bytes of ctx->x87_st[] and EMMS empties the tag word — both
- * touch the frozen state directly until L5c's x87.c lands the
- * mmx_get/mmx_set + tag-sync accessors (S5 coordination: switch these
- * few lines over then; the storage layout is ABI-identical).
+ * Other v1 notes: no alignment fault is raised for the Phase 5 aligned
+ * forms (MOVAPS/MOVAPD on unaligned EAs simply load/store); the RC7b T1
+ * aligned forms (66 0F 6F/7F MOVDQA, 0F E7 MOVNTDQ/MOVNTQ) DO check and
+ * raise #GP(0) through the seg-fault channel with eip at the faulting
+ * instruction.  MOVMSKPS/PD and LDMXCSR/STMXCSR reject the reserved
+ * mod=3 / memory forms as I686_EXIT_UNDEF (matching #UD); PAUSE (F3 90)
+ * already decodes to NOP and needs nothing here; FXSAVE/XSAVE-family
+ * rows were declined in the generator and never reach a handler.  MMX
+ * registers alias the low 8 bytes of ctx->x87_st[] and EMMS empties the
+ * tag word — both touch the frozen state directly until L5c's x87.c
+ * lands the mmx_get/mmx_set + tag-sync accessors (S5 coordination:
+ * switch these few lines over then; the storage layout is ABI-
+ * identical).
  *
  * i686_interp_sse_init is NOT called by interp.c yet — the coordinator
  * wires it at S5.  Calling it twice is harmless (registry last-wins).
@@ -1630,6 +1633,319 @@ static int h_pshufw(i686_ctx_t *ctx, const x86_insn_t *insn)
 }
 
 /* ------------------------------------------------------------------ */
+/* RC7b T1: SSE2 data movement + integer rows (docs/lanes/phase-7.md)  */
+/* ------------------------------------------------------------------ */
+
+/* #GP(0) for the aligned forms (MOVDQA, MOVNTDQ/MOVNTQ): delivered via
+ * the seg-fault channel (trapno 13 in exit_arg, error code 0 in
+ * exit_dest, cr2 = the offending EA); eip stays at the instruction. */
+static int sse_aligned_fault(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    ctx->exit_arg = 13u; /* #GP */
+    ctx->exit_dest = 0u;
+    ctx->fault_addr = sse_ea(ctx, insn);
+    return I686_EXIT_FAULT;
+}
+
+/* MOVDQA/MOVDQU + MMX MOVQ (0F 6F load row / 0F 7F store row, one id;
+ * direction from opnd[0]): 66 = MOVDQA (#GP(0) on a misaligned 16-byte
+ * EA), F3 = MOVDQU, plain = MMX MOVQ (8 bytes, m64/mm); F2 is undefined
+ * x86.  MOVAPS keeps its documented v1 no-fault behavior -- only the
+ * RC7b aligned forms check alignment. */
+static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    int load = (insn->opnd[0] == I686_OPND_R32);
+    uint8_t buf[16];
+
+    if (insn->pfx_rep == 2U) {
+        return I686_EXIT_UNDEF; /* F2 0F 6F/7F: undefined x86 */
+    }
+    if (insn->pfx_rep == 0U) { /* plain: MMX MOVQ mm <-> m64/mm */
+        uint64_t v;
+        if (load) {
+            if (insn->modrm_mod == 3U) {
+                v = mm_rd(ctx, insn->modrm_rm);
+            } else {
+                sse_ld(ctx, insn, &v, 8);
+            }
+            mm_wr(ctx, insn->modrm_reg, v);
+        } else {
+            v = mm_rd(ctx, insn->modrm_reg);
+            if (insn->modrm_mod == 3U) {
+                mm_wr(ctx, insn->modrm_rm, v);
+            } else {
+                sse_st(ctx, insn, &v, 8);
+            }
+        }
+        return sse_done(ctx, insn);
+    }
+    if (insn->pfx_opsize != 0U && insn->modrm_mod != 3U &&
+        (sse_ea(ctx, insn) & 15U) != 0U) {
+        return sse_aligned_fault(ctx, insn); /* MOVDQA: #GP(0) */
+    }
+    if (load) {
+        src128(ctx, insn, buf);
+        sse_set_xmm(ctx, insn->modrm_reg, buf);
+    } else {
+        sse_get_xmm(ctx, insn->modrm_reg, buf);
+        if (insn->modrm_mod == 3U) {
+            sse_set_xmm(ctx, insn->modrm_rm, buf);
+        } else {
+            sse_st(ctx, insn, buf, 16);
+        }
+    }
+    return sse_done(ctx, insn);
+}
+
+/* MOVQ family row (0F D6): 66 = MOVQ m64/xmm-low64 <- xmm.d0 (reg-reg
+ * keeps the dest upper), F2 = MOVDQ2Q mm <- xmm.d0 (reg-only), F3 =
+ * MOVQ2DQ xmm <- mm (upper zeroed); plain D6 is undefined x86. */
+static int h_movq2dq(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    uint8_t src[16];
+    uint64_t v;
+
+    if (insn->pfx_opsize != 0U) { /* 66 0F D6: MOVQ xmm2/m64, xmm1 */
+        sse_get_xmm(ctx, insn->modrm_reg, src);
+        memcpy(&v, src, 8);
+        if (insn->modrm_mod == 3U) {
+            uint8_t dst[16];
+            sse_get_xmm(ctx, insn->modrm_rm, dst);
+            memcpy(dst, &v, 8);
+            sse_set_xmm(ctx, insn->modrm_rm, dst);
+        } else {
+            sse_st(ctx, insn, &v, 8);
+        }
+    } else if (insn->pfx_rep == 2U) { /* F2: MOVDQ2Q mm, xmm */
+        if (insn->modrm_mod != 3U) {
+            return I686_EXIT_UNDEF; /* memory form is #UD */
+        }
+        sse_get_xmm(ctx, insn->modrm_rm, src);
+        memcpy(&v, src, 8);
+        mm_wr(ctx, insn->modrm_reg, v);
+    } else if (insn->pfx_rep == 1U) { /* F3: MOVQ2DQ xmm, mm */
+        uint8_t x[16];
+        v = mm_rd(ctx, insn->modrm_rm);
+        memset(x, 0, sizeof x);
+        memcpy(x, &v, 8);
+        sse_set_xmm(ctx, insn->modrm_reg, x);
+    } else {
+        return I686_EXIT_UNDEF; /* plain 0F D6: undefined x86 */
+    }
+    return sse_done(ctx, insn);
+}
+
+/* MOVNTDQ/MOVNTQ (0F E7): 66 = m128 <- xmm (16-byte-aligned NT store),
+ * plain = MOVNTQ m64 <- mm (8-byte-aligned); the register form and
+ * F2/F3 are undefined x86.  Non-temporal semantics are plain stores at
+ * this level (single-threaded TSO guest). */
+static int h_movntdq(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    unsigned align;
+
+    if (insn->pfx_rep != 0U || insn->modrm_mod == 3U) {
+        return I686_EXIT_UNDEF;
+    }
+    align = (insn->pfx_opsize != 0U) ? 16U : 8U;
+    if ((sse_ea(ctx, insn) & (align - 1U)) != 0U) {
+        return sse_aligned_fault(ctx, insn); /* #GP(0) */
+    }
+    if (insn->pfx_opsize != 0U) {
+        uint8_t buf[16];
+        sse_get_xmm(ctx, insn->modrm_reg, buf);
+        sse_st(ctx, insn, buf, 16);
+    } else {
+        uint64_t v = mm_rd(ctx, insn->modrm_reg);
+        sse_st(ctx, insn, &v, 8);
+    }
+    return sse_done(ctx, insn);
+}
+
+/* PSRLDQ row (0F 73): 66 /2 = PSRLDQ, /3 = PSLLDQ (whole-register byte
+ * shifts by imm8, >= 16 gives zero); plain /2 = MMX PSRLQ, /6 = PSLLQ
+ * (count masked to 6 bits); other /digits and F2/F3 are undefined. */
+static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    unsigned imm = insn->imm & 0xFFu;
+    unsigned dig = insn->modrm_reg;
+
+    if (insn->pfx_rep != 0U) {
+        return I686_EXIT_UNDEF;
+    }
+    if (insn->pfx_opsize != 0U) { /* 66: xmm forms */
+        uint8_t s[16], out[16];
+        if (dig != 2U && dig != 3U) {
+            return I686_EXIT_UNDEF;
+        }
+        src128(ctx, insn, s);
+        memset(out, 0, sizeof out);
+        if (imm < 16U) {
+            if (dig == 2U) { /* PSRLDQ: out[j] = s[j - imm] */
+                memcpy(out + imm, s, 16U - imm);
+            } else { /* PSLLDQ: out[j] = s[j + imm] */
+                memcpy(out, s + imm, 16U - imm);
+            }
+        }
+        sse_set_xmm(ctx, insn->modrm_reg, out);
+    } else { /* plain: MMX PSRLQ /2, PSLLQ /6 */
+        uint64_t v;
+        unsigned cnt;
+        if (dig != 2U && dig != 6U) {
+            return I686_EXIT_UNDEF;
+        }
+        if (insn->modrm_mod == 3U) {
+            v = mm_rd(ctx, insn->modrm_rm);
+        } else {
+            sse_ld(ctx, insn, &v, 8);
+        }
+        cnt = imm & 63U; /* MMX: count masked to 6 bits */
+        if (dig == 2U) {
+            v = (cnt == 0U) ? v : (v >> cnt);
+        } else {
+            v = (cnt == 0U) ? v : (v << cnt);
+        }
+        mm_wr(ctx, insn->modrm_reg, v);
+    }
+    return sse_done(ctx, insn);
+}
+
+/* PCMPGTB (0F 64) / PCMPEQB (0F 74) / PCMPEQD (0F 76): per-element
+ * compares with all-ones/zero masks; 66 = 16-byte xmm, plain = 8-byte
+ * MMX. */
+typedef enum { PCMP_GT8 = 0, PCMP_EQ8, PCMP_EQ32 } pcmp_kind;
+
+static int h_pcmp(i686_ctx_t *ctx, const x86_insn_t *insn, pcmp_kind k)
+{
+    uint8_t d[16], s[16];
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    unsigned n = xmm ? 16U : 8U; /* operand bytes */
+    unsigned esz = (k == PCMP_EQ32) ? 4U : 1U;
+    unsigned i;
+
+    int_vec_dst_fetch(ctx, insn, d, xmm);
+    for (i = 0U; i < n; i += esz) {
+        int t;
+        if (k == PCMP_GT8) {
+            t = (int8_t)d[i] > (int8_t)s[i];
+        } else if (esz == 4U) {
+            t = lane32(d, i / 4U) == lane32(s, i / 4U);
+        } else {
+            t = d[i] == s[i];
+        }
+        memset(d + i, t ? 0xFF : 0x00, esz);
+    }
+    int_vec_dst(ctx, insn, d, xmm);
+    return sse_done(ctx, insn);
+}
+
+static int h_pcmp_gt8(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return h_pcmp(ctx, insn, PCMP_GT8);
+}
+
+static int h_pcmp_eq8(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return h_pcmp(ctx, insn, PCMP_EQ8);
+}
+
+static int h_pcmp_eq32(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return h_pcmp(ctx, insn, PCMP_EQ32);
+}
+
+/* PMOVMSKB (0F D7): r32 <- byte sign mask of xmm[rm] (66, 16 bits) or
+ * mm[rm] (plain, 8 bits); reg-only (mod=3), F2/F3 undefined. */
+static int h_pmovmskb(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    uint8_t src[16];
+    uint32_t r = 0U;
+    unsigned n, i;
+
+    if (insn->modrm_mod != 3U || insn->pfx_rep != 0U) {
+        return I686_EXIT_UNDEF;
+    }
+    if (insn->pfx_opsize != 0U) {
+        sse_get_xmm(ctx, insn->modrm_rm, src);
+        n = 16U;
+    } else {
+        uint64_t m = mm_rd(ctx, insn->modrm_rm);
+        memset(src, 0, sizeof src);
+        memcpy(src, &m, 8);
+        n = 8U;
+    }
+    for (i = 0U; i < n; i++) {
+        r |= (uint32_t)(src[i] >> 7) << i;
+    }
+    ctx->gpr[insn->modrm_reg & 7U] = r;
+    return sse_done(ctx, insn);
+}
+
+/* PMINUB (0F DA) / PMAXUB (0F DE): unsigned byte min/max; 66 = xmm,
+ * plain = MMX. */
+static int h_pminmaxub(i686_ctx_t *ctx, const x86_insn_t *insn, int is_max)
+{
+    uint8_t d[16], s[16];
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    unsigned n = xmm ? 16U : 8U;
+    unsigned i;
+
+    int_vec_dst_fetch(ctx, insn, d, xmm);
+    for (i = 0U; i < n; i++) {
+        d[i] = (is_max ? (d[i] > s[i]) : (d[i] < s[i])) ? d[i] : s[i];
+    }
+    int_vec_dst(ctx, insn, d, xmm);
+    return sse_done(ctx, insn);
+}
+
+static int h_pminub(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return h_pminmaxub(ctx, insn, 0);
+}
+
+static int h_pmaxub(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return h_pminmaxub(ctx, insn, 1);
+}
+
+/* PSUBB (0F F8): byte lanes; 66 = xmm, plain = MMX. */
+static int h_psubb(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    uint8_t d[16], s[16];
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    unsigned n = xmm ? 16U : 8U;
+    unsigned i;
+
+    int_vec_dst_fetch(ctx, insn, d, xmm);
+    for (i = 0U; i < n; i++) {
+        d[i] = (uint8_t)(d[i] - s[i]);
+    }
+    int_vec_dst(ctx, insn, d, xmm);
+    return sse_done(ctx, insn);
+}
+
+/* PREFETCHh (0F 18): performance hint — no memory access, no faults,
+ * no architected result (the modrm byte only sizes the instruction).
+ * The 66/F2/F3 forms are undefined x86. */
+static int h_prefetch(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    if (insn->pfx_opsize != 0U || insn->pfx_rep != 0U) {
+        return I686_EXIT_UNDEF;
+    }
+    return sse_done(ctx, insn);
+}
+
+/* SFENCE (0F AE /7): store fence — a no-op in the single-threaded TSO
+ * guest model (plain stores order naturally).  The memory modrm forms
+ * are undefined x86 (#UD). */
+static int h_sfence(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    if (insn->modrm_mod != 3U) {
+        return I686_EXIT_UNDEF;
+    }
+    return sse_done(ctx, insn);
+}
+
+/* ------------------------------------------------------------------ */
 /* MXCSR / EMMS                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1715,6 +2031,19 @@ void i686_interp_sse_init(void)
     i686_interp_register(I686_OP_PSUBD, h_psubd);
     i686_interp_register(I686_OP_PSUBQ, h_psubq);
     i686_interp_register(I686_OP_PADDD, h_paddd);
+    i686_interp_register(I686_OP_MOVDQA, h_movdqa);
+    i686_interp_register(I686_OP_MOVQ2DQ, h_movq2dq);
+    i686_interp_register(I686_OP_MOVNTDQ, h_movntdq);
+    i686_interp_register(I686_OP_PSRLDQ, h_pshiftdq);
+    i686_interp_register(I686_OP_PCMPGTB, h_pcmp_gt8);
+    i686_interp_register(I686_OP_PCMPEQB, h_pcmp_eq8);
+    i686_interp_register(I686_OP_PCMPEQD, h_pcmp_eq32);
+    i686_interp_register(I686_OP_PMOVMSKB, h_pmovmskb);
+    i686_interp_register(I686_OP_PMINUB, h_pminub);
+    i686_interp_register(I686_OP_PMAXUB, h_pmaxub);
+    i686_interp_register(I686_OP_PSUBB, h_psubb);
+    i686_interp_register(I686_OP_PREFETCH, h_prefetch);
+    i686_interp_register(I686_OP_SFENCE, h_sfence);
     i686_interp_register(I686_OP_LDMXCSR, h_ldmxcsr);
     i686_interp_register(I686_OP_STMXCSR, h_stmxcsr);
     i686_interp_register(I686_OP_EMMS, h_emms);

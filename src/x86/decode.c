@@ -27,7 +27,7 @@
  *     and GDT accesses are never limit-checked (v1 behaviour).
  *   - Bytes whose generated table rows are INVALID but which Phase 7
  *     must execute (pops/far transfers/les-family/privileged ops)
- *     decode here into synthetic registry ids (350..359) handled by
+ *     decode here into synthetic registry ids (460..469) handled by
  *     src/interp/h_seg.c; see far_op_decode below.
  */
 
@@ -51,20 +51,22 @@ static uint8_t eff_default16(const i686_ctx_t *ctx)
 
 /*
  * Phase-7 synthetic opcode ids (registry-only; the enum ends at
- * I686_OP_COUNT = 346, the interp registry holds 512 slots).  MUST match
- * the identical table in src/interp/h_seg.c (which registers handlers).
+ * I686_OP_COUNT = 359 after the RC7b T1 union extension, the interp
+ * registry holds 512 slots; the block moved up from 350 with that
+ * extension — docs/lanes/phase-7.md T1 record).  MUST match the
+ * identical table in src/interp/h_seg.c (which registers handlers).
  */
 enum {
-    I686_OP7_POP_SS = 350, /* 17                                      */
-    I686_OP7_CALLF  = 351, /* 9A Ap: m16:16 / m16:32 far pointer      */
-    I686_OP7_JMPF   = 352, /* EA Ap                                   */
-    I686_OP7_LES    = 353, /* C4 Gv,mp                                */
-    I686_OP7_LDS    = 354, /* C5 Gv,mp                                */
-    I686_OP7_RETF   = 355, /* CB                                      */
-    I686_OP7_LSS    = 356, /* 0F B2 Gv,mp                             */
-    I686_OP7_LFS    = 357, /* 0F B4 Gv,mp                             */
-    I686_OP7_LGS    = 358, /* 0F B5 Gv,mp                             */
-    I686_OP7_PRIV   = 359  /* E4-E7/EC-EF, 0F 20-23 (16-bit code)     */
+    I686_OP7_POP_SS = 460, /* 17                                      */
+    I686_OP7_CALLF  = 461, /* 9A Ap: m16:16 / m16:32 far pointer      */
+    I686_OP7_JMPF   = 462, /* EA Ap                                   */
+    I686_OP7_LES    = 463, /* C4 Gv,mp                                */
+    I686_OP7_LDS    = 464, /* C5 Gv,mp                                */
+    I686_OP7_RETF   = 465, /* CB                                      */
+    I686_OP7_LSS    = 466, /* 0F B2 Gv,mp                             */
+    I686_OP7_LFS    = 467, /* 0F B4 Gv,mp                             */
+    I686_OP7_LGS    = 468, /* 0F B5 Gv,mp                             */
+    I686_OP7_PRIV   = 469  /* E4-E7/EC-EF, 0F 20-23 (16-bit code)     */
 };
 
 static uint8_t fetch8(i686_ctx_t *ctx, uint32_t va)

@@ -110,6 +110,16 @@ EXPECTED_IDS += [
     "LDMXCSR", "STMXCSR", "EMMS",
 ]
 
+# RC7b triage T1 (docs/lanes/phase-7.md): sanctioned union extension for
+# the SSE2 data-movement + integer rows the wine32 sysroot binaries
+# execute; SFENCE rides the 0F AE group /7 slot.
+EXPECTED_IDS += [
+    "MOVDQA", "MOVQ2DQ", "MOVNTDQ",
+    "PCMPGTB", "PSRLDQ", "PCMPEQB", "PCMPEQD",
+    "PMINUB", "PMAXUB", "PSUBB", "PMOVMSKB",
+    "PREFETCH", "SFENCE",
+]
+
 # Phase 5 L5c x87/MMX set (docs/lanes/phase-5.md + hardware-verified
 # second bytes): D8-DF group ids plus 0F 77 EMMS and 0F AE /0-/1.
 EXPECTED_IDS += [
@@ -245,6 +255,7 @@ S_0F = [
     (0x12, "MOVLPS", ("R32", "RM32"), 1, 0, 0),
     (0x13, "MOVLPS", ("RM32", "R32"), 1, 0, 0),
     (0x14, "INVALID", None, 0, 0, 0),               # UNPCKLPS not in v1
+    (0x18, "PREFETCH", ("RM32",), 1, 0, 0),         # RC7b T1 hint-NOP
     (0x16, "MOVHPS", ("R32", "RM32"), 1, 0, 0),
     (0x17, "MOVHPS", ("RM32", "R32"), 1, 0, 0),
     (0x28, "MOVAPS", ("R32", "RM32"), 1, 0, 0),
@@ -271,16 +282,21 @@ S_0F = [
     (0x61, "PUNPCKLWD", ("R32", "RM32"), 1, 0, 0),
     (0x62, "PUNPCKLDQ", ("R32", "RM32"), 1, 0, 0),
     (0x63, "INVALID", None, 0, 0, 0),               # PACKSSWB not in v1
+    (0x64, "PCMPGTB", ("R32", "RM32"), 1, 0, 0),    # RC7b T1
     (0x68, "PUNPCKHBW", ("R32", "RM32"), 1, 0, 0),
     (0x69, "PUNPCKHWD", ("R32", "RM32"), 1, 0, 0),
     (0x6A, "PUNPCKHDQ", ("R32", "RM32"), 1, 0, 0),
     (0x6C, "PUNPCKLQDQ", ("R32", "RM32"), 1, 0, 0),
     (0x6D, "PUNPCKHQDQ", ("R32", "RM32"), 1, 0, 0),
     (0x6E, "MOVQ_xmm", ("R32", "RM32"), 1, 0, 0),
-    (0x6F, "INVALID", None, 0, 0, 0),               # MOVDQA/MOVDQU not in v1
+    (0x6F, "MOVDQA", ("R32", "RM32"), 1, 0, 0),     # RC7b T1 (+F3/plain)
     (0x70, "PSHUFW", ("R32", "RM32", "I8"), 1, 0, 0),
+    (0x73, "PSRLDQ", ("R32", "RM32", "I8"), 1, 0, 0),  # RC7b T1
+    (0x74, "PCMPEQB", ("R32", "RM32"), 1, 0, 0),    # RC7b T1
+    (0x75, "INVALID", None, 0, 0, 0),               # PCMPEQW unused
+    (0x76, "PCMPEQD", ("R32", "RM32"), 1, 0, 0),    # RC7b T1
     (0x7E, "MOVQ_xmm", ("RM32", "R32"), 1, 0, 0),
-    (0x7F, "INVALID", None, 0, 0, 0),
+    (0x7F, "MOVDQA", ("RM32", "R32"), 1, 0, 0),     # RC7b T1 store row
     (0xC2, "CMPPS", ("R32", "RM32", "I8"), 1, 0, 0),
     (0xD4, "PADDQ", ("R32", "RM32"), 1, 0, 0),
     (0xD5, "PMULLW", ("R32", "RM32"), 1, 0, 0),
@@ -292,6 +308,13 @@ S_0F = [
     (0xFA, "PSUBD", ("R32", "RM32"), 1, 0, 0),
     (0xFB, "PSUBQ", ("R32", "RM32"), 1, 0, 0),
     (0xFE, "PADDD", ("R32", "RM32"), 1, 0, 0),
+    # RC7b T1 rows (D6/D7/DA/DE/E7/F8).
+    (0xD6, "MOVQ2DQ", ("RM32", "R32"), 1, 0, 0),
+    (0xD7, "PMOVMSKB", ("R32", "RM32"), 1, 0, 0),
+    (0xDA, "PMINUB", ("R32", "RM32"), 1, 0, 0),
+    (0xDE, "PMAXUB", ("R32", "RM32"), 1, 0, 0),
+    (0xE7, "MOVNTDQ", ("RM32", "R32"), 1, 0, 0),
+    (0xF8, "PSUBB", ("R32", "RM32"), 1, 0, 0),
 ]
 
 # Group rows: ((map0f, opcode), [8 ids], lock mask)
@@ -331,9 +354,10 @@ S_GROUPS = [
     ((0, 0xDF), ["FILD_m16", "INVALID", "FIST_m16", "FISTP_m16",
                  "FNSTSW_AX", "FILD_m64", "FCOMIP", "FISTP_m64"], 0x00),
     # Phase 5 shared spec: 0F AE /2 LDMXCSR, /3 STMXCSR join the L5c
-    # FXSAVE/FXRSTOR group slots (/4-/7 stay INVALID).
-    ((1, 0xAE), ["FXSAVE", "FXRSTOR", "LDMXCSR", "STMXCSR"]
-     + ["INVALID"] * 4, 0x00),
+    # FXSAVE/FXRSTOR group slots; RC7b T1 binds /7 SFENCE (/4-/6 stay
+    # INVALID).
+    ((1, 0xAE), ["FXSAVE", "FXRSTOR", "LDMXCSR", "STMXCSR", "INVALID",
+                 "INVALID", "INVALID", "SFENCE"], 0x00),
 ]
 
 
