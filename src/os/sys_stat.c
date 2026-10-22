@@ -94,6 +94,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -498,9 +499,31 @@ static int64_t stat_path(i686_ctx_t *ctx, int dirfd, uint32_t path_va,
     if (r != 0) {
         return r;
     }
+    {
+        extern int i686_systrace_on(void);
+        if (i686_systrace_on()) {
+            (void)fprintf(stderr, "STAT %s\n", path);
+        }
+    }
+    /* Absolute guest paths resolve under --sysroot first (open_guest
+     * model; dash `test -x` stats sysroot paths, RC7b). */
+    if (path[0] == '/' && dirfd == AT_FDCWD && ctx->sysroot != NULL &&
+        ctx->sysroot[0] != '\0') {
+        char sp[L2A_PATH_MAX];
+        size_t sl = strlen(ctx->sysroot);
+
+        if (sl + strlen(path) < sizeof sp) {
+            memcpy(sp, ctx->sysroot, sl);
+            strcpy(sp + sl, path);
+            if (fstatat(AT_FDCWD, sp, &st, flags) == 0) {
+                goto have_stat;
+            }
+        }
+    }
     if (fstatat(dirfd, path, &st, flags) != 0) {
         return err_neg();
     }
+have_stat:;
     i686_stat64_from_host(&gs, &st);
     return i686_copy_to_guest(ctx, buf_va, &gs, sizeof(gs));
 }

@@ -653,7 +653,8 @@ static int64_t r_execve(i686_ctx_t *ctx)
 
     memset(ctx->gpr, 0, sizeof(ctx->gpr));
     ctx->gpr[I686_REG_ESP] = sp;
-    ctx->eip = info.entry;
+    ctx->eip = ctx->elf_entry; /* rt32_elf_load sets the interpreter
+                                * entry when PT_INTERP (launch parity) */
     ctx->eflags = 0x202U;
     ctx->lazy_op = I686_FOP_NONE;
     ctx->seg_sel[I686_SEG_CS] = 0x23U;

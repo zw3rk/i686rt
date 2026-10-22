@@ -610,7 +610,7 @@ static const i686_insn_desc_t i686_insn_tab_0f[256] = {
     /* 0x70 */ { I686_OP_PSHUFW, { 3u, 6u, 7u }, 1u, 0u, 0u }, /* 66=PSHUFD, F2=PSHUFLW, F3=PSHUFHW; plain = MMX */
     /* 0x71 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
     /* 0x72 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
-    /* 0x73 */ { I686_OP_PSRLDQ, { 3u, 6u, 7u }, 1u, 0u, 0u }, /* 66 /2=PSRLDQ /3=PSLLDQ (128-bit byte shifts); plain /2=PSRLQ /6=PSLLQ (MMX) */
+    /* 0x73 */ { I686_OP_PSRLDQ, { 3u, 6u, 7u }, 1u, 0u, 0u }, /* /digit in modrm_reg: /2 PSRLQ, /3 PSRLDQ, /6 PSLLQ, /7 PSLLDQ; 66-form 128-bit, plain MMX */
     /* 0x74 */ { I686_OP_PCMPEQB, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* 66 = xmm, plain = MMX */
     /* 0x75 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* PCMPEQW: unused by the RC7b targets */
     /* 0x76 */ { I686_OP_PCMPEQD, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* 66 = xmm, plain = MMX */

@@ -785,6 +785,25 @@ static long sys_access(i686_ctx_t *ctx, uint32_t path_va, uint32_t mode)
     if (fetch_path(ctx, path_va, path) != 0) {
         return -EFAULT;
     }
+    {
+        extern int i686_systrace_on(void);
+        if (i686_systrace_on()) {
+            (void)fprintf(stderr, "ACCESS %s %x\n", path, mode);
+        }
+    }
+    /* Absolute guest paths resolve under --sysroot first (RC7b). */
+    if (path[0] == '/' && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
+        char sp[PATH_BUF];
+        size_t sl = strlen(ctx->sysroot);
+
+        if (sl + strlen(path) < sizeof sp) {
+            memcpy(sp, ctx->sysroot, sl);
+            strcpy(sp + sl, path);
+            if (access(sp, (int)mode) == 0) {
+                return 0;
+            }
+        }
+    }
     return host_ret_(access(path, (int)mode));
 }
 
@@ -795,8 +814,28 @@ static long sys_faccessat(i686_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
     if (fetch_path(ctx, path_va, path) != 0) {
         return -EFAULT;
     }
-    /* AT_EACCESS (0x200) / AT_SYMLINK_NOFOLLOW (0x100) identical. */
-    return host_ret_int(faccessat((int)(int32_t)dirfd, path, (int)mode, (int)flags));
+    /* AT_EACCESS (0x200) / AT_SYMLINK_NOFOLLOW (0x100) identical.
+     * Absolute guest paths resolve under --sysroot first (wine's
+     * wrapper `test -x` probes sysroot paths; RC7b). */
+    if (path[0] == '/' || (int32_t)dirfd == -100 /* AT_FDCWD */) {
+        if (path[0] == '/' && ctx->sysroot != NULL &&
+            ctx->sysroot[0] != '\0') {
+            char sp[PATH_BUF];
+            size_t sl = strlen(ctx->sysroot);
+
+            if (sl + strlen(path) < sizeof sp) {
+                memcpy(sp, ctx->sysroot, sl);
+                strcpy(sp + sl, path);
+                if (faccessat(AT_FDCWD, sp, (int)mode, (int)flags) == 0) {
+                    return 0;
+                }
+            }
+        }
+        return host_ret_int(faccessat(AT_FDCWD, path, (int)mode,
+                                      (int)flags));
+    }
+    return host_ret_int(faccessat((int)(int32_t)dirfd, path, (int)mode,
+                                  (int)flags));
 }
 
 static long sys_chdir(i686_ctx_t *ctx, uint32_t path_va)
