@@ -210,8 +210,8 @@ typedef struct i686_ctx {
     i686_region_t regions[I686_MAX_REGIONS];
     size_t        region_count;
 
-    /* Emulated descriptor tables (D8, Phases 7) */
-    void    *ldt;               /* array of I686_LDT_MAX_ENTRIES descriptors */
+    /* Emulated descriptor tables (D8, Phase 7; state shape: interp/seg.h) */
+    void    *ldt;               /* i686_segstate_t* once seg_init ran */
     uint32_t ldt_entries;
     uint32_t gdt_tls_slots[3];  /* GDT_ENTRY_TLS_MIN..+2 bases */
 
@@ -247,6 +247,12 @@ typedef struct i686_ctx {
     uint64_t icache_flushes;
     uint64_t wx_transitions;
     uint64_t flags_elided;
+
+    /* Segment/v86 mode state (Phases 7-8; C-only tail, extend at end) */
+    uint8_t  cs_d;              /* current CS default size: 1=32, 0=16 */
+    uint8_t  v86;               /* bit0: vm86 mode active (Phase 8) */
+    uint8_t  pad_seg[6];
+    void    *v86state;          /* v86.c-owned state (Phase 8) */
 } i686_ctx_t;
 
 /* ABI-locked offsets (src/trampoline.S, Phase 3, must agree). */
