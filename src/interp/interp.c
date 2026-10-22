@@ -81,6 +81,12 @@ void i686_interp_init_all(void)
     i686_interp_mov_init();
     i686_interp_branch_init();
     i686_interp_muldiv_init();
+    {
+        extern void i686_interp_x87_init(void);
+        extern void i686_interp_sse_init(void);
+        i686_interp_x87_init();
+        i686_interp_sse_init();
+    }
 }
 
 const char *i686_op_name(uint16_t op)
