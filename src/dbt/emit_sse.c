@@ -53,8 +53,11 @@
  *     0F 7F store as plain Q moves — the alignment #GP is interpreter-
  *     only, v1 MOVAPS-class deviation), MOVQ2DQ row (66 0F D6 store-
  *     low64, F3 MOVQ2DQ, F2 MOVDQ2Q via the MMX file), MOVNTDQ (66 0F E7
- *     as a plain Q store), PSRLDQ/PSLLDQ (66 0F 73 /2 /3 via EXT against
- *     a zero temp), PCMPGTB/PCMPEQB/PCMPEQD (66 0F 64/74/76 via CMGT/
+ *     as a plain Q store), PSRLDQ/PSLLDQ (66 0F 73 /3 /7 via EXT against
+ *     a zero temp; RC7b T2: the old /2 /3 digit map wrote the result to
+ *     the /digit register — 0F 73 carries the digit in modrm_reg and the
+ *     operand in modrm_rm), PCMPGTB/PCMPEQB/PCMPEQD (66 0F 64/74/76 via
+ *     CMGT/
  *     CMEQ), PMOVMSKB (66 0F D7, 16-bit UMOV sign-bit assembly),
  *     PMINUB/PMAXUB (66 0F DA/DE via UMIN/UMAX), PSUBB (66 0F F8),
  *     PREFETCHh (0F 18) = no-op.
@@ -1633,11 +1636,13 @@ static int sse_emit_movq2dq(i686_emit_ctx_t *e, const x86_insn_t *insn)
     if (insn->pfx_opsize == 0U) {
         return -1; /* plain 0F D6 undefined x86 */
     }
-    /* 66: MOVQ m64 <- xmm.d0. */
+    /* 66: MOVQ m64 <- xmm.d0.  Register destination: legacy MOVQ
+     * CLEARS bits 127:64 of the dest (RC7b T2, oracle-verified). */
     sse_xmm_file(e);
     sse_ldr_q(b, 1U, SSE_XMM_BASE, insn->modrm_reg & 7U);
     if (insn->modrm_mod == 3U) {
         sse_ins_d_elt(b, 0U, 0U, 1U, 0U);
+        sse_ins_d_gpr(b, 0U, 1U, 31U); /* zero bits 127:64 */
         sse_str_q(b, 0U, SSE_XMM_BASE, insn->modrm_rm & 7U);
     } else {
         sse_guest_addr(e, insn);
@@ -1662,18 +1667,23 @@ static int sse_emit_movntdq(i686_emit_ctx_t *e, const x86_insn_t *insn)
     return 0;
 }
 
-/* PSRLDQ row (0F 73): 66 /2 PSRLDQ, /3 PSLLDQ via EXT against a zero
- * temp; imm8 >= 16 gives zero, imm8 == 0 is a register move.  Plain
- * (MMX PSRLQ/PSLLQ) and other digits/prefixes decline. */
+/* PSRLDQ row (0F 73).  RC7b T2 rewrite: the shift-by-imm8 group carries
+ * the /digit in modrm_reg and the register operand in modrm_rm (the old
+ * code stored the result to the digit-indexed register), and the group
+ * map is /3 PSRLDQ, /7 PSLLDQ (whole-register byte shifts via EXT
+ * against a zero temp; imm8 >= 16 gives zero, imm8 == 0 is a register
+ * move) — /2 PSRLQ and /6 PSLLQ (packed 64-bit bit shifts) decline to
+ * the interpreter.  Plain (MMX) and other prefixes decline. */
 static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
     a64_buf_t *b = &e->buf;
     unsigned imm = insn->imm & 0xFFu;
+    unsigned dig = insn->modrm_reg;
 
     if (insn->pfx_opsize == 0U || insn->pfx_rep != 0U) {
         return -1;
     }
-    if (insn->modrm_reg == 2U) { /* PSRLDQ: out[j] = in[j-imm] */
+    if (dig == 3U) { /* PSRLDQ: out[j] = in[j+imm] */
         if (imm == 0U) {
             sse_src_q(e, insn);
             sse_mov_v_v(b, 0U, 1U);
@@ -1684,7 +1694,7 @@ static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
         } else {
             sse_movi_v_zero(b, 0U);
         }
-    } else if (insn->modrm_reg == 3U) { /* PSLLDQ: out[j] = in[j+imm] */
+    } else if (dig == 7U) { /* PSLLDQ: out[j] = in[j-imm] */
         if (imm == 0U) {
             sse_src_q(e, insn);
             sse_mov_v_v(b, 0U, 1U);
@@ -1696,10 +1706,11 @@ static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
             sse_movi_v_zero(b, 0U);
         }
     } else {
-        return -1; /* other /digits: x86 #UD */
+        return -1; /* /2 /6 packed PSRLQ/PSLLQ and other digits:
+                    * interpreter fallback (D2) */
     }
     sse_xmm_file(e);
-    sse_str_q(b, 0U, SSE_XMM_BASE, insn->modrm_reg & 7U);
+    sse_str_q(b, 0U, SSE_XMM_BASE, insn->modrm_rm & 7U);
     return 0;
 }
 

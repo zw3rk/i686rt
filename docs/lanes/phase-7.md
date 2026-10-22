@@ -467,3 +467,161 @@ Deviations / notes:
   reachability under the v1 CPUID argued per row above, not proven by
   execution for rec=0 rows.
 
+
+## RC7b triage T2 record (2026-10-22) — PASSED
+
+Card: root-cause the guest-side string-function misbehavior behind the
+wine cmd /c echo ok blocker (T1 sweep follow-up: single opcodes matched
+the oracle, so a longer SEQUENCE had to diverge).  Lane worktree
+i686rt-t2, branch lane/7b-t2; engine under test: interp (default).
+
+### A. Fixture (tests/probe_strfuncs.c, freestanding i386)
+
+tests/probe_strfuncs.c embeds the REAL glibc 2.44 i386 SSE2 string
+function bodies, byte-exact, extracted from the sysroot libc.so.6, plus
+hand-written raw-.byte probes for the strchr idioms and every T1-added
+opcode with edge vectors/alignments and the 64-bit MMX forms:
+
+- glibc blobs (S cases; identities from the IFUNC resolver target
+  arithmetic, anchor 0x23de34, confirmed behaviorally on the oracle):
+  __strchr_sse2 0xc0c70, __strrchr_sse2 0xc0d80, __memchr_sse2 0xc0f70,
+  __strlen_sse2 0xafc80.  Note: glibc i386 has NO SSE2 strchrnul; the
+  public strchrnul@@GLIBC_2.1.1 (0xa9e70) is a plain C implementation.
+  An earlier draft mislabeled 0xc0c70/0xc0d80/0xc0f70 as
+  chrnul/strchr/strlen from their map positions; the oracle run exposed
+  that (chr got the LAST match = strrchr semantics; "strlen" took
+  (s, c, n) = memchr) and the identities were corrected.
+- case matrix: alignment offsets 0..63 over a 64-byte aligned buffer
+  (fast path p&0x3f <= 0x30 and unaligned path), needles at
+  0/1/5/15/16/31/33/47/63, absent needles, NUL needles
+  (strchr(s,0)), needle-after-NUL (chr stops, memchr does not),
+  16/32/64/128-boundary needles, memchr n=0/n<pos/n>len, >64-byte
+  multi-loop strings, and the literal failing "/usr/bin/sh".
+- P probes (raw .byte, pinned regs, no -msse needed): P1 glibc
+  prologue idiom (movd + punpcklbw x2 + pshufd broadcast + movdqu +
+  pcmpeqb x2 + pmovmskb, the NUL trick); P2 PSRLDQ/PSLLDQ
+  (66 0F 73 /3 /7) imm 0/1/15/16/255 on 0102.. and all-ones + packed
+  PSRLQ/PSLLQ (/2 /6); P3 MOVDQA + pcmpeqb-vs-zero edge vectors;
+  P4 PCMPEQB/PCMPGTB (0x80 vs 0x7F signed); P5 PCMPEQD; P6 PMOVMSKB
+  sign-bit patterns; P7 PMINUB/PMAXUB; P8 PSUBB wrap both directions;
+  P9 MOVQ row (66 0F D6 m64 store + reg-reg, F3 0F 7E m64 load,
+  F3 0F D6 MOVQ2DQ, F2 0F D6 MOVDQ2Q); P10 MOVD zero-extension;
+  P11 MOVNTDQ aligned; P12 PREFETCHh /0../3 + SFENCE; P14 por;
+  P15 MMX plain forms (movq mm, psubb/pcmpeqb/pcmpgtb/pcmpeqd/
+  pminub/pmaxub mm, pmovmskb mm, psrlq/psllq mm, EMMS).
+
+Build: docker --platform linux/386 alpine:3.20 gcc,
+  cc -std=gnu11 -ffreestanding -static -nostdlib -O2 -march=i686
+     -mno-mmx -fno-pie -fno-stack-protector
+(all SSE/MMX as raw bytes; gcc rejects xmm clobbers with SSE disabled
+and never allocates those registers, so the asm omits them).
+Run oracle: qemu-i386 (alpine arm64 qemu-i386 package) over the same
+static binary — deterministic; the --platform linux/386 container
+(Rosetta/QEMU) agreed everywhere it was spot-checked.
+
+### B. Divergences found and root causes (all in the T1-added rows)
+
+1. h_movdqa (0F 6F/7F row) — THE dash blocker.  The plain/MMX MOVQ
+   branch tested `pfx_rep == 0`, but the 66 prefix rides pfx_opsize,
+   NOT pfx_rep, so 66-prefixed MOVDQA/MOVDQA-stores also took the
+   8-byte MMX path: loads/stores went through the x87_st (MMX) slot,
+   the real XMM destination stayed stale, and the misalignment #GP
+   check was skipped.  glibc's aligned main loops (movdqa) therefore
+   scanned stale data; __strchr_sse2 returned NULL for "/usr/bin/sh"
+   -> dash shellexec PATH-searched the absolute path ->
+   "exec: /usr/bin/sh: not found" 127.  Fix: plain-form test is now
+   `pfx_opsize == 0U && pfx_rep == 0U`.
+2. h_pshiftdq (0F 73 row) — group semantics.  0F 73 is the
+   shift-by-imm8 GROUP: modrm_reg carries the /digit and the register
+   operand is modrm_rm.  The T1 handler (a) wrote the result to the
+   digit-indexed register (XMM3/XMM6) leaving the real destination
+   stale, and (b) used the wrong digit map: real map is /2 PSRLQ,
+   /3 PSRLDQ, /6 PSLLQ, /7 PSLLDQ (66 forms; the old code had
+   /2 "PSRLDQ", /3 "PSLLDQ", /6 /7 -> UNDEF).  Rewritten: /3 byte
+   shift out[j]=s[j+imm], /7 out[j]=s[j-imm], /2 /6 packed 64-bit BIT
+   shifts (both quadwords, count masked to 6 bits); operand = rm in
+   both the 66 and plain (MMX PSRLQ /2, PSLLQ /6) branches.
+3. h_movq2dq (0F D6 row) — 66 reg-reg form.  Legacy MOVQ is the store
+   form (reg field = source, rm = destination) and CLEARS bits 127:64
+   of a register destination; the handler preserved the dest upper.
+   Oracle-verified on both qemu backends; fixed to clear.
+4. h_movq_xmm (0F 6E/7E row) — F3 0F 7E MOVQ xmm, xmm2/m64 clears
+   dest[127:64]; the handler preserved it.  Fixed to clear (the DBT
+   emitter already zeroed).
+5. src/dbt/emit_sse.c — same fixes on the DBT side: sse_emit_psrldq
+   now fires its byte-shift branches on /3 /7 (was /2 /3), stores to
+   modrm_rm (was the digit), and declines /2 /6 (packed PSRLQ/PSLLQ)
+   to the interpreter; sse_emit_movq2dq 66 reg-reg zeroes bits 127:64.
+   NOTE (pre-existing, NOT introduced by this lane, verified by
+   stashing the fixes): I686RT_ENGINE=dbt segfaults on the first
+   66 0F 73 instruction (psrldq_min and the fixture both die at the
+   same point; the interp engine handles the same binaries fine).
+   Evidence: _build/probe_dbt.txt (truncated at PR p1 o=13, rc=139).
+   Needs a coordinator-owned DBT look at the 0F 73 emission path.
+
+### C. Acceptance check (single run, 2026-10-22)
+
+Oracle (qemu-i386, alpine arm64 container, static fixture):
+
+    DONE 1274 FAIL 0
+
+i686rt (default interp engine, arm64 alpine container):
+
+    DONE 1274 FAIL 0
+    rc=0
+
+    diff _build/probe_oracle.txt _build/probe_i686rt.txt   -> identical
+
+Both outputs printed in full to the lane artifacts (kept at
+_build/probe_oracle.txt and _build/probe_i686rt.txt; byte-identical,
+1274 case lines each).  The reexec repro after the fix:
+
+    /w/i686rt --sysroot /w/sysroot -- /w/sysroot/usr/bin/sh -c
+      "exec /usr/bin/sh -c \"echo reexec-ok\""
+
+no longer prints "exec: /usr/bin/sh: not found" — dash execve's the
+absolute path correctly (the string-function blocker is gone).  The
+chain now fails FURTHER DOWN at a non-opcode issue (see D).
+
+First acceptance attempt passed (pre-flight iterations against the
+fixture only; the check chain ran once).
+
+### D. Wine-chain progress (evidence; further blockers are non-opcode)
+
+- wine --version (direct loader, WINEDLLPATH set): STILL PASSES after
+  the fixes — "wine-10.0 (debian 10.0~repack-12+b1)" rc=0 (no
+  regression from the T2 opcode fixes).
+- Full wrapper chain /usr/bin/wine (dash script): FAILS at the script's
+  `test -x /usr/bin/wine32` — i686rt syscall 307 faccessat returns
+  -EINVAL (real kernels: 0/-EACCES); faccessat2 (439) correctly returns
+  -ENOSYS and glibc falls back to 307.  Evidence (I686RT_SYSTRACE):
+    SYS 439 -> -38 (faccessat2, ENOSYS)
+    SYS 307 -> -22 (faccessat, EINVAL)  <- the gap
+  `test -d /usr/bin` passes, so this is the access-mode path for
+  regular files.  Wrapper output: "error: unable to find wine
+  executable, this shouldn't happen." rc=1.
+- Re-exec'd program entry (blocks everything that execve's a dynamic
+  PIE, incl. the reexec repro's second sh): the r_execve path enters
+  the program at ITS OWN entry without transferring control to the
+  PT_INTERP interpreter.  Trace: /usr/bin/sh is PIE, entry 0x2920,
+  loaded at 0x400000; execution starts at 0x402920 (= entry) with
+  ld-linux.so.2 mapped but libc.so.6 absent; the first PLT call
+  (`jmp *0x24(%ebx)` at 0x402090) jumps to the unrelocated GOT value
+  0x2096 -> guest fault.  The direct-launch path handles PT_INTERP
+  correctly (wine --version works), so the gap is specific to the
+  guest execve reload path.  Both items are coordinator-owned
+  (src/os/syscalls.c / rt32 exec paths — outside this lane's file
+  list).  Per the card, chasing stopped here.
+
+Deviations / notes:
+- src/x86/insn_tab.h line ~613 row comment still documents the OLD
+  wrong digit map ("66 /2=PSRLDQ /3=PSLLDQ"); the file is outside this
+  lane's list, so only the handlers were fixed — the comment needs a
+  one-line coordinator touch.
+- The fixture is self-checking (scalar C expectations) AND required to
+  be byte-identical between oracle and i686rt; P2's first-cut
+  expectations encoded the MMX PSRLQ semantics for the 66 form and a
+  flat all-ones model — corrected against the oracle (both qemu
+  backends agree: 66 PSRLQ/PSLLQ shift BOTH quadwords).
+- p9rr pins the 66 0F D6 reg-reg form: legacy MOVQ clears the dest
+  upper; i686rt now matches.  F3 0F 7E load likewise clears.
