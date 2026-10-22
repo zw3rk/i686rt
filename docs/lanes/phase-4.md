@@ -100,3 +100,17 @@ host-mounted test files remain. The S4 hang above remains unresolved.
 Before resuming diagnostics, follow the test process lifecycle rules in
 `AGENTS.md`: bound runs, clean up by container identity, and verify exit
 directly before retrying or leaving the session.
+
+## RC4 bring-up state (2026-10-22)
+
+Static test_p4 PASSES under interp (commit f1e6610 chain). Dynamic
+glibc path: ld-linux.so.2 + libc.so.6 now load from the sysroot
+(openat + sysroot-aware opens), glibc startup completes, execution
+reaches the test's own code (~0x4012xx). First test run looped
+402k sigreturns because the ORIGINAL test returned from the SIGFPE
+handler (real-Linux behavior re-executes the faulting div); test
+fixed to sigsetjmp/siglongjmp and rebuilt. The rebuilt oracle binary
+hangs under the debian:386 TCG container (env issue; the FIRST oracle
+binary had run PASS instantly) — pending: rerun oracle on a clean
+container, then the RC4 check (i686rt --sysroot ... test_p4_glibc).
+Cleanup: task-owned debian containers removed; no survivors.
