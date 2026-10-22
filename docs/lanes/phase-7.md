@@ -193,3 +193,150 @@ alpine:3.20, staging /tmp/rc3): `timeout 60 /w/i686rt -- /w/test_p7_ldt`
 → rc=0, last line PASS.  Deviations: lima stand-in as in RC1–RC5.
 Noted behavior change (SDM-correct): 16-bit EA wrap mod 64K for
 67-prefixed flat code.
+
+## L7b record (2026-10-22)
+
+`tools/setup-wine32.sh` (POSIX sh, difftest.sh header style) fetches
+the minimal non-wow64 Wine32 sysroot into `_sysroot/debian-wine32-i386/`
+(separate from setup_sysroot.py's `_sysroot/debian-i386/`; both share
+the `_sysroot/pool` deb cache — gitignored, not committed).  Pool
+listing → newest-version derivation per package (sort -V) with
+upstream-version coherence across the wine set (epoch/debian-revision
+stripped), bounded curl transfers (--max-time 60 listing / 900 s per
+deb, --retry 2), ar-magic check on cached and downloaded debs,
+`ar p` + `tar -xJf/xzf -` streaming extraction (data.tar.xz/.gz;
+zstd rejected with a clear message — not needed for the current
+archive), member path check (no `..`), idempotent `.stamp`
+(package urls + sha256s, key-file hashes) with short-circuit rerun and
+`--force` to re-fetch.  `--verify` prints `WINE32-SYSROOT-OK` (exit 0)
+iff usr/bin/wine (or wine-stable) is executable, the wine32 loader
+tree (wine/wine, wine/wineserver, i386-unix/ntdll.so, PE
+ntdll/kernel32/cmd.exe, wine.inf, fonts) and the glibc loader/libc are
+present; non-zero otherwise.
+
+Package closure (determined from the archive; wine 10.0~repack era,
+trixie, main i386) — total download 99,909,696 bytes (95.3 MiB):
+
+    libc6            2.44-3           1,767,384 B   pool/main/g/glibc/
+    libwine          10.0~repack-12+b1    96,294,912 B   pool/main/w/wine/
+    wine32           10.0~repack-12+b1       304,240 B   "
+    wine32-preloader 10.0~repack-12+b1        35,264 B   "
+    wine             10.0~repack-12          139,612 B   "
+    wine-common      10.0~repack-12        1,368,284 B   "
+
+(libc6-i686 is no longer shipped for this suite; skipped as in
+setup_sysroot.py.)  Closure rationale: wine (all) Depends
+wine64 | wine32; wine32 Depends libc6 + libwine (=); libwine Depends
+wine-common + libc6 + a large optional set (X11/wayland/pulse/gstreamer/
+avcodec/fontconfig/freetype/...).  That optional set is Debian's
+everything-enabled build being dlopened per subsystem with graceful
+fallback — NOT loader requirements: the loader-side DT_NEEDED of
+wine/wine, wine/wineserver, i386-unix/ntdll.so and i386-unix/win32u.so
+is exactly { libc.so.6, libm.so.6, ntdll.so } (objdump -p evidence),
+so no graphics packages are fetched and RC7b's text-mode `wine cmd`
+needs none.  wine32-tools / libwine-dev / fonts-wine (external TTFs)
+are not needed for `cmd /c echo` and are not fetched.
+
+Extracted layout (preserved paths; i686rt --sysroot resolver handles
+the usr/lib/i386-linux-gnu multiarch paths):
+
+    usr/bin/wine -> wine-stable          (alternatives replicas, see below)
+    usr/bin/wine32 -> wine32-stable
+    usr/bin/wineboot -> wineboot-stable
+    usr/bin/*-stable                     shell wrappers (wine deb)
+    usr/libexec/wine/apploader           app.exe-style wrapper script
+    usr/lib/i386-linux-gnu/wine/wine         the real ELF32 loader
+    usr/lib/i386-linux-gnu/wine/wineserver
+    usr/lib/i386-linux-gnu/wine/wine-preloader{,.static}
+    usr/lib/i386-linux-gnu/wine/i386-unix/*.so      (36 unix-side modules)
+    usr/lib/i386-linux-gnu/wine/i386-windows/*      (810 PE builtins incl.
+                                          ntdll.dll, kernel32.dll, cmd.exe)
+    usr/lib/i386-linux-gnu/wine/x86_64-windows/*    wow64-side PEs shipped
+                                          inside the i386 libwine deb;
+                                          unused non-wow64, extracted as-is
+    usr/share/wine/wine.inf              needed by wineboot prefix creation
+    usr/share/wine/fonts/                wine builtin fonts (wine-common)
+    lib -> usr/lib                       usrmerge compat symlink (added
+                                         when the debs shipped no lib/)
+
+Special paths / fixups documented for RC7b:
+
+- Debian creates usr/bin/wine, usr/bin/wine32 and usr/bin/wineboot as
+  update-alternatives links (libwine postinst slave links at priority
+  70) pointing at the -stable wrappers; maintainer scripts do not run
+  on plain extraction, so the script recreates the three links as
+  symlinks (usr/bin/wine -> wine-stable -> ... -> wine32-stable -> exec
+  usr/lib/i386-linux-gnu/wine/wine).  Launch chain for RC7b:
+  usr/bin/wine → wine-stable (needs usr/bin/wine32 present — provided).
+- wineboot needs usr/share/wine/wine.inf (libwine) + the builtin fonts
+  (wine-common); both are in the closure.
+- libwine's postinst also patches zlib1.dll out of libz-mingw-w64 into
+  i386-windows/; skipped (apt-level, not needed by cmd; would drag the
+  mingw zip runtime in).
+- wine 10 removed libwine.so.1 (folded into i386-unix/ntdll.so); the
+  only DT_NEEDED outside the wine tree is glibc (ld-linux.so.2,
+  libc.so.6, libm.so.6 — from the libc6 deb, same derivation as
+  setup_sysroot.py).
+
+Acceptance check (single run, 2026-10-22, macOS host):
+
+    tools/setup-wine32.sh && tools/setup-wine32.sh --verify
+
+Output, verbatim (exit 0; last line exactly WINE32-SYSROOT-OK):
+
+    setup-wine32.sh: wine set: newest libwine libwine_10.0~repack-12+b1_i386.deb (upstream 10.0~repack)
+    setup-wine32.sh:   wine32_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh:   wine32-preloader_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh:   wine_10.0~repack-12_all.deb
+    setup-wine32.sh:   wine-common_10.0~repack-12_all.deb
+    setup-wine32.sh: glibc: newest libc6_2.44-3_i386.deb
+    setup-wine32.sh: libc6-i686: not shipped for this suite (skipping; modern Debian i386 glibc is i686-optimized in libc6 itself)
+    setup-wine32.sh: cached libc6_2.44-3_i386.deb
+    setup-wine32.sh: cached libwine_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh: cached wine32_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh: cached wine32-preloader_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh: cached wine_10.0~repack-12_all.deb
+    setup-wine32.sh: cached wine-common_10.0~repack-12_all.deb
+    setup-wine32.sh: extracting libc6_2.44-3_i386.deb
+    setup-wine32.sh: extracting libwine_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh: extracting wine32_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh: extracting wine32-preloader_10.0~repack-12+b1_i386.deb
+    setup-wine32.sh: extracting wine_10.0~repack-12_all.deb
+    setup-wine32.sh: extracting wine-common_10.0~repack-12_all.deb
+    setup-wine32.sh: created usrmerge compat symlink lib -> usr/lib
+    setup-wine32.sh: alternatives replica: usr/bin/wine -> wine-stable
+    setup-wine32.sh: alternatives replica: usr/bin/wine32 -> wine32-stable
+    setup-wine32.sh: alternatives replica: usr/bin/wineboot -> wineboot-stable
+    setup-wine32.sh: stamp written: .../_sysroot/debian-wine32-i386/.stamp (total download 99909696 bytes)
+    setup-wine32.sh: ok loader: usr/bin/wine (executable)
+    setup-wine32.sh: ok wine32 loader: usr/lib/i386-linux-gnu/wine/wine
+    setup-wine32.sh: ok wine32 wineserver: usr/lib/i386-linux-gnu/wine/wineserver
+    setup-wine32.sh: ok wine32 unix ntdll: usr/lib/i386-linux-gnu/wine/i386-unix/ntdll.so
+    setup-wine32.sh: ok wine32 PE ntdll: usr/lib/i386-linux-gnu/wine/i386-windows/ntdll.dll
+    setup-wine32.sh: ok wine32 PE kernel32: usr/lib/i386-linux-gnu/wine/i386-windows/kernel32.dll
+    setup-wine32.sh: ok wine32 PE cmd: usr/lib/i386-linux-gnu/wine/i386-windows/cmd.exe
+    setup-wine32.sh: ok wine.inf: usr/share/wine/wine.inf
+    setup-wine32.sh: ok wine fonts: usr/share/wine/fonts/courer.fon
+    setup-wine32.sh: ok glibc loader: lib/ld-linux.so.2
+    setup-wine32.sh: ok glibc libc: usr/lib/i386-linux-gnu/libc.so.6
+    WINE32-SYSROOT-OK
+
+Deviations / notes:
+
+- The six debs were downloaded into `_sysroot/pool` by the lane while
+  resolving the closure from the archive (same URLs the script derives,
+  sha256s recorded in `.stamp`); the acceptance run therefore reports
+  "cached" instead of re-downloading 95.3 MiB.  A cold-cache run uses
+  the identical derivation (the two scripts/scrape paths were compared
+  during authoring).  A pre-flight run against a throwaway tree
+  preceded the single official acceptance run above (tree wiped before
+  it; the check above ran on the final script version only).
+- Extracted tree is ~572 MB on disk (dominated by the i386 PE builtins
+  plus the wow64-side x86_64-windows tree that Debian ships inside the
+  i386 libwine deb; extracted as-is for dpkg-deb -x fidelity).
+- Requires curl, ar, tar (xz), sort -V, sha256sum|shasum (all present
+  on the macOS host class setup_sysroot.py targets; no zstd debs in
+  this closure — wine/glibc ship data.tar.xz).
+- RC7b itself (running `wine cmd /c echo ok` under i686rt --sysroot
+  against this tree) is the coordinator's card, not this lane's.
+
