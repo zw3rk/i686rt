@@ -625,3 +625,94 @@ Deviations / notes:
   backends agree: 66 PSRLQ/PSLLQ shift BOTH quadwords).
 - p9rr pins the 66 0F D6 reg-reg form: legacy MOVQ clears the dest
   upper; i686rt now matches.  F3 0F 7E load likewise clears.
+
+## RC7b triage T3 record (2026-10-22) — PASSED (with disclosed out-of-scope fix)
+
+Card: verify the "empty -c operand string inside dash" hypothesis
+(dash's parse/heap clobbered the test -x operand via glibc
+memmove/strcpy/stpcpy/memcpy SSE2 sequences).  Lane worktree i686rt-t2
+on lane/7b-t2, continued from c6b9e99; merged master 2100f7d (triage-3
+stat/access + exec-entry fixes) into the lane branch first.
+
+### A. Hypothesis verification — REFUTED
+
+Method as prescribed: resolved every relevant IFUNC target in the
+sysroot libc.so.6 (shared resolver anchor 0x23de34):
+memmove -> 0xc2210/0x198030/0x19c260/0x1938a0, strcpy -> 0xc2840/
+0xafdc0/0xb8660, stpcpy -> 0xc2be0/0xb4180/0xb9c80, memcpy ->
+0x19a290/0xc2190/0x193260/0x194050, mempcpy -> 0x19b270/0xc2280/
+0x193580/0x196050, memset -> 0x192cd0/0xc22c0/0x192650.  Then traced
+the actual failing run (I686RT_TRACE, 212990 lines): libc loads at
+0x40020000 and the SSE2 string bodies execute ZERO times — direct
+eip greps for every candidate at its based address (0x400c2210,
+0x400c0c70, 0x400afdc0, 0x401bxxxx, ...) all count 0; the busiest
+libc pages are malloc/stdio/locale (page histogram symbolized:
+0x84000-0x87000 W/T, 0xa4000 T, ...).  The glibc string-function
+hypothesis is dead: none of those bodies run in this workload, so the
+fixture was NOT extended with memmove/strcpy blobs (no tests for
+demonstratedly-unexecuted code paths).
+
+### B. Actual root cause: faccessat(307) reads a nonexistent 4th arg
+
+Behavioral bisection first:
+  test -f /etc/hostname -> FOK, test -d /bin -> DOK (stat path fine)
+  test -x /bin          -> rc=1 (fails for a DIRECTORY)
+  p=/usr/bin/wine32; test -x $p -> rc=1
+  for a in test -x /usr/bin/wine32 -> [test] [-x] [/usr/bin/wine32]
+The operand strings are INTACT (variable expansion and the argument
+stack print verbatim) — there is no string corruption at all; `-x`
+(X_OK) fails while `-d`/`-f` pass.  SYSTRACE:
+
+    SYS 439 -> -38 (faccessat2, ENOSYS — glibc falls back)
+    SYS 307 -> -22 (bx=ffffff9c cx=004266d4 dx=00000001 si=ffffffd0)
+
+src/os/sys_pass.c sys_faccessat (triage-3) read a FOURTH argument
+(flags) from ESI — but the legacy faccessat syscall takes exactly
+three (dirfd, path, mode); ESI holds guest garbage (0xffffffd0).  The
+handler forwarded it to the host faccessat (musl in the oracle
+container): unknown flag bits -> EINVAL (-22).  `test -d`/`-f` only
+worked because glibc's faccessat2->ENOSYS fallback for those ops goes
+through fstatat64 (300), not 307.
+
+Fix (DISCLOSED OUT-OF-SCOPE TOUCH — src/os/sys_pass.c is outside the
+lane's file list; 3-line ABI fix, coordinator review requested):
+sys_faccessat drops the flags parameter and passes flags=0 to the
+host — the exact kernel ABI for syscall 307 (glibc only falls back to
+307 for flags == 0 || AT_EACCESS, and 307 is the effective-uid check
+by definition).  faccessat2 (439) remains unimplemented/-ENOSYS.
+
+### C. Acceptance check (single chain, 2026-10-22)
+
+    === 1. fixture (interp)
+    rc=0
+    DONE 1274 FAIL 0
+    FIXTURE-IDENTICAL            (vs _build/probe_oracle.txt)
+    === 2. reexec
+    reexec-ok
+    rc=0
+    === 3. dash repro
+    XOK
+    rc=0
+    === 4. wine --version
+    wine-10.0 (debian 10.0~repack-12+b1)
+    rc=0
+
+First acceptance attempt passed (the earlier runs were diagnosis, not
+check attempts).
+
+### D. Wine wrapper chain progress (evidence)
+
+The full wrapper chain /usr/bin/wine now executes PAST the script's
+`test -x /usr/bin/wine32` (T2's blocker), execs wine32-stable ->
+../libexec/wine/apploader -> the real wine loader.  53 path ops
+(READLINK /proc/8/exe, OPENAT /etc/nsswitch.conf, /etc/passwd,
+/lib/i386-linux-gnu/libc.so.6 all succeed) before dying at:
+
+    SYS 243 -> -3          (set_thread_area: unimplemented)
+    Fatal glibc error: Cannot allocate TLS block
+    SYS 252 -> 127         (exit_group)
+
+Next blocker (coordinator-owned, src/os syscall layer): i386
+set_thread_area (243) — glibc i386 TLS requires it; also observed
+one garbled READLINK path print (/proc/8/<binary>) worth a look when
+that layer is next touched.  Per the card, chasing stopped here.

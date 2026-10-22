@@ -808,15 +808,20 @@ static long sys_access(i686_ctx_t *ctx, uint32_t path_va, uint32_t mode)
 }
 
 static long sys_faccessat(i686_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
-                          uint32_t mode, uint32_t flags)
+                          uint32_t mode)
 {
     char path[PATH_BUF];
     if (fetch_path(ctx, path_va, path) != 0) {
         return -EFAULT;
     }
-    /* AT_EACCESS (0x200) / AT_SYMLINK_NOFOLLOW (0x100) identical.
-     * Absolute guest paths resolve under --sysroot first (wine's
-     * wrapper `test -x` probes sysroot paths; RC7b). */
+    /* RC7b T3: the legacy faccessat syscall (307) takes THREE arguments
+     * (dirfd, path, mode) -- there is no flags register.  Reading ESI as
+     * a flags word forwarded guest garbage to the host faccessat, which
+     * (musl, and glibc->faccessat2 alike) rejected unknown flag bits with
+     * EINVAL: dash's `test -x` broke while `test -d`/-f (glibc's
+     * fstatat64 fallback) kept working.  faccessat(307) is the
+     * effective-uid check, i.e. glibc only falls back to it for
+     * flags == 0 || AT_EACCESS, so flags 0 is the exact kernel ABI. */
     if (path[0] == '/' || (int32_t)dirfd == -100 /* AT_FDCWD */) {
         if (path[0] == '/' && ctx->sysroot != NULL &&
             ctx->sysroot[0] != '\0') {
@@ -826,16 +831,14 @@ static long sys_faccessat(i686_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
             if (sl + strlen(path) < sizeof sp) {
                 memcpy(sp, ctx->sysroot, sl);
                 strcpy(sp + sl, path);
-                if (faccessat(AT_FDCWD, sp, (int)mode, (int)flags) == 0) {
+                if (faccessat(AT_FDCWD, sp, (int)mode, 0) == 0) {
                     return 0;
                 }
             }
         }
-        return host_ret_int(faccessat(AT_FDCWD, path, (int)mode,
-                                      (int)flags));
+        return host_ret_int(faccessat(AT_FDCWD, path, (int)mode, 0));
     }
-    return host_ret_int(faccessat((int)(int32_t)dirfd, path, (int)mode,
-                                  (int)flags));
+    return host_ret_int(faccessat((int)(int32_t)dirfd, path, (int)mode, 0));
 }
 
 static long sys_chdir(i686_ctx_t *ctx, uint32_t path_va)
@@ -1431,7 +1434,7 @@ static int64_t r_access(i686_ctx_t *ctx)
 static int64_t r_faccessat(i686_ctx_t *ctx)
 {
     return sys_faccessat(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                         ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI]);
+                         ctx->gpr[I686_REG_EDX]);
 }
 
 static int64_t r_chdir(i686_ctx_t *ctx)
