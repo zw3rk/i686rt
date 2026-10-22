@@ -65,3 +65,90 @@ the v86 loop is self-contained and reuses only public handler helpers.
 
 Merge L8a (--no-ff), wire syscall registration, RC8: `test_p8_vm86`
 prints PASS (arm64 docker stand-in, recorded deviation).
+
+## L8a record (lane, 2026-10-22) — PASSED
+
+Landed on `lane/8-l8a` (worktree ../i686rt-l8a):
+`src/interp/v86.h` + `src/interp/v86.c` (self-contained 16-bit
+fetch/decode/execute loop: prefix stream, six IOPL-sensitive opcodes
+kernel-verbatim incl. check_vip/PICRETURN/TF-re-trap/vm86dbg, do_int
+protocol, traps cc/ce, executed subset 88-8b/b0-bf/c6-c7/90/c3/cb/
+e8/e9/eb, A20-off linear model, G-agnostic low-megabyte bring-up with a
+private 64 KiB shim for zero-base windows), `src/os/vm86.c`
+(vm86old(113)/vm86(166) marshalling per the E10 pins: split copy at
+offsetof(vm86_struct,int_revectored), kernel-side is_vm86pus,
+__null_*/orig_eax ignored, VM86_SCREEN_BITMAP -> -EINVAL, exit
+writeback of exactly ebx..eax/eip/cs/eflags/esp/ss/es/ds/fs/gs at
+kernel widths, screen_bitmap preserved, packed exit code in EAX), and
+`tests/test_p8_vm86.c`. Makefile needed no edit (wildcard sources).
+Frozen files untouched (git status: only the four lane files).
+
+**Syscall registration snippet** (the coordinator applies this inside
+`i686_syscalls_init_once()` in src/os/syscalls.c at S8, next to the
+other `i686_syscalls_*_init()` calls; 113/166 only — plain mmap(90)
+already exists via L2e `i686_syscalls_misc_init()`/`r_old_mmap` and was
+deliberately not touched):
+
+```c
+{
+    extern void i686_sys_vm86_init(void);
+    i686_sys_vm86_init();
+}
+```
+
+**Acceptance check** (run once, verbatim; staging held `_build/i686rt`
++ `_build/test_p8_vm86`, fixture per tools/build_fixture.sh, docker
+linux/386 gcc build, zero warnings):
+
+```
+$ docker run --rm --platform linux/arm64 --memory 1g --cpus 2 \
+    --name l8a-check -v "$PWD/_build/staging":/w:ro alpine:3.20 \
+    sh -c 'timeout 60 /w/i686rt -- /w/test_p8_vm86'
+PASS
+# rc=0; container removed; docker ps -a verified gone
+```
+
+The check binary carried the snippet above applied locally to
+syscalls.c (unregistered 113/166 dispatch to -ENOSYS); the wiring was
+reverted before commit — the committed tree contains NO syscalls.c
+change and builds warning-clean (the one branch warning,
+`dbt/engine.c:50 dbt_lookup unused`, is pre-existing on the frozen
+file).
+
+**Coordinator notes / deviations:**
+
+1. **v86 opcode faults exit VM86_SIGNAL + pending 32-bit signal** per
+   the freeze (SIGILL for unknown/unimplemented opcodes, incl. hlt;
+   SIGTRAP for non-vm86pus int3/TF; SIGFPE for non-vm86pus into).
+   The kernel's VM86_UNKNOWN default is therefore not generated
+   anywhere; the macro stays defined. A runaway guard (2^27 steps)
+   exits VM86_UNKNOWN as an emulator bound (documented in v86.c).
+2. **Pre-existing Phase-1 decoder bug found (frozen decode.c, not
+   touched): `66`-prefixed moffs moves (`66 a1`/`66 a3`) size the
+   moffs displacement by OPERAND size (4-byte insn) instead of ADDRESS
+   size (6-byte insn, SDM/GCC/objdump all use 32-bit moffs).** Any
+   gcc-generated i386 `movw` to/from a static address breaks. The
+   fixture works around it by accessing every u16 segment field as its
+   u32 (seg|pad) pair. Recommend a Phase-1 decoder fix lane.
+3. The fixture stub sits at **0x1000:0x7c00** (linear 0x17c00), keeping
+   SPEC's 0x7c00 IP: the check container resolves **guest_base = 0**
+   (no /dev/a32host hint), where host linear [0, mmap_min_addr) is
+   unmappable, so 0:0x7c00 is not 32-bit-side addressable there. It
+   exercises the identical seg<<4+off rule; in offset mode (hl) 0:0x7c00
+   works identically. v86.c still contains the full G=0 shim for
+   [0,0x10000) (IVT/BDA/stack) and it was exercised (trace: sub-64K
+   v86 traffic via shim, self-consistent).
+4. VM86 command stubs: REQUEST_IRQ -> -ENOSYS;
+   FREE_IRQ/GET_IRQ_BITS/GET_AND_RESET_IRQ -> -EINVAL (freeze allowed
+   "-EINVAL/-ENOSYS"); VM86_PLUS_INSTALL_CHECK -> 0; other cmds ->
+   -EINVAL.
+5. Signal delivery after a VM86_SIGNAL return happens at the
+   interpreter's next safe point (one 32-bit instruction after the
+   syscall) — Phase-4 v1 delivery-point behavior, unchanged by this
+   lane.
+6. v86 stack arithmetic wraps at 16 bits (kernel handle_vm86_fault
+   computes push/pop addresses from the 16-bit SP view).
+7. Engine guard: v86 is interpreter-only by construction (the loop runs
+   on the ctx inside the syscall handler and never dispatches DBT
+   blocks); the `!ctx->v86` DBT guard from the Phase 7 freeze remains
+   S7/S8 coordination as written.
