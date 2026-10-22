@@ -150,3 +150,35 @@ test-p5-lima: ## RC5: fixture under ./_build/i686rt vs goldens, default + --x87-
 	fi
 
 .PHONY: fixture-p5 golden-p5 test-p5-lima
+
+## ------------------------------------------------------------------ ##
+##  Phase 6 — L6b: hl smoke targets (RC6; coordinator executes at S6   ##
+##  with the L6a-built hl; every smoke is bounded by timeout 120)      ##
+## ------------------------------------------------------------------ ##
+
+# Inputs for the RC6 smokes.  I686RT_BIN is already assigned in the
+# build section above, so the ?= here defers to it (same path, kept
+# relative to the repo root); an explicit I686RT_BIN= on the command
+# line wins either way.
+HL_BIN       ?= ../hyper-linux/_build/hl
+I686RT_BIN   ?= $(abspath $(BUILD_DIR)/i686rt)
+BUSYBOX_I686 ?= $(BUILD_DIR)/busybox-i686
+
+test-p1-hl: ## RC1 on hl: run the fixture under hl+i686rt (coordinator executes at S6)
+	@echo "RC1 runs under hl (coordinator executes this at S6):"
+	@echo "  $(HL_BIN) --i686rt $(I686RT_BIN) $(BUILD_DIR)/test_p1_isa    # must print PASS"
+
+test-p2-hl: busybox ## RC2 through hl: busybox sh -c 'echo ok' smoke (coordinator executes at S6)
+	tools/hl-smoke.sh "$(HL_BIN)" "$(I686RT_BIN)" "$(BUSYBOX_I686)"
+
+test-p3-hl: busybox ## RC3 through hl: busybox sh -c 'echo ok' smoke (coordinator executes at S6)
+	tools/hl-smoke.sh "$(HL_BIN)" "$(I686RT_BIN)" "$(BUSYBOX_I686)"
+
+test-p4-hl: ## RC4 on hl: dynamic glibc test_p4 under hl+i686rt (coordinator executes at S6)
+	@echo "RC4 runs under hl (coordinator executes this at S6; needs the RC4 sysroot):"
+	@echo "  $(HL_BIN) --i686rt $(I686RT_BIN) --sysroot <sysroot> -- $(BUILD_DIR)/test_p4_glibc    # must print PASS"
+
+test-p5-hl: busybox ## RC5 through hl: busybox sh -c 'echo ok' smoke (coordinator executes at S6)
+	tools/hl-smoke.sh "$(HL_BIN)" "$(I686RT_BIN)" "$(BUSYBOX_I686)"
+
+.PHONY: test-p1-hl test-p2-hl test-p3-hl test-p4-hl test-p5-hl
