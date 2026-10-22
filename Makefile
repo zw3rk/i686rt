@@ -117,3 +117,36 @@ test-p3-lima: fixtures busybox ## RC3 differential: test_p1_isa + busybox echo s
 	echo PASS
 
 .PHONY: difftest test-p3-lima
+
+## ------------------------------------------------------------------ ##
+##  Phase 5 — L5e: x87/SSE fixture + oracle golden vectors (RC5)       ##
+##  RC5/test-p5-lima is executed by the coordinator inside the arm64  ##
+##  docker VM with an aarch64 _build/i686rt on the PATH-rooted cwd.   ##
+## ------------------------------------------------------------------ ##
+
+fixture-p5: ## Build the x87/SSE i386 fixture into _build (docker linux/386, -msse -msse2)
+	@mkdir -p $(BUILD_DIR)
+	tools/mkgolden.sh --fixture-only
+
+golden-p5: ## Regenerate tests/golden/p5.txt and p5_x87_80.txt from the docker linux/386 QEMU oracle
+	tools/mkgolden.sh
+
+test-p5-lima: ## RC5: fixture under ./_build/i686rt vs goldens, default + --x87-80 (single PASS)
+	@test -x "$(BUILD_DIR)/test_p5_fpu_sse" || $(MAKE) --no-print-directory fixture-p5
+	@set -e; \
+	d=$(BUILD_DIR)/p5check; mkdir -p $$d; \
+	grep -v '^CASE X87ONLY ' tests/golden/p5.txt | grep -e '^CASE ' -e '^DONE' > $$d/gold_default.txt; \
+	grep -e '^CASE ' -e '^DONE' tests/golden/p5_x87_80.txt > $$d/gold_x87_80.txt; \
+	./$(BUILD_DIR)/i686rt -- $(BUILD_DIR)/test_p5_fpu_sse > $$d/act_default.txt; \
+	./$(BUILD_DIR)/i686rt --x87-80 -- $(BUILD_DIR)/test_p5_fpu_sse > $$d/act_x87_80.txt; \
+	if cmp -s $$d/gold_default.txt $$d/act_default.txt && \
+	   cmp -s $$d/gold_x87_80.txt $$d/act_x87_80.txt; then \
+	  echo PASS; \
+	else \
+	  echo "FAIL: RC5 i686rt output vs golden"; \
+	  diff $$d/gold_default.txt $$d/act_default.txt | sed -n 1,40p || true; \
+	  diff $$d/gold_x87_80.txt $$d/act_x87_80.txt | sed -n 1,40p || true; \
+	  exit 1; \
+	fi
+
+.PHONY: fixture-p5 golden-p5 test-p5-lima
