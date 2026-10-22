@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+long syscall(long, ...);
 #include <unistd.h>
 
 #include "i686rt.h"
@@ -69,6 +70,19 @@ static void *thread_entry(void *arg)
         } else {
             (void)i686_interp_run(ctx);
         }
+    }
+    /* CLONE_CHILD_CLEARTID: clear the tid word and futex-wake it
+     * (kernel exit_mm/exit_notify behavior). */
+    if (ctx->clear_child_tid != 0U) {
+        uint32_t zero = 0U;
+        memcpy(i686_guest_ptr(ctx, ctx->clear_child_tid), &zero, 4U);
+        {
+            long hcmd = 1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/;
+            (void)syscall(SYS_futex,
+                          i686_guest_ptr(ctx, ctx->clear_child_tid),
+                          hcmd, 1, NULL, NULL, 0);
+        }
+        ctx->clear_child_tid = 0U;
     }
     return NULL;
 }
@@ -119,6 +133,7 @@ static int64_t r_clone(i686_ctx_t *ctx)
     i686_ctx_t *child;
     struct clone_arg *ca;
     pthread_t th;
+    uint32_t r_val = 0U;
     uint32_t child_eip = ctx->eip; /* engine sets exit_dest at clone */
 
     if ((flags & I686_CLONE_VM) == 0U) {
@@ -147,14 +162,21 @@ static int64_t r_clone(i686_ctx_t *ctx)
     if ((flags & I686_CLONE_SETTLS) != 0U && tls_va != 0U) {
         (void)i686_tls_install(child, tls_va);
     }
-    if ((flags & I686_CLONE_PARENT_SETTID) != 0U && parent_tid != 0U) {
-        uint32_t tid = (uint32_t)(uintptr_t)child; /* unique per thread v1 */
-        (void)i686_copy_to_guest(ctx, parent_tid, &tid, 4U);
-    }
-    if ((flags & I686_CLONE_CHILD_SETTID) != 0U && child_tid != 0U) {
-        uint32_t tid = (uint32_t)(uintptr_t)child;
-        (void)i686_copy_to_guest(child, child_tid, &tid, 4U);
-        child->clear_child_tid = child_tid;
+    {
+        /* small positive tids (i386 pid_t); the raw heap pointer
+         * truncates to unpredictable 32-bit garbage. */
+        static uint32_t s_next_tid = 101U;
+        uint32_t tid = s_next_tid++;
+        if ((flags & I686_CLONE_PARENT_SETTID) != 0U && parent_tid != 0U) {
+            (void)i686_copy_to_guest(ctx, parent_tid, &tid, 4U);
+        }
+        if ((flags & I686_CLONE_CHILD_SETTID) != 0U && child_tid != 0U) {
+            (void)i686_copy_to_guest(child, child_tid, &tid, 4U);
+        }
+        if ((flags & I686_CLONE_CHILD_CLEARTID) != 0U && child_tid != 0U) {
+            child->clear_child_tid = child_tid;
+        }
+        r_val = tid;
     }
 
     ca->ctx = child;
@@ -163,7 +185,7 @@ static int64_t r_clone(i686_ctx_t *ctx)
         return -ENOMEM;
     }
     pthread_detach(th);
-    return (int64_t)(uintptr_t)child; /* nonzero tid-ish in parent */
+    return (int64_t)r_val; /* parent sees the positive tid */
 }
 
 void i686_threads_main_init(i686_ctx_t *ctx)

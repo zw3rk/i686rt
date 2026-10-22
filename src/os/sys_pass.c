@@ -87,6 +87,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+/* syscall(2) hidden under strict _POSIX_C_SOURCE in musl */
+long syscall(long, ...);
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -1023,26 +1025,36 @@ static long sys_personality(i686_ctx_t *ctx, uint32_t persona)
 static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val)
 {
     /*
-     * Phase 4 stopgap, single-threaded semantics (documented deviation):
-     * FUTEX_WAKE reports "no waiters" (0); FUTEX_WAIT verifies *uaddr ==
-     * val (returning -EAGAIN like the kernel on mismatch) and then
-     * reports "woken" (0) without ever blocking.  Real futexes arrive
-     * with clone() in Phase 4.
+     * Phase 4: real futexes on the shared window.  The guest uaddr maps
+     * 1:1 to a host address (guest_base + uaddr) and every thread of
+     * the process shares the mapping, so the host futex word IS the
+     * guest futex word.  Timeout (arg5 on i386: a guest timespec*) is
+     * converted to a host timespec; NULL = infinite.
      */
-    switch (op & FUTEX_CMD_MASK_) {
-    case FUTEX_WAIT_: {
-        uint8_t cur[4];
-        if (guest_ptr_bad(uaddr) ||
-            i686_copy_from_guest(ctx, cur, uaddr, sizeof cur) != 0) {
-            return -EFAULT;
+    long hcmd = (op & FUTEX_CMD_MASK_) + 128 /* FUTEX_PRIVATE_FLAG */;
+    struct timespec ts, *pts = NULL;
+    int r;
+
+    if (guest_ptr_bad(uaddr)) {
+        return -EFAULT;
+    }
+    if ((op & FUTEX_CMD_MASK_) == FUTEX_WAIT_) {
+        uint32_t timeout_va = ctx->gpr[I686_REG_EBP];
+        if (timeout_va != 0U) {
+            struct { uint32_t sec, nsec; } gts;
+            if (i686_copy_from_guest(ctx, &gts, timeout_va, sizeof gts) == 0) {
+                ts.tv_sec = gts.sec;
+                ts.tv_nsec = gts.nsec;
+                pts = &ts;
+            }
         }
-        return (rd_le32(cur) == val) ? 0 : -EAGAIN;
     }
-    case FUTEX_WAKE_:
-        return 0;
-    default:
-        return -ENOSYS;
+    r = (int)syscall(SYS_futex, i686_guest_ptr(ctx, uaddr), hcmd, val,
+                     pts, NULL, 0);
+    if (r < 0) {
+        return (errno == EWOULDBLOCK) ? -EAGAIN : -errno;
     }
+    return r;
 }
 
 /* ------------------------------------------------------------------ */

@@ -40,6 +40,12 @@ static const uint8_t retcode_rt[8] = {
 #define SA_RESTORER_ 0x04000000U
 #define SA_SIGINFO_  0x00000004U
 
+/* Last frame base pushed on this thread (v1 single-threaded): the
+ * sigreturn entry reads the sigcontext from the EXACT address we
+ * built, immune to esp-convention drift at the restorer. */
+static uint32_t s_last_frame_va;
+static int s_last_frame_rt;
+
 static uint32_t push_bytes(i686_ctx_t *ctx, uint32_t *sp, const void *b,
                            size_t n)
 {
@@ -75,6 +81,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     fp_va = push_bytes(ctx, &sp, &fp, sizeof(fp));
     sp &= ~7U;
 
+    sp &= ~0xFU; /* frame base (and thus handler esp) 16-aligned */
     if (sa_siginfo) {
         i686_rt_sigframe_t rt;
         memset(&rt, 0, sizeof(rt));
@@ -108,6 +115,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     sc.fpstate = fp_va;
     sc.cr2 = ctx->fault_addr;
 
+    /* siginfo bytes for the rt frame (frame+0x10..0x90). */
     if (sa_siginfo) {
         /* rt frame: sc lives in ucontext at frame+0x90+20 */
         memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 20), &sc, sizeof(sc));
@@ -115,32 +123,35 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
                retcode_rt, 8);
         *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
             frame_va + sizeof(i686_rt_sigframe_t) - 8;
-        /* handler args (sig, info, uc): info/uc point into the frame
-         * (kernel: pinfo=frame+0x10, puc=frame+0x90) — fixed VAs. */
         *(uint32_t *)i686_guest_ptr(ctx, frame_va + 8) = frame_va + 0x10;
         *(uint32_t *)i686_guest_ptr(ctx, frame_va + 12) = frame_va + 0x90;
-        sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = frame_va + 0x90;
-        sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = frame_va + 0x10;
-        sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = (uint32_t)sig;
+        {
+            /* si_signo, si_errno, si_code(+8), si_addr(12 for SEGV) */
+            uint8_t si[16];
+            memset(si, 0, sizeof(si));
+            si[0] = (uint8_t)sig; si[1] = (uint8_t)(sig >> 8);
+            si[8] = (sig == 11) ? 1 : ((sig == 8) ? 1 : 0); /* SEGV_MAPERR / FPE_INTDIV */
+            if (sig == 11) {
+                uint32_t a = sc.cr2;
+                memcpy(si + 12, &a, 4);
+            }
+            memcpy(i686_guest_ptr(ctx, frame_va + 0x10), si, sizeof(si));
+        }
     } else {
-        memcpy(i686_guest_ptr(ctx, frame_va + 4), &sc, sizeof(sc));
+        memcpy(i686_guest_ptr(ctx, frame_va + 8), &sc, sizeof(sc));
         memcpy(i686_guest_ptr(ctx, frame_va + sizeof(i686_sigframe_t) - 8),
                retcode_nonrt, 8);
         *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
             frame_va + sizeof(i686_sigframe_t) - 8;
-        sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = (uint32_t)sig;
     }
 
-    /* return address for the guest handler -> restorer (or retcode) */
-    {
-        uint32_t ret_to = (ga->flags & SA_RESTORER_)
-            ? ga->restorer
-            : frame_va + ((sa_siginfo) ? (uint32_t)sizeof(i686_rt_sigframe_t) - 8
-                                       : (uint32_t)sizeof(i686_sigframe_t) - 8);
-        sp -= 4; *(uint32_t *)i686_guest_ptr(ctx, sp) = ret_to;
-    }
-
-    ctx->gpr[I686_REG_ESP] = sp & ~0xFU;
+    /* Kernel-contiguous handler entry (i386): esp = frame base;
+     * [esp]=pretcode is the handler return address, [esp+4]=sig,
+     * [esp+8]=pinfo, [esp+0xc]=puc — the frame fields ARE the args. */
+    (void)sp;
+    ctx->gpr[I686_REG_ESP] = frame_va;
+    s_last_frame_va = frame_va;
+    s_last_frame_rt = sa_siginfo;
     ctx->eip = ga->handler;
     (void)handler; (void)restorer; (void)info_va; (void)uc_va; (void)i;
     return 0;
@@ -148,17 +159,16 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
 
 int i686_sigreturn(i686_ctx_t *ctx, int rt)
 {
-    /* Kernel esp convention at the restorer: non-RT frame + 4 (pretcode
-     * was popped as the handler's return address); RT frame + 0 (the
-     * restorer is called with esp pointing at the frame base because the
-     * handler-return popped pretcode leaving sig at [esp]).  We detect
-     * the frame by scanning: our builder pushed handler args + retaddr
-     * BELOW the frame, so at sigreturn time esp = frame_va (args and
-     * retaddr were popped by the handler's own ret/leave sequence only
-     * if the guest stub did `pop eax` first — the retcode does). */
-    uint32_t sp = ctx->gpr[I686_REG_ESP];
     i686_sigcontext_t sc;
-    uint32_t base = rt ? sp + 0x90 + 20 : sp + 8;
+    uint32_t base;
+    if (s_last_frame_va == 0U || (!!rt) != (!!s_last_frame_rt)) {
+        /* sigreturn outside our delivered frame: kernel behavior is a
+         * SIGSEGV; v1 restores nothing and reports EFAULT. */
+        s_last_frame_va = 0U;
+        return -1;
+    }
+    base = s_last_frame_va + (rt ? (0x90U + 20U) : 8U); /* sc follows pretcode+sig */
+    s_last_frame_va = 0U;
     if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
         return -1;
     }
