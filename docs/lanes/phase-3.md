@@ -127,3 +127,15 @@ RC3 acceptance, aarch64 docker VM (lima deviation per Phase 1):
 - busybox echo hi / sh -c 'echo ok' under dbt → correct output, exit 0
 - difftest test_p1_isa → DIFFTEST: EQUAL
 - difftest busybox sh -c 'echo ok' → DIFFTEST: EQUAL, output contains ok
+
+## Post-audit fix (2026-10-22)
+
+DEFECTS.md D3 (external audit of f1e6610): the L3c setcc unit oracle's
+GE not-taken mask was SF|OF — flags under which GE is TRUE — so an
+always-1 SETGE passed it. Fixed to SF-only (SF set, OF clear); the
+full L3c suite re-run passes (863 checks, static-pie link in the arm64
+VM; interim link needed flags_dbt.c/engine.c/h_bit.c that the lane's
+file list omitted). The audit's D1/D2/D4-D6 comment notes were
+partially swept into 3febc37 via git add -A; the remaining stray
+lane-leak edits in the main checkout are preserved in stashes
+(quarantine, quarantine-2) pending owner reconciliation at S5.
