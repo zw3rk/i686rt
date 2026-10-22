@@ -521,7 +521,7 @@ int main(void)
                                            0U,
                                            0U};
         static const uint32_t setcc_f[] = {0U,
-                                           I686_EF_SF | I686_EF_OF,
+                                           I686_EF_SF,
                                            I686_EF_CF | I686_EF_ZF};
         for (j = 0U; j < sizeof(setcc_conds); j++) {
             t_case_t c;
