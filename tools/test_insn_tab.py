@@ -93,10 +93,55 @@ EXPECTED_IDS += [
 ]
 EXPECTED_IDS += ["INT_Ib", "INT3", "INTO", "IRET"]
 
+# Phase 5 shared spec (docs/lanes/phase-5.md): one id per 0F opcode byte;
+# 66/F2/F3 select the family member inside the handler.
+EXPECTED_IDS += [
+    "MOVUPS", "MOVLPS", "MOVHPS", "MOVAPS", "MOVQ_xmm",
+    "CVTPI2PS", "CVTTPS2PI", "CVTPS2PD", "CVTDQ2PS",
+    "UCOMISS", "COMISS", "MOVMSKPS",
+    "ANDPS", "ANDNPS", "ORPS", "XORPS",
+    "ADDPS", "MULPS", "SUBPS", "DIVPS",
+    "PUNPCKLBW", "PUNPCKLWD", "PUNPCKLDQ",
+    "PUNPCKHBW", "PUNPCKHWD", "PUNPCKHDQ",
+    "PUNPCKLQDQ", "PUNPCKHQDQ",
+    "PSHUFW", "CMPPS",
+    "PADDQ", "PMULLW", "PAND", "PANDN", "POR", "PXOR",
+    "PMULUDQ", "PSUBD", "PSUBQ", "PADDD",
+    "LDMXCSR", "STMXCSR", "EMMS",
+]
+
+# Phase 5 L5c x87/MMX set (docs/lanes/phase-5.md + hardware-verified
+# second bytes): D8-DF group ids plus 0F 77 EMMS and 0F AE /0-/1.
+EXPECTED_IDS += [
+    # D8 / DC: m32 + m64 arithmetic/compare forms
+    "FADD_m32", "FMUL_m32", "FCOM_m32", "FCOMP_m32",
+    "FSUB_m32", "FSUBR_m32", "FDIV_m32", "FDIVR_m32",
+    "FADD_m64", "FMUL_m64", "FCOM_m64", "FCOMP_m64",
+    "FSUB_m64", "FSUBR_m64", "FDIV_m64", "FDIVR_m64",
+    # DE pop forms
+    "FADDP", "FMULP", "FSUBRP", "FSUBP", "FDIVRP", "FDIVP",
+    # D9
+    "FLD_m32", "FXCH", "FST_m32", "FSTP_m32",
+    "FLDENV", "FLDCW", "FNSTENV", "FNSTCW",
+    # DD
+    "FLD_m64", "FST_m64", "FSTP_m64", "FUCOM", "FUCOMP", "FNSTSW_m16",
+    # DB
+    "FILD_m32", "FIST_m32", "FISTP_m32", "FNINIT", "FLD_m80", "FCOMI",
+    "FSTP_m80",
+    # DA
+    "FUCOMPP",
+    # DF
+    "FILD_m16", "FIST_m16", "FISTP_m16", "FNSTSW_AX", "FILD_m64",
+    "FCOMIP", "FISTP_m64",
+    # 0F map
+    "EMMS", "FXSAVE", "FXRSTOR",
+]
+
 # CALL_Ev/JMP_Ev/PUSH_Ev are named in two contract lists (G5 and
-# branches/stack) but are single ids; count uniques for the size check.
+# branches/stack) but are single ids; EMMS likewise rides both the SSE
+# and x87 lists.  Count uniques for the size check.
 EXPECTED_UNIQUE = sorted(set(EXPECTED_IDS))
-assert len(EXPECTED_IDS) - len(EXPECTED_UNIQUE) == 3
+assert len(EXPECTED_IDS) - len(EXPECTED_UNIQUE) == 4
 
 # ---------------------------------------------------------------------------
 # Descriptor spot checks: (byte, op, opnd-kinds, modrm, group_op, lockable)
@@ -146,7 +191,14 @@ S_1B = [
     (0xCD, "INT_Ib", ("I8",), 0, 0, 0),
     (0xD1, "INVALID", None, 1, 1, 0),
     (0xD7, "XLAT", ("NONE",), 0, 0, 0),
-    (0xD8, "INVALID", None, 0, 0, 0),
+    (0xD8, "INVALID", None, 1, 1, 0),   # x87 group (L5c)
+    (0xD9, "INVALID", None, 1, 1, 0),
+    (0xDA, "INVALID", None, 1, 1, 0),
+    (0xDB, "INVALID", None, 1, 1, 0),
+    (0xDC, "INVALID", None, 1, 1, 0),
+    (0xDD, "INVALID", None, 1, 1, 0),
+    (0xDE, "INVALID", None, 1, 1, 0),
+    (0xDF, "INVALID", None, 1, 1, 0),
     (0xE0, "LOOPNZ_Jb", ("REL8",), 0, 0, 0),
     (0xE9, "JMP_Jz", ("REL32",), 0, 0, 0),
     (0xEB, "JMP_Jb", ("REL8",), 0, 0, 0),
@@ -158,7 +210,7 @@ S_1B = [
 
 S_0F = [
     (0x0B, "UD2", ("NONE",), 0, 0, 0),              # card spot
-    (0x10, "INVALID", None, 0, 0, 0),
+    (0x10, "MOVUPS", ("R32", "RM32"), 1, 0, 0),     # Phase 5 SSE
     (0x31, "RDTSC", ("NONE", "NONE", "NONE", "NONE", "NONE", "NONE"), 0, 0, 0),
     (0x34, "SYSENTER", ("NONE",), 0, 0, 0),         # card spot
     (0x40, "CMOVcc_Gv", ("R32", "RM32"), 1, 0, 0),
@@ -185,7 +237,61 @@ S_0F = [
     (0xBF, "MOVSX_GvEw", ("R32", "RM16"), 1, 0, 0),
     (0xC0, "XADD_EbGb", ("RM8", "R8"), 1, 0, 1),
     (0xC8, "BSWAP_Gv", ("R32",), 0, 0, 0),
+    (0x77, "EMMS", ("NONE",), 0, 0, 0),            # L5c x87/MMX
+    (0xAE, "INVALID", None, 1, 1, 0),              # L5c 0F AE group
     (0xD0, "INVALID", None, 0, 0, 0),
+    # Phase 5 SSE/MMX rows (full byte map lock; every assigned byte).
+    (0x11, "MOVUPS", ("RM32", "R32"), 1, 0, 0),
+    (0x12, "MOVLPS", ("R32", "RM32"), 1, 0, 0),
+    (0x13, "MOVLPS", ("RM32", "R32"), 1, 0, 0),
+    (0x14, "INVALID", None, 0, 0, 0),               # UNPCKLPS not in v1
+    (0x16, "MOVHPS", ("R32", "RM32"), 1, 0, 0),
+    (0x17, "MOVHPS", ("RM32", "R32"), 1, 0, 0),
+    (0x28, "MOVAPS", ("R32", "RM32"), 1, 0, 0),
+    (0x29, "MOVAPS", ("RM32", "R32"), 1, 0, 0),
+    (0x2A, "CVTPI2PS", ("R32", "RM32"), 1, 0, 0),
+    (0x2C, "CVTTPS2PI", ("R32", "RM32"), 1, 0, 0),
+    (0x2D, "INVALID", None, 0, 0, 0),               # CVTPS2PI fam not in v1
+    (0x2E, "UCOMISS", ("R32", "RM32"), 1, 0, 0),
+    (0x2F, "COMISS", ("R32", "RM32"), 1, 0, 0),
+    (0x50, "MOVMSKPS", ("R32", "RM32"), 1, 0, 0),
+    (0x54, "ANDPS", ("R32", "RM32"), 1, 0, 0),
+    (0x55, "ANDNPS", ("R32", "RM32"), 1, 0, 0),
+    (0x56, "ORPS", ("R32", "RM32"), 1, 0, 0),
+    (0x57, "XORPS", ("R32", "RM32"), 1, 0, 0),
+    (0x58, "ADDPS", ("R32", "RM32"), 1, 0, 0),
+    (0x59, "MULPS", ("R32", "RM32"), 1, 0, 0),      # hw map: MUL=59
+    (0x5A, "CVTPS2PD", ("R32", "RM32"), 1, 0, 0),
+    (0x5B, "CVTDQ2PS", ("R32", "RM32"), 1, 0, 0),
+    (0x5C, "SUBPS", ("R32", "RM32"), 1, 0, 0),
+    (0x5D, "INVALID", None, 0, 0, 0),               # MIN family not in v1
+    (0x5E, "DIVPS", ("R32", "RM32"), 1, 0, 0),
+    (0x5F, "INVALID", None, 0, 0, 0),               # MAX family not in v1
+    (0x60, "PUNPCKLBW", ("R32", "RM32"), 1, 0, 0),
+    (0x61, "PUNPCKLWD", ("R32", "RM32"), 1, 0, 0),
+    (0x62, "PUNPCKLDQ", ("R32", "RM32"), 1, 0, 0),
+    (0x63, "INVALID", None, 0, 0, 0),               # PACKSSWB not in v1
+    (0x68, "PUNPCKHBW", ("R32", "RM32"), 1, 0, 0),
+    (0x69, "PUNPCKHWD", ("R32", "RM32"), 1, 0, 0),
+    (0x6A, "PUNPCKHDQ", ("R32", "RM32"), 1, 0, 0),
+    (0x6C, "PUNPCKLQDQ", ("R32", "RM32"), 1, 0, 0),
+    (0x6D, "PUNPCKHQDQ", ("R32", "RM32"), 1, 0, 0),
+    (0x6E, "MOVQ_xmm", ("R32", "RM32"), 1, 0, 0),
+    (0x6F, "INVALID", None, 0, 0, 0),               # MOVDQA/MOVDQU not in v1
+    (0x70, "PSHUFW", ("R32", "RM32", "I8"), 1, 0, 0),
+    (0x7E, "MOVQ_xmm", ("RM32", "R32"), 1, 0, 0),
+    (0x7F, "INVALID", None, 0, 0, 0),
+    (0xC2, "CMPPS", ("R32", "RM32", "I8"), 1, 0, 0),
+    (0xD4, "PADDQ", ("R32", "RM32"), 1, 0, 0),
+    (0xD5, "PMULLW", ("R32", "RM32"), 1, 0, 0),
+    (0xDB, "PAND", ("R32", "RM32"), 1, 0, 0),
+    (0xDF, "PANDN", ("R32", "RM32"), 1, 0, 0),
+    (0xEB, "POR", ("R32", "RM32"), 1, 0, 0),
+    (0xEF, "PXOR", ("R32", "RM32"), 1, 0, 0),
+    (0xF4, "PMULUDQ", ("R32", "RM32"), 1, 0, 0),
+    (0xFA, "PSUBD", ("R32", "RM32"), 1, 0, 0),
+    (0xFB, "PSUBQ", ("R32", "RM32"), 1, 0, 0),
+    (0xFE, "PADDD", ("R32", "RM32"), 1, 0, 0),
 ]
 
 # Group rows: ((map0f, opcode), [8 ids], lock mask)
@@ -207,6 +313,27 @@ S_GROUPS = [
                  "JMP_Ev", "INVALID", "PUSH_Ev", "INVALID"], 0x03),
     ((1, 0xBA), ["INVALID"] * 4 + ["BT_EvIb", "BTS_EvIb", "BTR_EvIb",
                                    "BTC_EvIb"], 0xE0),
+    # Phase 5 L5c x87 groups (D8-DF by modrm reg field; mod picks mem vs
+    # ST(i) in the handler; 0F AE /0-/1 FXSAVE/FXRSTOR).
+    ((0, 0xD8), ["FADD_m32", "FMUL_m32", "FCOM_m32", "FCOMP_m32",
+                 "FSUB_m32", "FSUBR_m32", "FDIV_m32", "FDIVR_m32"], 0x00),
+    ((0, 0xD9), ["FLD_m32", "FXCH", "FST_m32", "FSTP_m32",
+                 "FLDENV", "FLDCW", "FNSTENV", "FNSTCW"], 0x00),
+    ((0, 0xDA), ["INVALID"] * 5 + ["FUCOMPP"] + ["INVALID"] * 2, 0x00),
+    ((0, 0xDB), ["FILD_m32", "INVALID", "FIST_m32", "FISTP_m32",
+                 "FNINIT", "FLD_m80", "FCOMI", "FSTP_m80"], 0x00),
+    ((0, 0xDC), ["FADD_m64", "FMUL_m64", "FCOM_m64", "FCOMP_m64",
+                 "FSUB_m64", "FSUBR_m64", "FDIV_m64", "FDIVR_m64"], 0x00),
+    ((0, 0xDD), ["FLD_m64", "INVALID", "FST_m64", "FSTP_m64",
+                 "FUCOM", "FUCOMP", "INVALID", "FNSTSW_m16"], 0x00),
+    ((0, 0xDE), ["FADDP", "FMULP", "INVALID", "INVALID",
+                 "FSUBRP", "FSUBP", "FDIVRP", "FDIVP"], 0x00),
+    ((0, 0xDF), ["FILD_m16", "INVALID", "FIST_m16", "FISTP_m16",
+                 "FNSTSW_AX", "FILD_m64", "FCOMIP", "FISTP_m64"], 0x00),
+    # Phase 5 shared spec: 0F AE /2 LDMXCSR, /3 STMXCSR join the L5c
+    # FXSAVE/FXRSTOR group slots (/4-/7 stay INVALID).
+    ((1, 0xAE), ["FXSAVE", "FXRSTOR", "LDMXCSR", "STMXCSR"]
+     + ["INVALID"] * 4, 0x00),
 ]
 
 
@@ -320,7 +447,7 @@ def main():
         key = (int(m.group(1)), int(m.group(2), 16))
         ids = re.findall(r"I686_OP_(\w+)", m.group(3))
         groups[key] = (ids, int(m.group(4), 16))
-    check(len(groups) == 15, "group tab has %d rows (want 15)" % len(groups))
+    check(len(groups) == 24, "group tab has %d rows (want 24)" % len(groups))
     for key, want_ids, want_lock in S_GROUPS:
         got = groups.get(key)
         if got is None:

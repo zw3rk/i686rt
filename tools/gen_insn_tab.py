@@ -127,6 +127,60 @@ def contract_ids():
         "LODSb", "LODSw", "SCASb", "SCASw",
     ]))
     sections.append(("int/trap", ["INT_Ib", "INT3", "INTO", "IRET"]))
+
+    # Phase 5 shared spec (docs/lanes/phase-5.md "Generator rows", lanes
+    # L5a+L5b emit byte-identically): SSE2 integer + SSE scalar FP over
+    # the used 0F map -- ONE id per opcode byte; the mandatory prefixes
+    # (66 -> pfx_opsize, F2/F3 -> pfx_rep) select the family member
+    # inside the handler.  LDMXCSR/STMXCSR bind via the 0F AE group
+    # (/2,/3); EMMS also rides the L5c x87 set below (one id).
+    sections.append(("SSE/MMX families (Phase 5 shared spec, docs/lanes/phase-5.md: ONE id per 0F opcode byte; the mandatory prefixes 66/F2/F3 ride pfx_opsize/pfx_rep and select the family member inside the handler)", [
+        "MOVUPS", "MOVLPS", "MOVHPS", "MOVAPS", "MOVQ_xmm",
+        "CVTPI2PS", "CVTTPS2PI", "CVTPS2PD", "CVTDQ2PS",
+        "UCOMISS", "COMISS", "MOVMSKPS",
+        "ANDPS", "ANDNPS", "ORPS", "XORPS",
+        "ADDPS", "MULPS", "SUBPS", "DIVPS",
+        "PUNPCKLBW", "PUNPCKLWD", "PUNPCKLDQ",
+        "PUNPCKHBW", "PUNPCKHWD", "PUNPCKHDQ",
+        "PUNPCKLQDQ", "PUNPCKHQDQ",
+        "PSHUFW", "CMPPS",
+        "PADDQ", "PMULLW", "PAND", "PANDN", "POR", "PXOR",
+        "PMULUDQ", "PSUBD", "PSUBQ", "PADDD",
+        "LDMXCSR", "STMXCSR", "EMMS",
+    ]))
+
+    # Phase 5 (L5c) x87/MMX set.  D8-DF are group bytes: the modrm reg
+    # field picks one of 8 ids per byte and the mod bit selects the memory
+    # vs ST(i) form inside the handler (x87 second-byte fixed forms ride
+    # the owning slot's handler via a modrm_mod/modrm_rm sub-dispatch --
+    # see src/interp/h_x87.c).  0F 77 EMMS and the 0F AE /0-/1 group
+    # (FXSAVE/FXRSTOR) complete the set; byte-identical rows are also
+    # emitted by the SSE lanes per docs/lanes/phase-5.md (S5 dedupes).
+    sections.append(("x87/MMX x87 state (D8-DF groups + 0F 77/0F AE, Phase 5 L5c)", [
+        # D8: m32 arithmetic/compare (+ ST(i) register forms via mod=3)
+        "FADD_m32", "FMUL_m32", "FCOM_m32", "FCOMP_m32",
+        "FSUB_m32", "FSUBR_m32", "FDIV_m32", "FDIVR_m32",
+        # DC: m64 arithmetic/compare (+ ST(i),ST(0) reversed forms)
+        "FADD_m64", "FMUL_m64", "FCOM_m64", "FCOMP_m64",
+        "FSUB_m64", "FSUBR_m64", "FDIV_m64", "FDIVR_m64",
+        # DE: pop forms ST(i),ST(0) (memory FIADD-class declined)
+        "FADDP", "FMULP", "FSUBRP", "FSUBP", "FDIVRP", "FDIVP",
+        # D9 env/slots (fixed forms via sub-dispatch)
+        "FLD_m32", "FXCH", "FST_m32", "FSTP_m32",
+        "FLDENV", "FLDCW", "FNSTENV", "FNSTCW",
+        # DD
+        "FLD_m64", "FST_m64", "FSTP_m64", "FUCOM", "FUCOMP", "FNSTSW_m16",
+        # DB (FUCOMI rides FLD_m80 mod=3; FNCLEX rides FNINIT mod=3)
+        "FILD_m32", "FIST_m32", "FISTP_m32", "FNINIT", "FLD_m80", "FCOMI",
+        "FSTP_m80",
+        # DA
+        "FUCOMPP",
+        # DF (FUCOMIP rides FILD_m64 mod=3; FNSTSW AX is DF E0)
+        "FILD_m16", "FIST_m16", "FISTP_m16", "FNSTSW_AX", "FILD_m64",
+        "FCOMIP", "FISTP_m64",
+        # 0F map
+        "EMMS", "FXSAVE", "FXRSTOR",
+    ]))
     return sections
 
 
@@ -190,42 +244,36 @@ TWOB_INVALID = {
     0x05: "",
     0x06: "CLTS: excluded", 0x07: "",
     0x08: "", 0x09: "", 0x0A: "", 0x0C: "", 0x0D: "", 0x0E: "", 0x0F: "",
-    0x10: "SSE excluded", 0x11: "SSE excluded", 0x12: "SSE excluded",
-    0x13: "SSE excluded", 0x14: "SSE excluded", 0x15: "SSE excluded",
-    0x16: "SSE excluded", 0x17: "SSE excluded", 0x18: "SSE excluded",
+    0x14: "SSE excluded", 0x15: "SSE excluded", 0x18: "SSE excluded",
     0x19: "SSE excluded", 0x1A: "SSE excluded", 0x1B: "SSE excluded",
     0x1C: "SSE excluded", 0x1D: "SSE excluded", 0x1E: "SSE excluded",
     0x1F: "SSE excluded (NOP variant)",
+    # (0x10-0x13, 0x16, 0x17 now MOVUPS/MOVLPS/MOVHPS rows, Phase 5)
     0x20: "MOV Cd/Td: excluded", 0x21: "", 0x22: "", 0x23: "",
     0x24: "MOV Rd/Td test: excluded", 0x25: "", 0x26: "", 0x27: "",
-    0x28: "MOV Rd/Dd: excluded", 0x29: "", 0x2A: "", 0x2B: "",
-    0x2C: "", 0x2D: "", 0x2E: "", 0x2F: "",
+    # 0x28/0x29 MOVAPS, 0x2A CVTPI2PS, 0x2C CVTTPS2PI, 0x2E/0x2F
+    # UCOMISS/COMISS: Phase 5 rows.
+    0x2D: "CVTPS2PI/CVTSS2SI family (0F 2D): not in v1",
     0x30: "WRMSR: excluded", 0x31: "RDTSC: excluded", 0x32: "RDMSR: excluded",
     0x33: "",
     0x35: "SYSEXIT: not in v1",
-    0x50: "SSE excluded", 0x51: "SSE excluded", 0x52: "SSE excluded",
-    0x53: "SSE excluded", 0x54: "SSE excluded", 0x55: "SSE excluded",
-    0x56: "SSE excluded", 0x57: "SSE excluded", 0x58: "SSE excluded",
-    0x59: "SSE excluded", 0x5A: "SSE excluded", 0x5B: "SSE excluded",
-    0x5C: "SSE excluded", 0x5D: "SSE excluded", 0x5E: "SSE excluded",
-    0x5F: "SSE excluded",
-    0x60: "SSE excluded", 0x61: "SSE excluded", 0x62: "SSE excluded",
-    0x63: "SSE excluded", 0x64: "SSE excluded", 0x65: "SSE excluded",
-    0x66: "SSE excluded", 0x67: "SSE excluded", 0x68: "SSE excluded",
-    0x69: "SSE excluded", 0x6A: "SSE excluded", 0x6B: "SSE excluded",
-    0x6C: "SSE excluded", 0x6D: "SSE excluded", 0x6E: "SSE excluded",
-    0x6F: "SSE excluded",
-    0x70: "SSE excluded", 0x71: "SSE excluded", 0x72: "SSE excluded",
-    0x73: "SSE excluded", 0x74: "SSE excluded", 0x75: "SSE excluded",
-    0x76: "SSE excluded", 0x77: "SSE excluded", 0x78: "SSE excluded",
-    0x79: "SSE excluded", 0x7A: "SSE excluded", 0x7B: "SSE excluded",
-    0x7C: "SSE excluded", 0x7D: "SSE excluded", 0x7E: "SSE excluded",
-    0x7F: "SSE excluded",
+    0x51: "SSE excluded", 0x52: "SSE excluded", 0x53: "SSE excluded",
+    0x5D: "MIN family (MINPS/MINSS/MINPD/MINSD): not in v1",
+    0x5F: "MAX family (MAXPS/MAXSS/MAXPD/MAXSD): not in v1",
+    0x63: "PACKSSWB: not in v1", 0x64: "PCMPGTB: not in v1",
+    0x65: "PCMPGTW: not in v1", 0x66: "PCMPGTD: not in v1",
+    0x67: "PACKUSWB: not in v1", 0x6B: "PACKSSDW: not in v1",
+    0x6F: "MOVDQA/MOVDQU (66/F3 0F 6F): not in v1",
+    0x71: "SSE excluded", 0x72: "SSE excluded", 0x73: "SSE excluded",
+    0x74: "SSE excluded", 0x75: "SSE excluded", 0x76: "SSE excluded",
+    0x78: "SSE excluded", 0x79: "SSE excluded", 0x7A: "SSE excluded",
+    0x7B: "SSE excluded", 0x7C: "SSE excluded", 0x7D: "SSE excluded",
+    0x7F: "MOVDQA/MOVDQU/MMX MOVQ stores (0F 7F): not in v1",
     0xA6: "reserved", 0xA7: "reserved",
-    0xAA: "RSM: excluded", 0xAE: "excluded",
+    0xAA: "RSM: excluded",
     0xB2: "reserved", 0xB4: "reserved", 0xB5: "reserved",
     0xB8: "reserved (POP gs variant)", 0xB9: "reserved group",
-    0xC2: "SSE excluded", 0xC3: "SSE excluded", 0xC4: "SSE excluded",
+    0xC3: "SSE excluded", 0xC4: "SSE excluded",
     0xC5: "SSE excluded", 0xC6: "SSE excluded", 0xC7: "SSE excluded",
 }
 TWOB_INVALID_RANGES = ((0xD0, 0xFF, "MMX/SSE excluded"),)
@@ -283,7 +331,17 @@ def build_oneb():
                     (0xF6, "G3 byte (see i686_group_tab)"),
                     (0xF7, "G3 word/dword (see i686_group_tab)"),
                     (0xFE, "G4 (see i686_group_tab)"),
-                    (0xFF, "G5 (see i686_group_tab)")):
+                    (0xFF, "G5 (see i686_group_tab)"),
+                    # Phase 5 L5c: x87 escape bytes resolve by modrm reg
+                    # field; the mod bit picks mem vs ST(i) in handlers.
+                    (0xD8, "x87 D8: m32/ST(i) arith+com (see i686_group_tab)"),
+                    (0xD9, "x87 D9: env/fixed forms (see i686_group_tab)"),
+                    (0xDA, "x87 DA: FUCOMPP only (see i686_group_tab)"),
+                    (0xDB, "x87 DB: FILD/FIST/FLD m80/COMI (see i686_group_tab)"),
+                    (0xDC, "x87 DC: m64/ST(i),ST(0) arith (see i686_group_tab)"),
+                    (0xDD, "x87 DD: FLD/FST m64, FUCOM*, FNSTSW (see i686_group_tab)"),
+                    (0xDE, "x87 DE: arithmetic pop forms (see i686_group_tab)"),
+                    (0xDF, "x87 DF: FILD/FIST m16/m64, FNSTSW AX (see i686_group_tab)")):
         t[b] = group_desc(note)
     t[0x84] = Desc("TEST_EbGb", ("RM8", "R8"))
     t[0x85] = Desc("TEST_EvGv", ("RM32", "R32"))
@@ -391,6 +449,92 @@ def build_twob():
     t[0xC1] = Desc("XADD_EvGv", ("RM32", "R32"), lock=1)
     for r in range(8):
         t[0xC8 + r] = Desc("BSWAP_Gv", ("R32",), modrm=0, note="rm=opcode&7")
+    # Phase 5 shared spec (docs/lanes/phase-5.md "Generator rows"): SSE2
+    # integer + SSE scalar FP over the used 0F map.  One id per opcode
+    # byte; the mandatory prefixes (66 -> pfx_opsize, F2/F3 -> pfx_rep)
+    # select the family member inside the handler.  Load rows carry
+    # (R32, RM32) [reg = xmm dest], store rows (RM32, R32) [rm = dest];
+    # plain-map 0F 6C/6D (PUNPCKLQDQ/HQDQ) have no MMX form.  Hardware
+    # note: the lane card's "SUB/MUL/DIV (5C/5D/5E)" is corrected to the
+    # real map (MUL=59, SUB=5C, DIV=5E; 5D/5F are MIN/MAX, not in v1).
+    t[0x10] = Desc("MOVUPS", ("R32", "RM32"),
+                   note="load; 66=MOVUPD, F3=MOVSS, F2=MOVSD")
+    t[0x11] = Desc("MOVUPS", ("RM32", "R32"),
+                   note="store; 66=MOVUPD, F3=MOVSS, F2=MOVSD")
+    t[0x12] = Desc("MOVLPS", ("R32", "RM32"),
+                   note="low64 <- m64 (mod=3 plain: MOVHLPS); 66=MOVLPD")
+    t[0x13] = Desc("MOVLPS", ("RM32", "R32"), note="m64 <- low64; 66=MOVLPD")
+    t[0x16] = Desc("MOVHPS", ("R32", "RM32"),
+                   note="high64 <- m64 (mod=3 plain: MOVLHPS); 66=MOVHPD")
+    t[0x17] = Desc("MOVHPS", ("RM32", "R32"), note="m64 <- high64; 66=MOVHPD")
+    t[0x28] = Desc("MOVAPS", ("R32", "RM32"),
+                   note="128-bit load (v1: no #GP on unaligned); 66=MOVAPD")
+    t[0x29] = Desc("MOVAPS", ("RM32", "R32"),
+                   note="128-bit store; 66=MOVAPD")
+    t[0x2A] = Desc("CVTPI2PS", ("R32", "RM32"),
+                   note="66=CVTPI2PD, F3=CVTSI2SS, F2=CVTSI2SD")
+    t[0x2C] = Desc("CVTTPS2PI", ("R32", "RM32"),
+                   note="66=CVTTPD2PI, F3=CVTTSS2SI, F2=CVTTSD2SI")
+    t[0x2E] = Desc("UCOMISS", ("R32", "RM32"), note="66=UCOMISD")
+    t[0x2F] = Desc("COMISS", ("R32", "RM32"), note="66=COMISD")
+    t[0x50] = Desc("MOVMSKPS", ("R32", "RM32"),
+                   note="66=MOVMSKPD; rm must be a register (mod=3)")
+    t[0x54] = Desc("ANDPS", ("R32", "RM32"), note="66=ANDPD")
+    t[0x55] = Desc("ANDNPS", ("R32", "RM32"), note="66=ANDNPD")
+    t[0x56] = Desc("ORPS", ("R32", "RM32"), note="66=ORPD")
+    t[0x57] = Desc("XORPS", ("R32", "RM32"), note="66=XORPD")
+    t[0x58] = Desc("ADDPS", ("R32", "RM32"),
+                   note="F3=ADDSS, 66=ADDPD, F2=ADDSD")
+    t[0x59] = Desc("MULPS", ("R32", "RM32"),
+                   note="F3=MULSS, 66=MULPD, F2=MULSD")
+    t[0x5A] = Desc("CVTPS2PD", ("R32", "RM32"),
+                   note="66=CVTPD2PS, F3=CVTSS2SD, F2=CVTSD2SS")
+    t[0x5B] = Desc("CVTDQ2PS", ("R32", "RM32"),
+                   note="66=CVTPS2DQ, F3=CVTTPS2DQ")
+    t[0x5C] = Desc("SUBPS", ("R32", "RM32"),
+                   note="F3=SUBSS, 66=SUBPD, F2=SUBSD")
+    t[0x5E] = Desc("DIVPS", ("R32", "RM32"),
+                   note="F3=DIVSS, 66=DIVPD, F2=DIVSD")
+    t[0x60] = Desc("PUNPCKLBW", ("R32", "RM32"),
+                   note="66 = xmm form, plain = MMX")
+    t[0x61] = Desc("PUNPCKLWD", ("R32", "RM32"),
+                   note="66 = xmm form, plain = MMX")
+    t[0x62] = Desc("PUNPCKLDQ", ("R32", "RM32"),
+                   note="66 = xmm form, plain = MMX")
+    t[0x68] = Desc("PUNPCKHBW", ("R32", "RM32"),
+                   note="66 = xmm form, plain = MMX")
+    t[0x69] = Desc("PUNPCKHWD", ("R32", "RM32"),
+                   note="66 = xmm form, plain = MMX")
+    t[0x6A] = Desc("PUNPCKHDQ", ("R32", "RM32"),
+                   note="66 = xmm form, plain = MMX")
+    t[0x6C] = Desc("PUNPCKLQDQ", ("R32", "RM32"), note="66 only (SSE2)")
+    t[0x6D] = Desc("PUNPCKHQDQ", ("R32", "RM32"), note="66 only (SSE2)")
+    t[0x6E] = Desc("MOVQ_xmm", ("R32", "RM32"),
+                   note="MOVD/MOVQ mm|xmm <- r/m32; 66 = xmm dest, plain = MMX")
+    t[0x70] = Desc("PSHUFW", ("R32", "RM32", "I8"),
+                   note="66=PSHUFD, F2=PSHUFLW, F3=PSHUFHW; plain = MMX")
+    t[0x7E] = Desc("MOVQ_xmm", ("RM32", "R32"),
+                   note="r/m32 <- MOVD/MOVQ mm|xmm (66); F3 = MOVQ xmm,xmm/m64")
+    t[0xC2] = Desc("CMPPS", ("R32", "RM32", "I8"),
+                   note="F3=CMPSS, 66=CMPPD, F2=CMPSD; imm8 predicate")
+    t[0xD4] = Desc("PADDQ", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xD5] = Desc("PMULLW", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xDB] = Desc("PAND", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xDF] = Desc("PANDN", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xEB] = Desc("POR", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xEF] = Desc("PXOR", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xF4] = Desc("PMULUDQ", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xFA] = Desc("PSUBD", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xFB] = Desc("PSUBQ", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+    t[0xFE] = Desc("PADDD", ("R32", "RM32"), note="66 = xmm, plain = MMX")
+
+    # Phase 5 L5c + SSE lanes: EMMS (x87 tag reset, rides the x87
+    # handler set) and the 0F AE group /0-/3 (FXSAVE/FXRSTOR m512 from
+    # L5c; LDMXCSR/STMXCSR m32 at /2,/3 from the SSE shared spec).
+    # /4-/7 (XSAVE family) stay INVALID.
+    t[0x77] = Desc("EMMS", modrm=0, note="x87 tag word reset (MMX done)")
+    t[0xAE] = group_desc("0F AE group: FXSAVE /0, FXRSTOR /1, "
+                         "LDMXCSR /2, STMXCSR /3 (see i686_group_tab)")
     return t
 
 
@@ -469,6 +613,66 @@ def build_groups():
                    + ["BT_EvIb", "BTS_EvIb", "BTR_EvIb", "BTC_EvIb"],
                    [("NONE",)] * 4 + [bt] * 4, 0xE0,
                    "0F BA: /0-/3 reserved; BT (/4) never locks"))
+
+    # ------------------------------------------------------------------
+    # Phase 5 L5c: x87 escape-byte groups.  reg field picks the id; the
+    # mod bit selects memory vs ST(i) forms inside the handler (true FP
+    # widths live in the id suffix; RM32/RM16 are the closest frozen
+    # operand kinds).  Operand kinds are documentation only for x87 rows:
+    # the decoder always decodes the modrm byte for group rows and the
+    # handlers access guest memory at explicit widths.
+    # ------------------------------------------------------------------
+    rm32 = ("RM32",)
+    rm16 = ("RM16",)
+    non = ("NONE",)
+    n8 = [non] * 8
+    g.append(Group(0, 0xD8,
+                   ["FADD_m32", "FMUL_m32", "FCOM_m32", "FCOMP_m32",
+                    "FSUB_m32", "FSUBR_m32", "FDIV_m32", "FDIVR_m32"],
+                   [rm32] * 8, 0, "x87 D8: ST(0) op= m32fp32 or ST(i)"))
+    g.append(Group(0, 0xD9,
+                   ["FLD_m32", "FXCH", "FST_m32", "FSTP_m32",
+                    "FLDENV", "FLDCW", "FNSTENV", "FNSTCW"],
+                   [rm32, non, rm32, rm32, rm32, rm16, rm32, rm16], 0,
+                   "x87 D9: loads/stores, env, fixed forms via mod=3 rm"))
+    g.append(Group(0, 0xDA,
+                   ["INVALID"] * 5 + ["FUCOMPP"] + ["INVALID"] * 2,
+                   n8, 0,
+                   "x87 DA: only DA E9 FUCOMPP; FIADD-class m32 declined"))
+    g.append(Group(0, 0xDB,
+                   ["FILD_m32", "INVALID", "FIST_m32", "FISTP_m32",
+                    "FNINIT", "FLD_m80", "FCOMI", "FSTP_m80"],
+                   [rm32, non, rm32, rm32, non, rm32, non, rm32], 0,
+                   "x87 DB: FISTTP /1 declined; FNCLEX/FNINIT via /4 mod=3; "
+                   "FUCOMI rides FLD_m80 mod=3"))
+    g.append(Group(0, 0xDC,
+                   ["FADD_m64", "FMUL_m64", "FCOM_m64", "FCOMP_m64",
+                    "FSUB_m64", "FSUBR_m64", "FDIV_m64", "FDIVR_m64"],
+                   [rm32] * 8, 0,
+                   "x87 DC: ST(0) op= m64fp64 or ST(i),ST(0) reversed"))
+    g.append(Group(0, 0xDD,
+                   ["FLD_m64", "INVALID", "FST_m64", "FSTP_m64",
+                    "FUCOM", "FUCOMP", "INVALID", "FNSTSW_m16"],
+                   [rm32, non, rm32, rm32, non, non, non, rm16], 0,
+                   "x87 DD: FFREE rides FLD_m64 mod=3; FUCOM* mod=3 only"))
+    g.append(Group(0, 0xDE,
+                   ["FADDP", "FMULP", "INVALID", "INVALID",
+                    "FSUBRP", "FSUBP", "FDIVRP", "FDIVP"],
+                   [non, non, non, non, non, non, non, non], 0,
+                   "x87 DE: ST(i),ST(0) then pop; memory FIADD-class declined"))
+    g.append(Group(0, 0xDF,
+                   ["FILD_m16", "INVALID", "FIST_m16", "FISTP_m16",
+                    "FNSTSW_AX", "FILD_m64", "FCOMIP", "FISTP_m64"],
+                   [rm16, non, rm16, rm16, non, rm32, non, rm32], 0,
+                   "x87 DF: FISTTP /1 declined, FBLD/FBSTP declined; "
+                   "FUCOMIP rides FILD_m64 mod=3"))
+    g.append(Group(1, 0xAE,
+                   ["FXSAVE", "FXRSTOR", "LDMXCSR", "STMXCSR"]
+                   + ["INVALID"] * 4,
+                   [rm32, rm32, rm32, rm32] + [non] * 4, 0,
+                   "0F AE: FXSAVE /0 and FXRSTOR /1 m512; LDMXCSR /2 and "
+                   "STMXCSR /3 m32 (Phase 5 shared spec); XSAVE-family "
+                   "/4-/7 declined"))
     return g
 
 
@@ -565,10 +769,32 @@ HEADER_NOTES = """\
  *  - I686_OP_LEA_GvM is not named in the phase-1 identifier list, but 8D
  *    is required for flat-mode code; added for coordinator ratification.
  *  - Left INVALID per the contract (decode -> I686_EXIT_UNDEF, D2):
- *    x87 (D8-DF, 0F 0x/1x/2x/5x-7x/Ex), SSE, BCD (27 2F 37 3F D4-D6),
- *    I/O (E4-E7 EC-EF 6C-6F), far transfers (9A EA CA CB), LES/LDS
- *    (C4 C5), BOUND/ARPL (62 63), PUSH/POP CS/SS (0E 16 17), and
+ *    x87's declined forms (FBLD/FBSTP BCD, FISTTP, the FIADD-class m16/
+ *    m32 integer arithmetic and FICOM, and the DA/DE C8-FF undefined
+ *    second bytes -- decoded-but-declined modrm forms return UNDEF from
+ *    their handlers instead), SSE3+ and the SSE/SSE2 leftovers not in
+ *    the Phase 5 spec rows (MIN/MAX 5D/5F, MOVDQA/MOVDQU 6F/7F, 0F 2D,
+ *    SHUFPS 0F C6, ...), BCD (27 2F 37 3F D4-D6),
+ *    I/O (E4-E7 EC-EF 6C-6F), far transfers (9A EA CA CB),
+ *    LES/LDS (C4 C5), BOUND/ARPL (62 63), PUSH/POP CS/SS (0E 16 17), and
  *    69/6B (IMUL Gv,Ev,Iz/Ib has no v1 contract id).
+ *  - Phase 5 (docs/lanes/phase-5.md shared spec): SSE2 integer + SSE
+ *    scalar FP families ride ONE id per 0F opcode byte -- the mandatory
+ *    prefixes (66 in pfx_opsize, F2/F3 in pfx_rep) select the family
+ *    member inside the handler, e.g. I686_OP_ADDPS also covers
+ *    ADDSS/ADDPD/ADDSD, I686_OP_MOVQ_xmm covers MOVD/MOVQ loads and
+ *    stores, and 0F AE /2,/3 resolve through the group table to
+ *    LDMXCSR/STMXCSR.  Hardware map correction: MULPS is 0F 59 (the
+ *    lane card's "SUB/MUL/DIV (5C/5D/5E)" miscounted; 5D/5F are the
+ *    MIN/MAX families, not in v1).
+ *  - Phase 5 L5c x87 resolution: D8-DF are GROUP rows resolved by the
+ *    modrm reg field (one id per /digit); the mod bit selects memory vs
+ *    ST(i) register forms inside src/interp/h_x87.c, and the mod=3
+ *    fixed second-byte forms (D9 C0-FF families, DB E2/E3/E8+i/F0+i,
+ *    DF E0/E8+i/F0+i, DD C0+i) sub-dispatch on modrm_rm in the owning
+ *    slot's handler.  Operand kinds on x87 rows are documentation only:
+ *    RM32/RM16 stand for m32fp/m64fp/m80/m16/m512 (no 64/80-bit frozen
+ *    kinds exist) and NONE marks implicit-stack forms.
 """
 
 
@@ -576,11 +802,15 @@ def generate():
     kinds = load_opnd_kinds()
     sections = contract_ids()
     ids = [i for _, sec in sections for i in sec]
-    if len(ids) != len(set(ids)):
-        dup = sorted({i for i in ids if ids.count(i) > 1})
-        raise SystemExit("duplicate contract ids: %r" % dup)
-    if len(ids) != 249:
-        raise SystemExit("expected 249 contract ids (+S1 IMUL +S4 RDTSC), got %d" % len(ids))
+    # EMMS is listed in both the SSE/MMX and x87 sections (one id, two
+    # contract lists -- same convention as CALL_Ev/JMP_Ev/PUSH_Ev).
+    dups = sorted({i for i in ids if ids.count(i) > 1} - {"EMMS"})
+    if dups:
+        raise SystemExit("duplicate contract ids: %r" % dups)
+    ids = sorted(set(ids))
+    if len(ids) != 345:
+        raise SystemExit("expected 345 contract ids (+S1 IMUL +S4 RDTSC "
+                         "+S5 x87 54 +S5 SSE 42), got %d" % len(ids))
 
     oneb = build_oneb()
     twob = build_twob()
@@ -611,8 +841,8 @@ def generate():
         raise SystemExit("unexpected enum-only ids: %r" % sorted(unused))
     for byte in PREFIX_BYTES:
         oneb.setdefault(byte, invalid("prefix (handled by the decoder)"))
-    for byte in range(0xD8, 0xE0):
-        oneb.setdefault(byte, invalid("x87: excluded in v1"))
+    # 0xD8-0xDF are explicit x87 group rows now (Phase 5 L5c); the old
+    # "x87: excluded in v1" defaults are gone.
 
     out = []
     out.append("/*")
@@ -648,11 +878,14 @@ def generate():
     out.append("/* Opcode ids (i686_op_t); value 0 is reserved for unassigned bytes. */")
     out.append("typedef enum {")
     out.append("    I686_OP_INVALID = 0,")
+    seen = {"INVALID"}
     for title, sec in sections:
         out.append("")
         out.append("    /* %s */" % title)
-        for i in range(0, len(sec), 4):
-            out.append("    " + ", ".join("I686_OP_" + x for x in sec[i:i + 4]) + ",")
+        fresh = [x for x in sec if x not in seen]
+        seen.update(fresh)
+        for i in range(0, len(fresh), 4):
+            out.append("    " + ", ".join("I686_OP_" + x for x in fresh[i:i + 4]) + ",")
     out.append("} i686_op_t;")
     out.append("")
     out.append("#define I686_OP_COUNT %du /* including I686_OP_INVALID */" % (len(ids) + 1))
