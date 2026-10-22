@@ -73,6 +73,106 @@ tools/setup-wine32.sh fetching Debian i386 wine (non-wow64) per the
 setup_sysroot.py pattern; triage list for RC7b. Owned: the script +
 docs/lanes/phase-7.md L7b record only.
 
+## L7a record
+
+Implemented seg.h completely (files owned): `src/interp/seg.c`
+(segstate alloc + flat defaults, selector lookup null/GDT-flat/TLS/LDT,
+validated segment loads with SDM DPL/RPL/type checks, cs_d maintenance,
+`i686_seg_flat_cs`, LDT data-limit enforcement along the decode EA path,
+`i686_seg_sc_encode/sc_decode`), `src/interp/h_seg.c` (MOV sreg 8E,
+pops 07/17/1F/0F A1/0F A9 via i686_seg_load, les/lds/lss/lfs/lgs, far
+call/jmp 9A/EA, lret CB incl. 0x66 cross-size, non-v86 iret CF, int NN
+resolvable fault in non-flat code, privileged cli/sti/hlt + synthetic
+IN/OUT/MOV CR,DR faults in 16-bit code), `src/os/ldt.c` (modify_ldt
+funcs 0/1/0x11/2, set/get_thread_area 243/244 with entry_number -1
+auto-alloc, seg_not_present frees, v1-compat GS auto-load), fixture
+`tests/test_p7_ldt.c`. Bounded edits: `src/x86/decode.c` (CS-relative
+instruction fetch, cs_d-driven defaults normalized into
+pfx_opsize/pfx_addrsize so every frozen handler keeps its
+`pfx ? 16 : 32` convention, 16-bit EA wrap mod 64K before the segment
+base, LDT limit check in x86_rm_read/x86_rm_write, far-op operand
+decode m16:16/m16:32 into synthetic registry ids 350–359 handled by
+h_seg.c, lazy idempotent `i686_interp_seg_init()` call), `src/dbt/
+engine.c` (per-dispatch guard `i686_seg_flat_cs(ctx) && !ctx->v86`).
+Makefile needed no edit (SRCS wildcards pick the new TUs up).
+
+**Syscall registration snippet for the coordinator (S7)** — in
+`i686_syscalls_init_once` (src/os/syscalls.c), after the existing
+registrations, add:
+
+```c
+    {
+        extern void i686_syscalls_ldt_init(void);
+        i686_syscalls_ldt_init();   /* 123 modify_ldt, 243/244 set/get_thread_area */
+    }
+```
+
+(already callable: ldt.c defines it idempotently; until wired it is
+invoked lazily from the Phase-7 interp registration. Note the v1
+syscalls.c init re-registers 243 at the first syscall, so it wins for
+set_thread_area until this moves here; 123/244 are served by ldt.c
+either way.)
+
+Also at S7 (already implemented, awaiting wiring, coordinator-owned
+files):
+- `src/os/signals_i386.c`: call `i686_seg_sc_encode(ctx, sc.gs..ss)`
+  when building sigcontexts and `i686_seg_sc_decode(ctx, in)` from
+  `i686_sigreturn`; and preserve the lane's trapno in `i686_deliver_sync`
+  (limit/segment/int-NN faults raise `ctx->exit_arg` = 13/11/12 with the
+  error code stashed in `ctx->exit_dest`; the current delivery overwrites
+  exit_arg to 14 — until wired, guest trapno reads 14 for all SIGSEGVs).
+- `src/interp/interp.c` (optional symmetry): move the
+  `i686_interp_seg_init()` call from decode.c into `i686_interp_init_all()`.
+
+Deviations / notes (all within card bounds):
+- Fault delivery uses the existing sync channel: handlers return
+  I686_EXIT_FAULT with exit_arg = trapno; the guest IP stays at the
+  faulting instruction (resumable). Limit faults additionally raise a
+  deterministic host SIGSEGV by touching the offending guest address
+  first (exact cr2 when the page is PROT_NONE — the fixture's overrun
+  at 0xF0001000), falling back to the always-unmapped guest VA 0.
+- The fixture cannot exercise the privileged-instruction fault from
+  inside 16-bit code end-to-end yet: signal delivery enters the handler
+  with the interrupted CS (16-bit) and sigreturn does not restore
+  segments until the sc_encode/sc_decode wiring above; the h_seg
+  handlers and the decode path are in place and covered by the record.
+- Limit enforcement covers the modrm/moffs EA path for LDT (TI=1)
+  selectors only; flat/GDT selectors are never limit-checked (v1
+  compatibility, D8 DBT-eligibility unchanged). 16-bit addressing now
+  wraps the offset mod 64K before the segment base is added (SDM
+  correct; flat 67-prefix behaviour change noted).
+- No vm86 paths touched (ctx->v86 guard only).
+- FROZEN-HEADER HAZARD for the coordinator (no change required this
+  phase, worked around lane-side): seg.h re-spells the FAULT codes
+  I686_SEG_OK/GP/NP/SS over i686rt.h's segment-register index macros —
+  I686_SEG_SS is 3 (fault) vs 2U (SS register index). Files including
+  both pre-clear the macro (#undef before including seg.h so the frozen
+  #define is fresh) and use collision-free SEG_F_* locals; seg.h should
+  rename its fault codes (e.g. I686_SEGF_*) at the next sanctioned
+  header touch.
+- execve leaves ctx->cs_d stale if the execing context ran with D=0
+  (the kernel drops the LDT on exec; the coordinator may reset
+  ctx->ldt/cs_d in r_execve at S7).
+
+Acceptance check (single run, 2026-10-22):
+
+    tools/build_fixture.sh tests/test_p7_ldt.c _build/test_p7_ldt
+      -> build_fixture.sh: _build/test_p7_ldt: ELF 32-bit LSB executable,
+         Intel 80386, version 1 (SYSV), statically linked, not stripped
+    nix shell nixpkgs#pkgsCross.aarch64-multiplatform-musl.buildPackages.gcc \
+      -c make build CC=aarch64-unknown-linux-musl-gcc        (zero warnings)
+    docker run --name l7a-check --rm --platform linux/arm64 \
+      -v "$PWD/_build/p7stage":/w alpine:3.20 sh -c 'timeout 60 /w/i686rt -- /w/test_p7_ldt'
+
+Output, verbatim (last line exactly PASS; exit 0; container gone —
+`docker ps -a --filter name=l7a-check` empty after the run):
+
+    PASS
+
+(The fixture also passes under I686RT_ENGINE=dbt in pre-flight: the
+engine guard keeps DBT to flat blocks and single-steps the far ops
+through the interpreter, D8.)
+
 ## S7/RC7 (coordinator)
 
 Merge L7a (--no-ff), wire syscall registration + sigframe sc_encode/

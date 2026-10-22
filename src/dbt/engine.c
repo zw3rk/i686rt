@@ -95,6 +95,15 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
 int i686_dbt_run(i686_ctx_t *ctx)
 {
     for (;;) {
+        {   /* D8 guard (phase-7.md freeze): non-flat CS (any LDT selector
+             * or D=0 code) or active v86 runs interpreter-only, checked
+             * per block dispatch.  A far transfer single-stepped through
+             * the UNDEF path can flip CS at any block boundary. */
+            extern bool i686_seg_flat_cs(const i686_ctx_t *ctx);
+            if (!i686_seg_flat_cs(ctx) || ctx->v86 != 0U) {
+                return i686_interp_run(ctx);
+            }
+        }
         dbt_entry_t *e = dbt_get_or_compile(ctx, ctx->eip);
         int r;
 
