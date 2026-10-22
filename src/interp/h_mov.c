@@ -17,6 +17,7 @@
  */
 
 #include <stdint.h>
+#include <time.h>
 
 #include "interp/interp.h"
 
@@ -538,6 +539,20 @@ static int h_pop_sreg(i686_ctx_t *ctx, const x86_insn_t *insn)
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
 
+/* RDTSC (0F 31): EDX:EAX = monotonic ns (host clock; deterministic per
+ * process is not required — CPUID advertises TSC). */
+static int h_rdtsc(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    struct timespec ts;
+    uint64_t ns;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    ctx->gpr[I686_REG_EAX] = (uint32_t)ns;
+    ctx->gpr[I686_REG_EDX] = (uint32_t)(ns >> 32);
+    ctx->eip += insn->len;
+    return I686_INTERP_CONTINUE;
+}
+
 void i686_interp_mov_init(void)
 {
     i686_interp_register(I686_OP_MOV_EbGb, h_mov_ebgb);
@@ -562,6 +577,7 @@ void i686_interp_mov_init(void)
     i686_interp_register(I686_OP_MOVSX_GvEw, h_movsx_gvew);
     i686_interp_register(I686_OP_BSWAP_Gv, h_bswap_gv);
     i686_interp_register(I686_OP_CPUID, h_cpuid);
+    i686_interp_register(I686_OP_RDTSC, h_rdtsc);
     i686_interp_register(I686_OP_XLAT, h_xlat);
 
     i686_interp_register(I686_OP_PUSH_Gv, h_push_gv);

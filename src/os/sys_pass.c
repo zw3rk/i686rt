@@ -100,6 +100,7 @@ long syscall(long, ...);
  * src/os/syscalls_i386.h (quoted as [nr] {"name"}). */
 #define NR_unlink        10U /* [10]  {"unlink"}       */
 #define NR_open           5U /* [5]   {"open"}         */
+#define NR_openat   295U /* [295] {"openat"} */
 #define NR_writev         146U /* [146] {"writev"}       */
 #define NR_close          6U /* [6]   {"close"}        */
 #define NR_lseek         19U /* [19]  {"lseek"}        */
@@ -518,6 +519,29 @@ static char s_comm[16];
 /* Handlers                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Guest absolute path -> host fd, sysroot-aware (a32rt resolve model):
+ * with a sysroot set, try sysroot+path first, then the plain path. */
+static long open_guest(const i686_ctx_t *ctx, const char *path, int flags,
+                       mode_t mode)
+{
+    char buf[PATH_BUF];
+    if (path[0] == '/' && ctx->sysroot != NULL &&
+        ctx->sysroot[0] != '\0') {
+        size_t n = strlen(ctx->sysroot);
+        if (n + strlen(path) < sizeof buf) {
+            memcpy(buf, ctx->sysroot, n);
+            strcpy(buf + n, path);
+            {
+                int fd = open(buf, flags, mode);
+                if (fd >= 0) {
+                    return fd;
+                }
+            }
+        }
+    }
+    return open(path, flags, mode);
+}
+
 static long sys_open(i686_ctx_t *ctx, uint32_t path_va, uint32_t flags, uint32_t mode)
 {
     char path[PATH_BUF];
@@ -533,7 +557,7 @@ static long sys_open(i686_ctx_t *ctx, uint32_t path_va, uint32_t flags, uint32_t
     if (pfd != I686_PROC_NOT_MATCHED) {
         return pfd;
     }
-    return host_ret_(open(path, (int)hf, (mode_t)mode));
+    return host_ret_(open_guest(ctx, path, (int)hf, (mode_t)mode));
 }
 
 static long sys_unlink(i686_ctx_t *ctx, uint32_t path_va)
@@ -1062,6 +1086,31 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
 /* ------------------------------------------------------------------ */
 
 
+/* openat(295): v1 supports AT_FDCWD (glibc/ld.so path); absolute
+ * paths ignore dirfd per kernel semantics. */
+static int64_t r_openat(i686_ctx_t *ctx)
+{
+    int32_t dirfd = (int32_t)ctx->gpr[I686_REG_EBX];
+    char path[PATH_BUF];
+    long hf = i686_open_flags_to_host(ctx->gpr[I686_REG_EDX]);
+    long pfd;
+    if (hf < 0) {
+        return hf;
+    }
+    if (i686_fetch_cstr(ctx, ctx->gpr[I686_REG_ECX], path, sizeof path) != 0) {
+        return -EFAULT;
+    }
+    if (path[0] == '/' || dirfd == -100 /* AT_FDCWD */) {
+        pfd = i686_proc_open_at(ctx, path);
+        if (pfd != I686_PROC_NOT_MATCHED) {
+            return pfd;
+        }
+        return host_ret_(open_guest(ctx, path, (int)hf,
+                                    (mode_t)ctx->gpr[I686_REG_ESI]));
+    }
+    return -EINVAL; /* relative-to-fd opens: Phase H */
+}
+
 /* writev(146) — iovec array in guest memory (L2f passthrough family,
  * S2 coordinator addition: busybox sh error paths print via writev). */
 struct i686_iov_local {
@@ -1441,6 +1490,7 @@ void i686_syscalls_pass_init(void)
      *   execve(11)/execveat(358) — coordinator in-process exec at S2.
      * getpid(20) stays in src/os/syscalls.c (Phase 1 adapter). */
     i686_sys_register(NR_open, r_open);
+    i686_sys_register(NR_openat, r_openat);
     i686_sys_register(NR_writev, r_writev);
     i686_sys_register(NR_close, r_close);
     i686_sys_register(NR_lseek, r_lseek);

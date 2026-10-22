@@ -202,7 +202,7 @@ static int run_guest(i686_ctx_t *ctx)
 
     /* Flat i386 Linux initial state. */
     ctx->gpr[I686_REG_ESP] = sp;
-    ctx->eip = info.entry;
+    ctx->eip = ctx->elf_entry; /* interp entry when PT_INTERP, else exe */
     ctx->eflags = 0x202U; /* IF set; bit 1 reserved, always 1 */
     ctx->seg_sel[I686_SEG_CS] = 0x23U;
     ctx->seg_sel[I686_SEG_DS] = 0x2bU;

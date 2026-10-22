@@ -9,9 +9,9 @@
  * CASE_EIP, runs them through i686_dbt_translate + i686_jit_run_block
  * (an HLT sentinel ends the stream), and checks:
  *
- *  1. the LOCK instruction was EMITTED natively: the first block exit
- *     is UNDEF with arg == 1 (only the 1-byte HLT declined) — a
- *     declined LOCK would report its own length;
+ *  1. the LOCK instruction was EMITTED natively: the block exit is
+ *     HLT with arg == 0 and dest one byte past the HLT. A declined
+ *     LOCK would end the block as UNDEF with the LOCK's own length;
  *  2. the memory effect, the register effect, and EFLAGS match a host
  *     __atomic/__sync oracle executed over a shadow copy of the data
  *     (fetch_add / fetch_sub / fetch_and / fetch_or / fetch_xor /

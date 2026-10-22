@@ -138,8 +138,8 @@ typedef enum {
     I686_OP_BT_EvGv, I686_OP_BTS_EvGv, I686_OP_BTR_EvGv, I686_OP_BTC_EvGv,
     I686_OP_BSF_GvEv, I686_OP_BSR_GvEv, I686_OP_BT_EvIb, I686_OP_BTS_EvIb,
     I686_OP_BTR_EvIb, I686_OP_BTC_EvIb, I686_OP_SHLD_EvIb, I686_OP_SHLD_EvCL,
-    I686_OP_SHRD_EvIb, I686_OP_SHRD_EvCL, I686_OP_IMUL_GvEv, I686_OP_IMUL_GvEvIz,
-    I686_OP_IMUL_GvEvIb,
+    I686_OP_SHRD_EvIb, I686_OP_SHRD_EvCL, I686_OP_IMUL_GvEv, I686_OP_RDTSC,
+    I686_OP_IMUL_GvEvIz, I686_OP_IMUL_GvEvIb,
 
     /* strings (REP via pfx_rep) */
     I686_OP_MOVSb, I686_OP_MOVSw, I686_OP_CMPSb, I686_OP_CMPSw,
@@ -150,7 +150,7 @@ typedef enum {
     I686_OP_INT_Ib, I686_OP_INT3, I686_OP_INTO, I686_OP_IRET,
 } i686_op_t;
 
-#define I686_OP_COUNT 249u /* including I686_OP_INVALID */
+#define I686_OP_COUNT 250u /* including I686_OP_INVALID */
 
 /* Per-opcode descriptor (frozen in docs/lanes/phase-1.md). */
 typedef struct {
@@ -470,7 +470,7 @@ static const i686_insn_desc_t i686_insn_tab_0f[256] = {
     /* 0x2E */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* unassigned */
     /* 0x2F */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* unassigned */
     /* 0x30 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* WRMSR: excluded */
-    /* 0x31 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* RDTSC: excluded */
+    /* 0x31 */ { I686_OP_RDTSC, { 0u, 0u, 0u }, 0u, 0u, 0u },
     /* 0x32 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* RDMSR: excluded */
     /* 0x33 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* unassigned */
     /* 0x34 */ { I686_OP_SYSENTER, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* syscall exit per D12 */

@@ -118,7 +118,7 @@ def contract_ids():
     sections.append(("bit ops (0F)", [
         "BT_EvGv", "BTS_EvGv", "BTR_EvGv", "BTC_EvGv", "BSF_GvEv", "BSR_GvEv",
         "BT_EvIb", "BTS_EvIb", "BTR_EvIb", "BTC_EvIb", "SHLD_EvIb", "SHLD_EvCL",
-        "SHRD_EvIb", "SHRD_EvCL", "IMUL_GvEv",
+        "SHRD_EvIb", "SHRD_EvCL", "IMUL_GvEv", "RDTSC",
         # Contract amendment (S1, ratified): three-operand IMUL (gcc-required)
         "IMUL_GvEvIz", "IMUL_GvEvIb",
     ]))
@@ -354,6 +354,7 @@ def build_twob():
     t = {}
     t[0x0B] = Desc("UD2", modrm=0)
     t[0x34] = Desc("SYSENTER", modrm=0, note="syscall exit per D12")
+    t[0x31] = Desc("RDTSC", modrm=0)
     for r in range(16):
         t[0x40 + r] = Desc("CMOVcc_Gv", ("R32", "RM32"),
                            note="cond=opcode&0xF carried in modrm_reg")
@@ -578,8 +579,8 @@ def generate():
     if len(ids) != len(set(ids)):
         dup = sorted({i for i in ids if ids.count(i) > 1})
         raise SystemExit("duplicate contract ids: %r" % dup)
-    if len(ids) != 248:
-        raise SystemExit("expected 248 contract ids (246 + S1 IMUL amendment), got %d" % len(ids))
+    if len(ids) != 249:
+        raise SystemExit("expected 249 contract ids (+S1 IMUL +S4 RDTSC), got %d" % len(ids))
 
     oneb = build_oneb()
     twob = build_twob()

@@ -512,7 +512,9 @@ int main(void)
         t_run_case(&c);
     }
 
-    /* SETcc sample (E/GE/A) x both directions. */
+    /* SETcc sample (E/GE/A). E and A use a taken mask and a not-taken
+     * mask. GE's f mask is SF|OF; GE is SF==OF, so that mask is taken
+     * too. The Jcc matrix above is what checks GE not-taken (SF only). */
     {
         static const uint8_t setcc_conds[] = {4U, 13U, 7U};
         static const uint32_t setcc_t[] = {I686_EF_ZF,

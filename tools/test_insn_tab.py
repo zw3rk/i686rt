@@ -83,7 +83,7 @@ EXPECTED_IDS += [
 EXPECTED_IDS += [
     "BT_EvGv", "BTS_EvGv", "BTR_EvGv", "BTC_EvGv", "BSF_GvEv", "BSR_GvEv",
     "BT_EvIb", "BTS_EvIb", "BTR_EvIb", "BTC_EvIb", "SHLD_EvIb", "SHLD_EvCL",
-    "SHRD_EvIb", "SHRD_EvCL", "IMUL_GvEv",
+    "SHRD_EvIb", "SHRD_EvCL", "IMUL_GvEv", "RDTSC",
     # S1 ratified amendment: three-operand IMUL
     "IMUL_GvEvIz", "IMUL_GvEvIb",
 ]
@@ -159,6 +159,7 @@ S_1B = [
 S_0F = [
     (0x0B, "UD2", ("NONE",), 0, 0, 0),              # card spot
     (0x10, "INVALID", None, 0, 0, 0),
+    (0x31, "RDTSC", ("NONE", "NONE", "NONE", "NONE", "NONE", "NONE"), 0, 0, 0),
     (0x34, "SYSENTER", ("NONE",), 0, 0, 0),         # card spot
     (0x40, "CMOVcc_Gv", ("R32", "RM32"), 1, 0, 0),
     (0x4F, "CMOVcc_Gv", ("R32", "RM32"), 1, 0, 0),
