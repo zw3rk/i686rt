@@ -35,7 +35,9 @@ int main(void)
      * re-execute the faulting division on real Linux as well) */
     if (sigsetjmp(g_jmp, 1) == 0) {
         volatile int z = 0;
-        int r = 1 / z; /* i686 idiv faults */
+        int r = 1;
+        /* raw idiv: compilers may elide a trap-free C division */
+        __asm__ volatile("idivl %1" : "+a"(r) : "m"(z));
         if (r == 42) { rc = 3; goto out; }
         rc = 4; goto out; /* should have longjmp'd */
     }
