@@ -448,6 +448,111 @@ static void guest_regions_teardown(i686_ctx_t *ctx)
     rt32_vm_reset_for_exec(ctx);
 }
 
+/* sysroot-aware execve open (RC7b): guest absolute paths resolve under
+ * --sysroot first, then the plain path — same model as open_guest in
+ * sys_pass.c.  The SCRIPT/ELF fd is read here; argv keeps the guest's
+ * original path strings (the interpreter re-opens the script through
+ * the normal sysroot-aware sys_open path). */
+int i686_exec_open(const i686_ctx_t *ctx, const char *path)
+{
+    char buf[4096];
+
+    if (path[0] == '/' && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
+        size_t n = strlen(ctx->sysroot);
+        if (n + strlen(path) < sizeof buf) {
+            int fd;
+
+            memcpy(buf, ctx->sysroot, n);
+            strcpy(buf + n, path);
+            fd = open(buf, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                return fd;
+            }
+        }
+    }
+    return open(path, O_RDONLY | O_CLOEXEC);
+}
+
+/* binfmt_script reinterpretation (kernel semantics): `#! interp [arg]`
+ * re-execs the interpreter with argv = {interp, [arg], script_path,
+ * orig argv[1:]}, orig argv[0] dropped.  The optional argument is the
+ * rest of the line after the interpreter token (trimmed).  Rewrites
+ * *path_buf (interp) and returns the rebuilt argv (caller frees the
+ * old array + argv[0]); NULL on malformed lines (-ENOEXEC territory).
+ * script_path must be a heap copy: it is stored into the new argv. */
+char **i686_exec_script_reinterp(const i686_ctx_t *ctx, char *path_buf,
+                              size_t path_sz, char *script_path,
+                              char **argv)
+{
+    char line[128];
+    char interp[96];
+    char sarg[24];
+    char **na;
+    size_t i, j = 0U, k, argc;
+    int in = -1;
+    ssize_t got;
+
+    for (argc = 0U; argv[argc] != NULL; argc++) {
+    }
+
+    in = i686_exec_open(ctx, path_buf); /* peek at the first line only */
+    if (in < 0) {
+        return NULL;
+    }
+    got = read(in, line, sizeof line - 1U);
+    close(in);
+    if (got < 3 || line[0] != '#' || line[1] != '!') {
+        errno = ENOEXEC;
+        return NULL;
+    }
+    line[got] = '\0';
+    { /* token 1: interpreter path */
+        char *p = line + 2;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '\n') { errno = ENOEXEC; return NULL; }
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && j < sizeof interp - 1U)
+            interp[j++] = *p++;
+        interp[j] = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+        /* token 2 (optional): rest of line, trimmed */
+        k = 0U;
+        while (*p != '\0' && *p != '\n' && k < sizeof sarg - 1U)
+            sarg[k++] = *p++;
+        while (k > 0U && (sarg[k-1U] == ' ' || sarg[k-1U] == '\t')) k--;
+        sarg[k] = '\0';
+    }
+    if (snprintf(path_buf, path_sz, "%s", interp) >= (int)path_sz) {
+        errno = ENOEXEC;
+        return NULL;
+    }
+    na = malloc(sizeof(char *) * (argc + 3U));
+    if (na == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    j = 0U;
+    na[j] = malloc(strlen(interp) + 1U);
+    if (na[j] == NULL) goto oom;
+    memcpy(na[j++], interp, strlen(interp) + 1U);
+    if (sarg[0] != '\0') {
+        na[j] = malloc(strlen(sarg) + 1U);
+        if (na[j] == NULL) goto oom1;
+        memcpy(na[j++], sarg, strlen(sarg) + 1U);
+    }
+    na[j++] = script_path; /* takes ownership */
+    for (i = 1U; i < argc; i++) {
+        na[j++] = argv[i];
+    }
+    na[j] = NULL;
+    return na;
+oom1:
+    free(na[0]);
+oom:
+    free(na);
+    errno = ENOMEM;
+    return NULL;
+}
+
 static int64_t r_execve(i686_ctx_t *ctx)
 {
     char path[4096];
@@ -458,6 +563,7 @@ static int64_t r_execve(i686_ctx_t *ctx)
     rt32_elf_info_t info;
     uint32_t sp = 0U;
     int fd;
+    unsigned depth;
 
     if (i686_fetch_cstr(ctx, ctx->gpr[I686_REG_EBX], path, sizeof(path)) != 0) {
         return -EFAULT;
@@ -472,11 +578,57 @@ static int64_t r_execve(i686_ctx_t *ctx)
         return -E2BIG;
     }
 
-    fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    /* binfmt_script: reinterpret `#!` lines before the ELF gate; the
+     * kernel re-enters execve with the interpreter, so loop (bounded
+     * like the kernel's recursion cap of 5). */
+    for (depth = 0U; depth < 5U; depth++) {
+        char *script_copy;
+        char **na;
+
+        fd = i686_exec_open(ctx, path);
+        if (fd < 0) {
+            int e = errno;
+
+            free_strv(argv);
+            free_strv(envp);
+            return -e;
+        }
+        {
+            char magic[2];
+
+            if (read(fd, magic, 2) == 2 && magic[0] == '#' && magic[1] == '!') {
+                (void)close(fd);
+                script_copy = malloc(strlen(path) + 1U);
+                if (script_copy == NULL) {
+                    free_strv(argv);
+                    free_strv(envp);
+                    return -ENOMEM;
+                }
+                memcpy(script_copy, path, strlen(path) + 1U);
+                na = i686_exec_script_reinterp(ctx, path, sizeof path, script_copy,
+                                     argv);
+                if (na == NULL) {
+                    int e = errno;
+
+                    free(script_copy);
+                    free_strv(argv);
+                    free_strv(envp);
+                    return (e == ENOMEM || e == ENOEXEC) ? -e : -ENOEXEC;
+                }
+                free(argv[0]); /* script's own argv[0] is dropped */
+                free(argv);    /* array only; argv[1:] moved to na */
+                argv = na;
+                argc += (na[1] == script_copy) ? 2U : 1U;
+                continue;
+            }
+            (void)lseek(fd, 0, SEEK_SET);
+        }
+        break; /* ELF (or ENOEXEC below) */
+    }
+    if (depth == 5U) {
         free_strv(argv);
         free_strv(envp);
-        return -errno;
+        return -ELOOP;
     }
     guest_regions_teardown(ctx);
     if (rt32_elf_load(ctx, fd, path, &info) != 0) {

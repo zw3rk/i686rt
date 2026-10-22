@@ -34,6 +34,17 @@ int64_t i686_sys_dispatch(i686_ctx_t *ctx, long nr);
 /* One-shot init of every module (defined in syscalls.c). */
 void i686_syscalls_init_once(void);
 
+/* binfmt_script reinterpretation (syscalls.c): rewrites path_buf to the
+ * #! interpreter and returns a rebuilt argv {interp,[arg],script,argv[1:]};
+ * NULL + errno on a non-script or malformed line.  script_path ownership
+ * moves into the returned vector. */
+/* sysroot-aware O_RDONLY open for exec/launch paths (syscalls.c). */
+int i686_exec_open(const i686_ctx_t *ctx, const char *path);
+
+char **i686_exec_script_reinterp(const i686_ctx_t *ctx, char *path_buf,
+                                size_t path_sz, char *script_path,
+                                char **argv);
+
 /* Per-module registration (defined by the marshal lanes). */
 void i686_syscalls_stat_init(void);
 void i686_syscalls_sock_init(void);

@@ -47,12 +47,6 @@ static uint32_t dbt_hash(uint32_t eip)
     return (eip >> 2U) & (DBT_HT_SIZE - 1U);
 }
 
-static dbt_entry_t *dbt_lookup(uint32_t eip)
-{
-    dbt_entry_t *e = &s_ht[dbt_hash(eip)];
-    return (e->len != 0U && e->eip == eip) ? e : NULL;
-}
-
 static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
 {
     dbt_entry_t *e = &s_ht[dbt_hash(eip)];

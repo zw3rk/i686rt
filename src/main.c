@@ -184,11 +184,69 @@ static int run_guest(i686_ctx_t *ctx)
         return -1;
     }
 
-    fd = open(ctx->exec_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        (void)fprintf(stderr, "i686rt: open %s: %s\n", ctx->exec_path,
-                      strerror(errno));
-        return -1;
+    /* Launch-side binfmt_script (RC7b): the kernel would interpret a
+     * `#!` executable the same way guest execve does (r_execve), so
+     * reinterpret before the ELF gate — wine's usr/bin/wine wrapper is
+     * a shell script.  The interpreter resolves under --sysroot. */
+    {
+        char lpath[4096];
+        unsigned depth;
+
+        if (snprintf(lpath, sizeof lpath, "%s", ctx->exec_path) >=
+            (int)sizeof lpath) {
+            (void)fprintf(stderr, "i686rt: exec path too long\n");
+            return -1;
+        }
+        for (depth = 0U; depth < 5U; depth++) {
+            char magic[2];
+            char **na;
+            char *script_copy;
+
+            {
+                extern int i686_exec_open(const i686_ctx_t *ctx,
+                                          const char *path);
+                fd = i686_exec_open(ctx, lpath);
+            }
+            if (fd < 0) {
+                (void)fprintf(stderr, "i686rt: open %s: %s\n", lpath,
+                              strerror(errno));
+                return -1;
+            }
+            if (read(fd, magic, 2) == 2 && magic[0] == '#' && magic[1] == '!') {
+                (void)close(fd);
+                script_copy = malloc(strlen(lpath) + 1U);
+                if (script_copy == NULL) {
+                    return -1;
+                }
+                memcpy(script_copy, lpath, strlen(lpath) + 1U);
+                {
+                    extern char **i686_exec_script_reinterp(
+                        const i686_ctx_t *ctx, char *path_buf, size_t path_sz,
+                        char *script_path, char **argv);
+                    na = i686_exec_script_reinterp(ctx, lpath, sizeof lpath,
+                                                   script_copy,
+                                                   ctx->guest_argv);
+                }
+                if (na == NULL) {
+                    (void)fprintf(stderr, "i686rt: %s: not an ELF file\n",
+                                  ctx->exec_path);
+                    free(script_copy);
+                    return -1;
+                }
+                free(ctx->guest_argv[0]);
+                free(ctx->guest_argv);
+                ctx->guest_argv = na;
+                ctx->guest_argc += (na[1] == script_copy) ? 2 : 1;
+                ctx->exec_path = strdup(lpath); /* interpreter image */
+                continue;
+            }
+            (void)lseek(fd, 0, SEEK_SET);
+            break;
+        }
+        if (depth == 5U) {
+            (void)fprintf(stderr, "i686rt: script interpreter nesting too deep\n");
+            return -1;
+        }
     }
     if (rt32_elf_load(ctx, fd, ctx->exec_path, &info) != 0) {
         (void)fprintf(stderr, "i686rt: ELF load failed: %s\n", ctx->exec_path);

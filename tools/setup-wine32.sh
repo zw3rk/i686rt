@@ -75,6 +75,7 @@ set -eu
 MIRROR=https://deb.debian.org/debian
 WINE_POOL=pool/main/w/wine
 GLIBC_POOL=pool/main/g/glibc
+DASH_POOL=pool/main/d/dash
 
 self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$self_dir/.." && pwd)
@@ -218,6 +219,7 @@ write_stamp() {  # args: <pool-subdir>:<deb filename> ...
         usr/lib/i386-linux-gnu/wine/i386-windows/kernel32.dll \
         usr/lib/i386-linux-gnu/wine/i386-windows/cmd.exe \
         usr/share/wine/wine.inf \
+        usr/bin/dash \
         lib/ld-linux.so.2 \
         usr/lib/i386-linux-gnu/libc.so.6
     do
@@ -269,16 +271,26 @@ do_fetch() {
     if [ -n "$libc6i686_deb" ]; then
         info "glibc: newest $libc6i686_deb"
     else
-        info "libc6-i686: not shipped for this suite (skipping; modern \
+        info "libc6-i686: not shipped for this suite (skipped; modern \
 Debian i386 glibc is i686-optimized in libc6 itself)"
     fi
 
+    # dash provides /bin/sh: the wine wrapper scripts (usr/bin/wine ->
+    # wine-stable `#!/bin/sh`) are shell scripts, so the sysroot needs a
+    # real interpreter for the launch chain (RC7b).
+    d_listing=$(http_get "$MIRROR/$DASH_POOL/") \
+        || die "cannot list $MIRROR/$DASH_POOL/"
+    dash_deb=$(deb_candidates "$d_listing" dash i386 | newest_deb)
+    [ -n "$dash_deb" ] || die "no dash_*_i386.deb in $DASH_POOL"
+    info "dash: newest $dash_deb"
+
     # --- download everything before touching the tree --------------------
     w_entries=
-    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $w_pkgs; do
+    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $dash_deb $w_pkgs; do
         case $w_deb in
         libc6-*) w_pool=$GLIBC_POOL ;;
         libc6_*) w_pool=$GLIBC_POOL ;;
+        dash_*)  w_pool=$DASH_POOL ;;
         *)       w_pool=$WINE_POOL ;;
         esac
         fetch_deb "$MIRROR/$w_pool/$w_deb" "$w_deb"
@@ -288,16 +300,25 @@ Debian i386 glibc is i686-optimized in libc6 itself)"
     # --- fresh extraction, then fixups + stamp ---------------------------
     rm -rf "$sysroot"
     mkdir -p "$sysroot"
-    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $w_pkgs; do
+    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $dash_deb $w_pkgs; do
         info "extracting $w_deb"
         extract_deb "$cache_dir/$w_deb"
     done
 
-    # usrmerge compat: lib -> usr/lib like a real Debian system.
+    # usrmerge compat: lib -> usr/lib and bin -> usr/bin like a real
+    # Debian system.
     if [ ! -e "$sysroot/lib" ] && [ ! -L "$sysroot/lib" ]; then
         ln -s usr/lib "$sysroot/lib"
         info "created usrmerge compat symlink lib -> usr/lib"
     fi
+    if [ ! -e "$sysroot/bin" ] && [ ! -L "$sysroot/bin" ]; then
+        ln -s usr/bin "$sysroot/bin"
+        info "created usrmerge compat symlink bin -> usr/bin"
+    fi
+
+    # /bin/sh -> dash (Debian's base alternatives choice).
+    ln -sfn dash "$sysroot/usr/bin/sh"
+    info "alternatives replica: usr/bin/sh -> dash"
 
     # update-alternatives replicas (maintainer scripts do not run on
     # plain extraction; libwine postinst installs these slave links at
@@ -346,6 +367,8 @@ do_verify() {
     # glibc the wine loader needs
     check_one "glibc loader" lib/ld-linux.so.2
     check_one "glibc libc" usr/lib/i386-linux-gnu/libc.so.6
+    check_one "dash shell" usr/bin/dash exec
+    check_one "/bin/sh -> dash" bin/sh
     if [ "$v_fail" -ne 0 ]; then
         die "verify failed: $v_fail check(s) missing (run without --verify to (re-)fetch)"
     fi
