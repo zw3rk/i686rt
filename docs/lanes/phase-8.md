@@ -152,3 +152,17 @@ file).
    on the ctx inside the syscall handler and never dispatches DBT
    blocks); the `!ctx->v86` DBT guard from the Phase 7 freeze remains
    S7/S8 coordination as written.
+
+## S8/RC8 record (2026-10-22) — PASSED
+
+L8a merged --no-ff (8a2d542); coordinator wiring: i686_sys_vm86_init
+(113/166) registered in syscalls.c init alongside the ldt init.  The
+L8a-reported pre-existing moffs decode defect (66-prefixed A0-A3 sized
+the offset by operand instead of address size) fixed by the
+coordinator in decode.c.  RC8 evidence (arm64 docker alpine:3.20,
+staging /tmp/rc3): `timeout 60 /w/i686rt -- /w/test_p8_vm86` → rc=0,
+last line PASS.  Deviations: lima stand-in; fixture stub at
+1000:0x7c00 (0x7c00 IP kept) because zero-base windows cannot host
+[0,0x10000) (mmap_min_addr + low guard) — the v86 shim carries IVT/BDA
+transparently; VM86_UNKNOWN is never generated (runaway guard 2^27
+exits UNKNOWN; SIGNAL+pending-signal per the freeze).

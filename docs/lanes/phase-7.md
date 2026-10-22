@@ -179,3 +179,17 @@ Merge L7a (--no-ff), wire syscall registration + sigframe sc_encode/
 sc_decode + far-int fault delivery, run RC7: `test_p7_ldt` prints PASS
 (lima stand-in: arm64 docker container — recorded deviation as in
 RC1–RC5). RC7b after L7b: `wine cmd /c echo ok`.
+
+## S7/RC7 record (2026-10-22) — PASSED
+
+L7a merged --no-ff (11321cd); coordinator wiring committed: ldt.c
+syscalls registered last-wins (123/243/244; full set_thread_area
+supersedes the flat v1 stub), sigframe segment round-trip via
+i686_seg_sc_decode + segment-fault trapno preservation (#GP 13/#NP
+11/#SS 12 with the error code in sc.err instead of the #PF-14
+overwrite), i686_interp_seg_init in init_all, r_execve cs_d reset,
+seg.h fault codes renamed I686_SEG_F_*.  RC7 evidence (arm64 docker
+alpine:3.20, staging /tmp/rc3): `timeout 60 /w/i686rt -- /w/test_p7_ldt`
+→ rc=0, last line PASS.  Deviations: lima stand-in as in RC1–RC5.
+Noted behavior change (SDM-correct): 16-bit EA wrap mod 64K for
+67-prefixed flat code.
