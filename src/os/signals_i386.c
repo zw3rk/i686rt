@@ -43,8 +43,9 @@ static const uint8_t retcode_rt[8] = {
 /* Last frame base pushed on this thread (v1 single-threaded): the
  * sigreturn entry reads the sigcontext from the EXACT address we
  * built, immune to esp-convention drift at the restorer. */
-static uint32_t s_last_frame_va;
-static int s_last_frame_rt;
+#define SA_ONSTACK_ 0x08000000U /* i386 sa_flags bit (kernel uapi) */
+#define SIGFRAME_MAX_NEED                                                      \
+    (sizeof(i686_fpstate_32_t) + 16U + sizeof(i686_rt_sigframe_t) + 32U)
 
 static uint32_t push_bytes(i686_ctx_t *ctx, uint32_t *sp, const void *b,
                            size_t n)
@@ -67,6 +68,32 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
 
     if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
         return -1; /* SIG_DFL: caller terminates */
+    }
+
+    /* SA_ONSTACK delivery (RC7b): wine's fault handlers install an
+     * alternative stack precisely so the frame never lands on the
+     * faulting (guard-adjacent) stack.  Deliver from its top when
+     * active and we are not already inside it. */
+    if ((ga->flags & SA_ONSTACK_) != 0U && ctx->altstack_sp != 0U &&
+        (ctx->altstack_flags & 0x2U /* SS_DISABLE */) == 0U &&
+        (sp < ctx->altstack_sp ||
+         sp >= ctx->altstack_sp + ctx->altstack_size)) {
+        sp = ctx->altstack_sp + ctx->altstack_size;
+    }
+
+    /* Guard pre-check (RC7b): a frame crossing into the stack guard
+     * previously host-faulted inside push_bytes and the host-fault
+     * path re-entered delivery forever (a real kernel force-kills).
+     * Refuse instead; the caller treats it as undeliverable. */
+    {
+        uint32_t floor = ctx->altstack_sp;
+
+        if (sp >= ctx->stack_base && sp < ctx->stack_top) {
+            floor = ctx->stack_base; /* main stack */
+        }
+        if (sp - floor < SIGFRAME_MAX_NEED) {
+            return -1;
+        }
     }
 
     /* fpstate on the guest stack (fxsr image: magic1 per E05). */
@@ -150,8 +177,8 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
      * [esp+8]=pinfo, [esp+0xc]=puc — the frame fields ARE the args. */
     (void)sp;
     ctx->gpr[I686_REG_ESP] = frame_va;
-    s_last_frame_va = frame_va;
-    s_last_frame_rt = sa_siginfo;
+    ctx->sig_last_frame_va = frame_va;
+    ctx->sig_last_frame_rt = (uint32_t)sa_siginfo;
     ctx->eip = ga->handler;
     (void)handler; (void)restorer; (void)info_va; (void)uc_va; (void)i;
     return 0;
@@ -161,14 +188,15 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
 {
     i686_sigcontext_t sc;
     uint32_t base;
-    if (s_last_frame_va == 0U || (!!rt) != (!!s_last_frame_rt)) {
+    if (ctx->sig_last_frame_va == 0U ||
+        (!!rt) != (!!ctx->sig_last_frame_rt)) {
         /* sigreturn outside our delivered frame: kernel behavior is a
          * SIGSEGV; v1 restores nothing and reports EFAULT. */
-        s_last_frame_va = 0U;
+        ctx->sig_last_frame_va = 0U;
         return -1;
     }
-    base = s_last_frame_va + (rt ? (0x90U + 20U) : 8U); /* sc follows pretcode+sig */
-    s_last_frame_va = 0U;
+    base = ctx->sig_last_frame_va + (rt ? (0x90U + 20U) : 8U);
+    ctx->sig_last_frame_va = 0U;
     if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
         return -1;
     }

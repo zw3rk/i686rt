@@ -525,6 +525,7 @@ struct i686_gsigaction *i686_gsig_tab(int signum)
     return &v;
 }
 
+
 /* prctl PR_{GET,SET}_NAME: TASK_COMM_LEN = 16 NUL-padded bytes. */
 static char s_comm[16];
 

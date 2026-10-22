@@ -253,6 +253,11 @@ typedef struct i686_ctx {
     uint8_t  v86;               /* bit0: vm86 mode active (Phase 8) */
     uint8_t  pad_seg[6];
     void    *v86state;          /* v86.c-owned state (Phase 8) */
+
+    /* Signal-frame anchor, PER-THREAD (RC7b: the file-static was shared
+     * across host threads; wine is threaded).  Extends the C-only tail. */
+    uint32_t sig_last_frame_va; /* 0 = none pending */
+    uint32_t sig_last_frame_rt;
 } i686_ctx_t;
 
 /* ABI-locked offsets (src/trampoline.S, Phase 3, must agree). */
