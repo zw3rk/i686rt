@@ -2815,6 +2815,18 @@ static unsigned to_ieee_bits(const xf_t *f, unsigned p, int emax, int emin,
         tiny = exp < emin;
         shift = tiny ? (emin - exp) : 0;
         eff = (int)p - shift; /* IEEE: the subnormal field shrinks directly */
+        if (eff < 0) {
+            /* Entire value below half the target's minimum subnormal:
+             * rnd_sig's eff contract is [0,64], and its eff==0 window
+             * only fits the halfway exponent.  Nearest-even and
+             * toward-zero give a signed zero; toward -inf of a negative
+             * / +inf of a positive value rounds up to 1 ulp. */
+            bool up = (g_rc == 1u && f->sign) || (g_rc == 2u && !f->sign);
+
+            *bits = up ? 1u : 0u;
+            if (f->sign) *bits |= 0x8000000000000000ULL;
+            return flags | X_UE | X_PE;
+        }
         sig = rnd_sig(m128, false, eff, f->sign, &inexact);
         if (eff >= 1 && sig == (((uint64_t)1) << eff)) {
             sig >>= 1;
