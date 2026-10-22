@@ -47,14 +47,25 @@
  *     CVTSS2SD/CVTSD2SS (FCVT), CVTDQ2PS (SCVTF), CVTPS2DQ (FCVTNS),
  *     CVTTPS2DQ (FCVTZS)
  *   LDMXCSR/STMXCSR (0F AE /2 /3, m32, reserved bits masked on load),
- *   EMMS (ftag = 0xFFFF), PAUSE (F3 0F 90, decode reports SETcc_Eb
+ *   SFENCE (0F AE /7) = no-op, PAUSE (F3 0F 90, decode reports SETcc_Eb
  *     with pfx_rep=1) = NOP.
+ *   RC7b T1 (docs/lanes/phase-7.md): MOVDQA/MOVDQU (66/F3 0F 6F load /
+ *     0F 7F store as plain Q moves — the alignment #GP is interpreter-
+ *     only, v1 MOVAPS-class deviation), MOVQ2DQ row (66 0F D6 store-
+ *     low64, F3 MOVQ2DQ, F2 MOVDQ2Q via the MMX file), MOVNTDQ (66 0F E7
+ *     as a plain Q store), PSRLDQ/PSLLDQ (66 0F 73 /2 /3 via EXT against
+ *     a zero temp), PCMPGTB/PCMPEQB/PCMPEQD (66 0F 64/74/76 via CMGT/
+ *     CMEQ), PMOVMSKB (66 0F D7, 16-bit UMOV sign-bit assembly),
+ *     PMINUB/PMAXUB (66 0F DA/DE via UMIN/UMAX), PSUBB (66 0F F8),
+ *     PREFETCHh (0F 18) = no-op.
  *
  * Declined (return -1 -> D2 interpret-one, per the card):
  *   - every MMX (unprefixed) integer form of the new rows (MOVD, the
- *     PUNPCK family, PADDD..PMULUDQ mm encodings): the shared spec
- *     lists only their 66 (xmm) forms; PSHUFW/CVTPI2PS/CVTTPS2PI/
- *     CVTPI2PD/CVTTPD2PI touch the MMX alias file and ARE emitted;
+ *     PUNPCK family, PADDD..PMULUDQ mm encodings, and the RC7b T1 MMX
+ *     forms of 6F/7F/64/73/74/76/D7/DA/DE/F8): the shared spec lists
+ *     only their 66 (xmm) forms -- the interpreter oracle implements
+ *     them; PSHUFW/CVTPI2PS/CVTTPS2PI/CVTPI2PD/CVTTPD2PI touch the MMX
+ *     alias file and ARE emitted, as are the RC7b F2/F3 0F D6 forms;
  *   - MOVDDUP/MOVSLDUP/MOVSHDUP (F2/F3 0F 12/16): not in the frozen
  *     name list;
  *   - F2 0F 5B (CVTPD2DQ): unlisted name -- the card's "CVTTPS2DQ =
@@ -572,6 +583,60 @@ static void sse_and_ffff(a64_buf_t *b, unsigned rd, unsigned rn)
 static void sse_eor_w11_1(a64_buf_t *b)
 {
     a64_emit(b, 0x5200016BU);
+}
+
+/* ---- RC7b T1 raw SIMD words (verified against the cross assembler) -- */
+
+/* EXT Vd.16B, Vn.16B, Vm.16B, #imm4: result[j] = concat(Vn:Vm)[j+imm4]
+ * (whole-register byte shifts against a zero temp). */
+static void sse_ext_16b(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm,
+                        unsigned imm4)
+{
+    a64_emit(b, 0x6E001800U | ((imm4 & 15U) << 11) | ((vm & 31U) << 16) |
+                     ((vn & 31U) << 5) | (vd & 31U));
+}
+
+static void sse_cmeq_16b(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x6E208C00U | ((vm & 31U) << 16) | ((vn & 31U) << 5) |
+                     (vd & 31U));
+}
+
+static void sse_cmeq_4s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x6EA08C00U | ((vm & 31U) << 16) | ((vn & 31U) << 5) |
+                     (vd & 31U));
+}
+
+static void sse_cmgt_16b(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x4E203400U | ((vm & 31U) << 16) | ((vn & 31U) << 5) |
+                     (vd & 31U));
+}
+
+static void sse_umin_16b(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x6E206C00U | ((vm & 31U) << 16) | ((vn & 31U) << 5) |
+                     (vd & 31U));
+}
+
+static void sse_umax_16b(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x6E206400U | ((vm & 31U) << 16) | ((vn & 31U) << 5) |
+                     (vd & 31U));
+}
+
+static void sse_sub_16b(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x6E208400U | ((vm & 31U) << 16) | ((vn & 31U) << 5) |
+                     (vd & 31U));
+}
+
+/* UMOV Wd, Vn.B[i]: imm5 = 2i+1 (bit 0 selects the B element size). */
+static void sse_umov_b(a64_buf_t *b, unsigned wd, unsigned vn, unsigned i)
+{
+    a64_emit(b, 0x0E003C00U | (((2U * (i & 15U)) + 1U) << 16) |
+                     ((vn & 31U) << 5) | (wd & 31U));
 }
 
 /* ---- operand staging ------------------------------------------------ */
@@ -1499,6 +1564,239 @@ static int sse_emit_mxcsr(i686_emit_ctx_t *e, const x86_insn_t *insn,
     return 0;
 }
 
+/* ---- RC7b T1 emitters (docs/lanes/phase-7.md) ----------------------- */
+
+/* MOVDQA/MOVDQU rows (0F 6F load / 0F 7F store, one id): 66/F3 = full
+ * 128-bit move (plain Q LDR/STR; the alignment check is interpreter-
+ * only — same class as the documented v1 MOVAPS deviation).  Plain
+ * (MMX MOVQ) and F2 decline to the D2 oracle. */
+static int sse_emit_movdqa(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    a64_buf_t *b = &e->buf;
+    int load = (insn->opnd[0] == I686_OPND_R32);
+
+    if (insn->pfx_rep == 2U || insn->pfx_opsize == 0U) {
+        return -1;
+    }
+    sse_xmm_file(e);
+    if (load) {
+        if (insn->modrm_mod == 3U) {
+            sse_ldr_q(b, 1U, SSE_XMM_BASE, insn->modrm_rm & 7U);
+        } else {
+            sse_guest_addr(e, insn);
+            sse_ldr_q(b, 1U, SSE_ADDR, 0U);
+        }
+        sse_str_q(b, 1U, SSE_XMM_BASE, insn->modrm_reg & 7U);
+    } else {
+        sse_ldr_q(b, 0U, SSE_XMM_BASE, insn->modrm_reg & 7U);
+        if (insn->modrm_mod == 3U) {
+            sse_str_q(b, 0U, SSE_XMM_BASE, insn->modrm_rm & 7U);
+        } else {
+            sse_guest_addr(e, insn);
+            sse_str_q(b, 0U, SSE_ADDR, 0U);
+        }
+    }
+    return 0;
+}
+
+/* MOVQ2DQ row (0F D6): 66 = MOVQ m64/xmm-low64 <- xmm.d0 (reg-reg keeps
+ * the dest upper), F3 = MOVQ2DQ xmm <- mm (upper zeroed), F2 =
+ * MOVDQ2Q mm <- xmm.d0 (reg-only, MMX dest + tags).  Plain D6 (m64
+ * form of the F2/F3 family) declines. */
+static int sse_emit_movq2dq(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    a64_buf_t *b = &e->buf;
+
+    if (insn->pfx_rep == 2U) { /* F2 MOVDQ2Q mm, xmm */
+        if (insn->modrm_mod != 3U) {
+            return -1; /* memory form is x86 #UD */
+        }
+        sse_xmm_file(e);
+        sse_ldr_q(b, 1U, SSE_XMM_BASE, insn->modrm_rm & 7U);
+        sse_mmx_file(e);
+        sse_str_d(b, 1U, SSE_MMX_BASE, 2U * (insn->modrm_reg & 7U));
+        sse_mmx_tags_valid(e);
+        return 0;
+    }
+    if (insn->pfx_rep == 1U) { /* F3 MOVQ2DQ xmm, mm */
+        if (insn->modrm_mod != 3U) {
+            return -1; /* mm-only source */
+        }
+        sse_mmx_file(e);
+        sse_ldr_d(b, 1U, SSE_MMX_BASE, 2U * (insn->modrm_rm & 7U));
+        sse_ins_d_elt(b, 0U, 0U, 1U, 0U);
+        sse_ins_d_gpr(b, 0U, 1U, 31U); /* zero bits 127:64 */
+        sse_xmm_file(e);
+        sse_str_q(b, 0U, SSE_XMM_BASE, insn->modrm_reg & 7U);
+        return 0;
+    }
+    if (insn->pfx_opsize == 0U) {
+        return -1; /* plain 0F D6 undefined x86 */
+    }
+    /* 66: MOVQ m64 <- xmm.d0. */
+    sse_xmm_file(e);
+    sse_ldr_q(b, 1U, SSE_XMM_BASE, insn->modrm_reg & 7U);
+    if (insn->modrm_mod == 3U) {
+        sse_ins_d_elt(b, 0U, 0U, 1U, 0U);
+        sse_str_q(b, 0U, SSE_XMM_BASE, insn->modrm_rm & 7U);
+    } else {
+        sse_guest_addr(e, insn);
+        sse_str_d(b, 1U, SSE_ADDR, 0U);
+    }
+    return 0;
+}
+
+/* MOVNTDQ row (0F E7): 66 = m128 <- xmm NT store, emitted as a plain Q
+ * store (single-threaded TSO; alignment check is interpreter-only).
+ * Plain MOVNTQ (MMX), the register form, and F2/F3 decline. */
+static int sse_emit_movntdq(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    if (insn->pfx_opsize == 0U || insn->pfx_rep != 0U ||
+        insn->modrm_mod == 3U) {
+        return -1;
+    }
+    sse_xmm_file(e);
+    sse_ldr_q(&e->buf, 0U, SSE_XMM_BASE, insn->modrm_reg & 7U);
+    sse_guest_addr(e, insn);
+    sse_str_q(&e->buf, 0U, SSE_ADDR, 0U);
+    return 0;
+}
+
+/* PSRLDQ row (0F 73): 66 /2 PSRLDQ, /3 PSLLDQ via EXT against a zero
+ * temp; imm8 >= 16 gives zero, imm8 == 0 is a register move.  Plain
+ * (MMX PSRLQ/PSLLQ) and other digits/prefixes decline. */
+static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    a64_buf_t *b = &e->buf;
+    unsigned imm = insn->imm & 0xFFu;
+
+    if (insn->pfx_opsize == 0U || insn->pfx_rep != 0U) {
+        return -1;
+    }
+    if (insn->modrm_reg == 2U) { /* PSRLDQ: out[j] = in[j-imm] */
+        if (imm == 0U) {
+            sse_src_q(e, insn);
+            sse_mov_v_v(b, 0U, 1U);
+        } else if (imm < 16U) {
+            sse_src_q(e, insn);
+            sse_movi_v_zero(b, 2U);
+            sse_ext_16b(b, 0U, 2U, 1U, 16U - imm);
+        } else {
+            sse_movi_v_zero(b, 0U);
+        }
+    } else if (insn->modrm_reg == 3U) { /* PSLLDQ: out[j] = in[j+imm] */
+        if (imm == 0U) {
+            sse_src_q(e, insn);
+            sse_mov_v_v(b, 0U, 1U);
+        } else if (imm < 16U) {
+            sse_src_q(e, insn);
+            sse_movi_v_zero(b, 2U);
+            sse_ext_16b(b, 0U, 1U, 2U, imm);
+        } else {
+            sse_movi_v_zero(b, 0U);
+        }
+    } else {
+        return -1; /* other /digits: x86 #UD */
+    }
+    sse_xmm_file(e);
+    sse_str_q(b, 0U, SSE_XMM_BASE, insn->modrm_reg & 7U);
+    return 0;
+}
+
+/* PCMPGTB (64) / PCMPEQB (74) / PCMPEQD (76): 66 forms via CMGT/CMEQ;
+ * plain (MMX) and F2/F3 decline. */
+static int sse_emit_pcmp(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                         unsigned kind)
+{
+    a64_buf_t *b = &e->buf;
+
+    if (insn->pfx_opsize == 0U || insn->pfx_rep != 0U) {
+        return -1;
+    }
+    sse_xmm_file(e);
+    sse_dst_load(e, insn);
+    sse_src_q(e, insn);
+    switch (kind) {
+    case 0U: sse_cmgt_16b(b, 0U, 0U, 1U); break; /* PCMPGTB: d > s */
+    case 1U: sse_cmeq_16b(b, 0U, 0U, 1U); break; /* PCMPEQB */
+    default: sse_cmeq_4s(b, 0U, 0U, 1U); break;  /* PCMPEQD */
+    }
+    sse_dst_store(e, insn);
+    return 0;
+}
+
+/* PMOVMSKB (0F D7, 66): r32 <- 16 byte sign bits; the mask is the
+ * weighted bit assembly (UMOV each byte lane, isolate bit 7, OR at the
+ * lane weight — MOVMSKPS pattern).  Plain (MMX) declines. */
+static int sse_emit_pmovmskb(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    a64_buf_t *b = &e->buf;
+    unsigned i;
+
+    if (insn->modrm_mod != 3U || insn->pfx_rep != 0U ||
+        insn->pfx_opsize == 0U) {
+        return -1;
+    }
+    sse_xmm_file(e);
+    sse_ldr_q(b, 1U, SSE_XMM_BASE, insn->modrm_rm & 7U);
+    a64_emit_movz_w(b, SSE_W9, 0U, 0U); /* acc = 0 */
+    for (i = 0U; i < 16U; i++) {
+        sse_umov_b(b, SSE_W8, 1U, i);
+        a64_emit_ubfm_w(b, SSE_W8, SSE_W8, 7U, 7U); /* bit 7 -> bit 0 */
+        a64_emit_orr_reg_w(b, SSE_W9, SSE_W9, SSE_W8, A64_SHIFT_LSL, i);
+    }
+    a64_emit_mov_w(b, i686_w(insn->modrm_reg), SSE_W9);
+    return 0;
+}
+
+/* PMINUB (DA) / PMAXUB (DE): 66 forms via UMIN/UMAX; plain (MMX) and
+ * F2/F3 decline. */
+static int sse_emit_pminmaxub(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                              unsigned is_max)
+{
+    a64_buf_t *b = &e->buf;
+
+    if (insn->pfx_opsize == 0U || insn->pfx_rep != 0U) {
+        return -1;
+    }
+    sse_xmm_file(e);
+    sse_dst_load(e, insn);
+    sse_src_q(e, insn);
+    if (is_max != 0U) {
+        sse_umax_16b(b, 0U, 0U, 1U);
+    } else {
+        sse_umin_16b(b, 0U, 0U, 1U);
+    }
+    sse_dst_store(e, insn);
+    return 0;
+}
+
+/* PSUBB (0F F8): 66 form via SUB .16B; plain (MMX) and F2/F3 decline. */
+static int sse_emit_psubb(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    a64_buf_t *b = &e->buf;
+
+    if (insn->pfx_opsize == 0U || insn->pfx_rep != 0U) {
+        return -1;
+    }
+    sse_xmm_file(e);
+    sse_dst_load(e, insn);
+    sse_src_q(e, insn);
+    sse_sub_16b(b, 0U, 0U, 1U);
+    sse_dst_store(e, insn);
+    return 0;
+}
+
+/* PREFETCHh (0F 18): hint with no architected effect — emit nothing.
+ * 66/F2/F3 forms are undefined x86 (decline to the oracle's UNDEF). */
+static int sse_emit_prefetch(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    if (insn->pfx_opsize != 0U || insn->pfx_rep != 0U) {
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- entry point ----------------------------------------------------- */
 
 int i686_emit_sse(i686_emit_ctx_t *e, const x86_insn_t *insn)
@@ -1518,6 +1816,37 @@ int i686_emit_sse(i686_emit_ctx_t *e, const x86_insn_t *insn)
         return sse_emit_movlp_hp(e, insn, 1U);
     case I686_OP_MOVQ_xmm:
         return sse_emit_movd(e, insn);
+    case I686_OP_MOVDQA:
+        return sse_emit_movdqa(e, insn);
+    case I686_OP_MOVQ2DQ:
+        return sse_emit_movq2dq(e, insn);
+    case I686_OP_MOVNTDQ:
+        return sse_emit_movntdq(e, insn);
+    case I686_OP_PSRLDQ:
+        return sse_emit_psrldq(e, insn);
+    case I686_OP_PCMPGTB:
+        return sse_emit_pcmp(e, insn, 0U);
+    case I686_OP_PCMPEQB:
+        return sse_emit_pcmp(e, insn, 1U);
+    case I686_OP_PCMPEQD:
+        return sse_emit_pcmp(e, insn, 2U);
+    case I686_OP_PMOVMSKB:
+        return sse_emit_pmovmskb(e, insn);
+    case I686_OP_PMINUB:
+        return sse_emit_pminmaxub(e, insn, 0U);
+    case I686_OP_PMAXUB:
+        return sse_emit_pminmaxub(e, insn, 1U);
+    case I686_OP_PSUBB:
+        return sse_emit_psubb(e, insn);
+    case I686_OP_PREFETCH:
+        return sse_emit_prefetch(e, insn);
+    case I686_OP_SFENCE:
+        /* 0F AE /7: store fence, no-op in the single-threaded TSO guest
+         * model; the memory modrm forms are x86 #UD (D2 decline). */
+        if (insn->modrm_mod != 3U) {
+            return -1;
+        }
+        return 0;
     case I686_OP_CVTPI2PS:
         return sse_emit_cvtpi2(e, insn);
     case I686_OP_CVTTPS2PI:
