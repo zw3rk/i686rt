@@ -207,6 +207,9 @@ typedef enum {
     I686_OP_PMAXUB, I686_OP_PSUBB, I686_OP_PMOVMSKB, I686_OP_PREFETCH,
     I686_OP_LDMXCSR, I686_OP_STMXCSR, I686_OP_EMMS,
 
+    /* CMPXCHG8B (0F C7 /1, RC7b T4) */
+    I686_OP_CMPXCHG8B,
+
     /* x87/MMX x87 state (D8-DF groups + 0F 77/0F AE, Phase 5 L5c) */
     I686_OP_FADD_m32, I686_OP_FMUL_m32, I686_OP_FCOM_m32, I686_OP_FCOMP_m32,
     I686_OP_FSUB_m32, I686_OP_FSUBR_m32, I686_OP_FDIV_m32, I686_OP_FDIVR_m32,
@@ -224,7 +227,7 @@ typedef enum {
     I686_OP_FXRSTOR, I686_OP_SFENCE,
 } i686_op_t;
 
-#define I686_OP_COUNT 359u /* including I686_OP_INVALID */
+#define I686_OP_COUNT 360u /* including I686_OP_INVALID */
 
 /* Per-opcode descriptor (frozen in docs/lanes/phase-1.md). */
 typedef struct {
@@ -610,7 +613,7 @@ static const i686_insn_desc_t i686_insn_tab_0f[256] = {
     /* 0x70 */ { I686_OP_PSHUFW, { 3u, 6u, 7u }, 1u, 0u, 0u }, /* 66=PSHUFD, F2=PSHUFLW, F3=PSHUFHW; plain = MMX */
     /* 0x71 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
     /* 0x72 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
-    /* 0x73 */ { I686_OP_PSRLDQ, { 3u, 6u, 7u }, 1u, 0u, 0u }, /* /digit in modrm_reg: /2 PSRLQ, /3 PSRLDQ, /6 PSLLQ, /7 PSLLDQ; 66-form 128-bit, plain MMX */
+    /* 0x73 */ { I686_OP_PSRLDQ, { 3u, 6u, 7u }, 1u, 0u, 0u }, /* 66 /2=PSRLDQ /3=PSLLDQ (128-bit byte shifts); plain /2=PSRLQ /6=PSLLQ (MMX) */
     /* 0x74 */ { I686_OP_PCMPEQB, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* 66 = xmm, plain = MMX */
     /* 0x75 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* PCMPEQW: unused by the RC7b targets */
     /* 0x76 */ { I686_OP_PCMPEQD, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* 66 = xmm, plain = MMX */
@@ -694,7 +697,7 @@ static const i686_insn_desc_t i686_insn_tab_0f[256] = {
     /* 0xC4 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
     /* 0xC5 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
     /* 0xC6 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
-    /* 0xC7 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
+    /* 0xC7 */ { I686_OP_CMPXCHG8B, { 6u, 0u, 0u }, 1u, 0u, 1u }, /* m64 at EA; reg /1, mod!=3 (handler #UDs others) */
     /* 0xC8 */ { I686_OP_BSWAP_Gv, { 3u, 0u, 0u }, 0u, 0u, 0u }, /* rm=opcode&7 */
     /* 0xC9 */ { I686_OP_BSWAP_Gv, { 3u, 0u, 0u }, 0u, 0u, 0u }, /* rm=opcode&7 */
     /* 0xCA */ { I686_OP_BSWAP_Gv, { 3u, 0u, 0u }, 0u, 0u, 0u }, /* rm=opcode&7 */

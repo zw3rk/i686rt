@@ -120,6 +120,10 @@ EXPECTED_IDS += [
     "PREFETCH", "SFENCE",
 ]
 
+# RC7b triage T4: 0F C7 /1 CMPXCHG8B (ntdll.so NtAllocateUuids interlocked
+# loop; lock cmpxchg8b at wine startup).
+EXPECTED_IDS += ["CMPXCHG8B"]
+
 # Phase 5 L5c x87/MMX set (docs/lanes/phase-5.md + hardware-verified
 # second bytes): D8-DF group ids plus 0F 77 EMMS and 0F AE /0-/1.
 EXPECTED_IDS += [
@@ -246,6 +250,8 @@ S_0F = [
     (0xBE, "MOVSX_GvEb", ("R32", "RM8"), 1, 0, 0),
     (0xBF, "MOVSX_GvEw", ("R32", "RM16"), 1, 0, 0),
     (0xC0, "XADD_EbGb", ("RM8", "R8"), 1, 0, 1),
+    (0xC1, "XADD_EvGv", ("RM32", "R32"), 1, 0, 1),
+    (0xC7, "CMPXCHG8B", ("RM32",), 1, 0, 1),        # RC7b T4
     (0xC8, "BSWAP_Gv", ("R32",), 0, 0, 0),
     (0x77, "EMMS", ("NONE",), 0, 0, 0),            # L5c x87/MMX
     (0xAE, "INVALID", None, 1, 1, 0),              # L5c 0F AE group

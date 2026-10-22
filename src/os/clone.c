@@ -148,9 +148,28 @@ static int64_t r_clone(i686_ctx_t *ctx)
          * launch, RC7b): the child only ever execve()s or _exit()s.
          * Under the translator a host fork() copy gives exactly that
          * observable behavior (the exec discards the copied memory);
-         * the parent's waitpid reaps the exec'd image's status. */
-        extern int64_t i686_sys_call_nr(long nr, i686_ctx_t *ctx);
-        return i686_sys_call_nr(2 /* fork */, ctx);
+         * the parent's waitpid reaps the exec'd image's status.
+         * Kernel ABI: with CLONE_VM the child's ESP is the requested
+         * newsp.  The glibc clone wrapper pre-stores flags/fake-ret/
+         * fn/arg at [newsp..newsp+12] and its child path (EAX==0)
+         * pops fn into EBX and calls *EBX — resuming the child on the
+         * parent's ESP pops the parent's callee-saves instead and
+         * calls through garbage (RC7b T4: `call *%ebx` with
+         * EBX=0xffffffff, fault eip=0xffffffff in the spawn child).
+         * Without CLONE_VM (plain fork/vfork) the kernel ignores
+         * newsp and the child keeps the parent's ESP. */
+        pid_t pid = fork();
+        if (pid < 0) {
+            return -errno;
+        }
+        if (pid == 0) {
+            ctx->host_tid = (int)getpid();
+            if (newsp != 0U) {
+                ctx->gpr[I686_REG_ESP] = newsp;
+            }
+            return 0;
+        }
+        return (int64_t)pid;
     }
 
     child = malloc(sizeof(*child));

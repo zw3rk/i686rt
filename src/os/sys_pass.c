@@ -36,7 +36,8 @@
  *   the unit test compiles this file on macOS where they differ again.
  *
  * L2e owns the fcntl/fcntl64 flag translation; this file translates flags
- * for open(5)/dup3(330) only (dup3 flags: O_CLOEXEC=0x80000 identical).
+ * for open(5)/dup3(330)/pipe2(331) only (dup3/pipe2 flags: O_CLOEXEC
+ * 0x80000 and O_NONBLOCK 0x800, identical on both sides).
  *
  * termios ioctls (verified: request numbers and kernel struct layouts are
  * identical on i386 and aarch64 — x86 ioctls.h/termbits.h match
@@ -89,6 +90,13 @@
 #include <sys/syscall.h>
 /* syscall(2) hidden under strict _POSIX_C_SOURCE in musl */
 long syscall(long, ...);
+#ifndef __APPLE__
+/* pipe2 is GNU, hidden under strict _POSIX_C_SOURCE in musl; verbatim
+ * prototype (same declare-verbatim convention as wait4 in syscalls.c).
+ * The macOS unit-test host has no pipe2 and takes the pipe()+fcntl
+ * fallback in sys_pipe2. */
+int pipe2(int [2], int);
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -146,6 +154,10 @@ long syscall(long, ...);
 #define NR_dup          41U /* [41]  {"dup"}          */
 #define NR_dup2         63U /* [63]  {"dup2"}         */
 #define NR_dup3        330U /* [330] {"dup3"}         */
+#define NR_pipe         42U /* [42]  {"pipe"}         */
+#define NR_pipe2       331U /* [331] {"pipe2"}        */
+#define NR_pread64     180U /* [180] {"pread64"}      */
+#define NR_pwrite64    181U /* [181] {"pwrite64"}     */
 #define NR_ioctl        54U /* [54]  {"ioctl"}        */
 #define NR_munmap       91U /* [91]  {"munmap"}       */
 #define NR_mprotect    125U /* [125] {"mprotect"}     */
@@ -971,6 +983,54 @@ static long sys_dup3(uint32_t oldfd, uint32_t newfd, uint32_t flags)
 #endif
 }
 
+/* pipe2(331) / pipe(42): int fds[2] out (8 bytes, host LE = guest LE);
+ * the only legal flags are O_NONBLOCK / O_CLOEXEC, numerically
+ * identical on i386 and the aarch64 host (0x800 / 0x80000, asm-generic
+ * values in the tables above).  i386 pipe(42) is pipe2(fds, 0) with
+ * the fds pointer in EBX.  glibc's pipe() calls pipe2(331) since 2.27
+ * with no ENOSYS fallback — wineserver's sock_check_pollhup() dies
+ * without it (RC7b T4).  On EFAULT after success both host fds are
+ * closed, matching fs/pipe.c's err path. */
+static long sys_pipe2(i686_ctx_t *ctx, uint32_t fds_va, uint32_t flags)
+{
+    int fds[2];
+
+    if ((flags & ~(uint32_t)(HOST_O_NONBLOCK | HOST_O_CLOEXEC)) != 0U) {
+        return -EINVAL;
+    }
+#ifdef __APPLE__
+    /* Unit-test host (macOS): no pipe2; pipe + fcntl for the two
+     * legal flags. */
+    if (pipe(fds) < 0) {
+        return -errno;
+    }
+    if ((flags & HOST_O_NONBLOCK) != 0U) {
+        if (fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0 ||
+            fcntl(fds[1], F_SETFL, O_NONBLOCK) < 0) {
+            int e = errno;
+            (void)close(fds[0]);
+            (void)close(fds[1]);
+            return -e;
+        }
+    }
+    if ((flags & HOST_O_CLOEXEC) != 0U) {
+        (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+#else
+    if (pipe2(fds, (int)flags) < 0) {
+        return -errno;
+    }
+#endif
+    if (guest_ptr_bad(fds_va) ||
+        i686_copy_to_guest(ctx, fds_va, fds, sizeof fds) != 0) {
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        return -EFAULT;
+    }
+    return 0;
+}
+
 /* Struct-carrying whitelisted ioctl: len bytes are copied guest->host
  * before the call (set direction) or host->guest after it (get
  * direction); the request number itself is identical on both arches. */
@@ -1567,6 +1627,66 @@ static int64_t r_dup3(i686_ctx_t *ctx)
                     ctx->gpr[I686_REG_EDX]);
 }
 
+static int64_t r_pipe(i686_ctx_t *ctx)
+{
+    return sys_pipe2(ctx, ctx->gpr[I686_REG_EBX], 0U);
+}
+
+static int64_t r_pipe2(i686_ctx_t *ctx)
+{
+    return sys_pipe2(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX]);
+}
+
+/* pread64(180) / pwrite64(181): (fd, buf, count, pos) with the 64-bit
+ * pos split pos_lo=ESI / pos_hi=EDI.  Register ABI byte-verified from
+ * this sysroot's glibc 2.44 i386 pread64 wrapper (libc.so.6 0xf9c30):
+ * it loads esi <- the offset's low half, routes the high half into the
+ * vDSO-shim edi slot, zero-fills ebp, and keeps ecx=buf for the call
+ * through *%gs:0x10 — the pad-less ia32 shim of modern kernels
+ * (fs/read_write.c SYSCALL_DEFINE5(pread64, .., loff_t, pos), where the
+ * pt_regs shim splits pos as regs->si : regs->di).  wineserver's
+ * sock_load_language/casemap loader rides pread(fd, buf, 2, 0) here
+ * (RC7b T4: -ENOSYS surfaced as "invalid format for casemap table").
+ * The buffer rides the guest window pointer directly (sys_read
+ * convention, src/os/syscalls.c). */
+static long sys_pread64(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
+                        uint32_t count, uint32_t pos_lo, uint32_t pos_hi)
+{
+    off_t pos = (off_t)(((uint64_t)pos_hi << 32) | (uint64_t)pos_lo);
+
+    if (count > 0U && buf_va < 0x1000U) {
+        return -EFAULT;
+    }
+    return host_ret_(pread((int)fd, i686_guest_ptr(ctx, buf_va),
+                           (size_t)count, pos));
+}
+
+static long sys_pwrite64(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
+                         uint32_t count, uint32_t pos_lo, uint32_t pos_hi)
+{
+    off_t pos = (off_t)(((uint64_t)pos_hi << 32) | (uint64_t)pos_lo);
+
+    if (count > 0U && buf_va < 0x1000U) {
+        return -EFAULT;
+    }
+    return host_ret_(pwrite((int)fd, i686_guest_ptr(ctx, buf_va),
+                            (size_t)count, pos));
+}
+
+static int64_t r_pread64(i686_ctx_t *ctx)
+{
+    return sys_pread64(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                       ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
+                       ctx->gpr[I686_REG_EDI]);
+}
+
+static int64_t r_pwrite64(i686_ctx_t *ctx)
+{
+    return sys_pwrite64(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                        ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
+                        ctx->gpr[I686_REG_EDI]);
+}
+
 static int64_t r_ioctl(i686_ctx_t *ctx)
 {
     return sys_ioctl(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
@@ -1695,6 +1815,10 @@ void i686_syscalls_pass_init(void)
     i686_sys_register(NR_dup, r_dup);
     i686_sys_register(NR_dup2, r_dup2);
     i686_sys_register(NR_dup3, r_dup3);
+    i686_sys_register(NR_pipe, r_pipe);
+    i686_sys_register(NR_pipe2, r_pipe2);
+    i686_sys_register(NR_pread64, r_pread64);
+    i686_sys_register(NR_pwrite64, r_pwrite64);
     i686_sys_register(NR_ioctl, r_ioctl);
     i686_sys_register(NR_munmap, r_munmap);
     i686_sys_register(NR_mprotect, r_mprotect);
