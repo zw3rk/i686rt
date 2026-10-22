@@ -116,3 +116,41 @@ updated) and L6b; build hl from the L6a worktree; RC6:
 `hl ./busybox-i686 sh -c 'echo ok'` → `ok` on macOS Apple Silicon with
 offset mode G=4 GiB (hl exports I686RT_WINDOW=0x100000000 by default).
 Record evidence here.
+
+## S6 merge + RC6 record (2026-10-22) — PASSED (attempt 2)
+
+- L6b merged --no-ff into i686rt master after review (owned files only,
+  check re-run once from master: L6B-OK).
+- L6a accepted on its local branch (hyper-linux worktree ../i686rt-l6a,
+  commit 1a8dadc + the coordinator RC6 fixup below; hyper-linux master
+  and ../hyper-linux untouched; never pushed).
+- RC6 attempt 1 failed: `i686rt: failed to reserve guest window at
+  0x0`.  Two defects:
+  1. hl side: guest_env is materialised from environ (hl.c ~:1918)
+     BEFORE i686_finalize's setenv(I686RT_WINDOW) (~:2054), so the
+     offset-mode hint never reached the translator; it fell into an
+     explicit G=0 reservation that cannot succeed inside the hl guest.
+     Fix (lane/6-l6a fixup commit): i686_window_hint() exported from
+     i686.c and appended as I686RT_WINDOW=<hint> to the guest env in
+     the hl.c i686 launch branch.  NOTE for the final report: the a32
+     launch path has the same latent ordering gap for A32RT_WINDOW
+     (a32rt masks it with its scan fallback); upstream hl issue, not
+     changed from this project.
+  2. i686rt side: src/main.c env_window() returned 0 for an
+     unset/unparseable I686RT_WINDOW, which rt32_vm_init read as an
+     EXPLICIT G=0 reservation instead of its documented resolution
+     order (env re-read, a32host hint, G=0-then-scan).  Unset now
+     passes the UINT64_MAX sentinel.
+- RC6 attempt 2 (evidence, from ../i686rt-l6a with the sibling
+  ../i686rt/_build/i686rt build):
+    $ ./_build/hl /tmp/rc3/busybox-i686 sh -c 'echo ok'
+    ok
+    rc=0
+  Offset mode: the guest env carries I686RT_WINDOW=0x100000000 (hl
+  default hint) and rt32_vm_init treats an explicit base as
+  fail-hard — the run completing proves the [4 GiB, 8 GiB) window
+  reserved exactly (offset mode G=4 GiB, D7/RC6 letter).
+- hl build note: plain make needs OBJCOPY from nix cctools on this
+  host (no ambient objcopy; nix develop fails on a pre-existing flake
+  gap — zlib.h absent from apple-sdk_15; lane used ambient clang +
+  OBJCOPY override).

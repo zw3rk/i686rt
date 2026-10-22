@@ -157,11 +157,14 @@ static uint64_t env_window(void)
     unsigned long long v;
 
     if (s == NULL) {
-        return 0;
+        /* Unset means "no explicit choice": rt32_vm_init then applies
+         * its own resolution order (env re-read, a32host hint, scan).
+         * A literal I686RT_WINDOW=0 still selects no-offset mode. */
+        return UINT64_MAX;
     }
     v = strtoull(s, &end, 0);
     if (end == s || *end != '\0') {
-        return 0;
+        return UINT64_MAX; /* rt32_vm_init re-parses and reports it */
     }
     return (uint64_t)v;
 }
