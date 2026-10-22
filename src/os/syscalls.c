@@ -511,6 +511,8 @@ static int64_t r_execve(i686_ctx_t *ctx)
     ctx->seg_sel[I686_SEG_FS] = 0U;
     ctx->seg_sel[I686_SEG_GS] = 0U;
     memset(ctx->seg_base, 0, sizeof(ctx->seg_base));
+    ctx->cs_d = 1U; /* exec reloads flat segment regs; the LDT itself
+                     * persists (per-mm on i386), segment state resets */
     return 0;
 }
 
@@ -560,4 +562,13 @@ void i686_syscalls_init_once(void)
     i686_syscalls_time_init();
     i686_syscalls_misc_init();
     i686_syscalls_pass_init();
+    /* Phase 7/8 module registrations run LAST: registration is
+     * last-wins, and ldt.c's full set_thread_area(243) supersedes the
+     * flat-model v1 stub registered above (S7 wiring). */
+    {
+        extern void i686_syscalls_ldt_init(void);   /* 123, 243, 244 */
+        extern void i686_sys_vm86_init(void);       /* 113, 166 */
+        i686_syscalls_ldt_init();
+        i686_sys_vm86_init();
+    }
 }

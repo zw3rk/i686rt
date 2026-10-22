@@ -549,11 +549,13 @@ prefixes_done:;
 
     /* moffs forms (A0–A3): absolute address, no modrm.  Loads (A0/A1)
      * carry the memory operand in opnd[1] (register destination is
-     * opnd[0]); stores (A2/A3) in opnd[0].  The moffs bytes live in the
-     * code stream (CS-relative fetch). */
+     * opnd[0]); stores (A2/A3) in opnd[0].  The moffs offset size
+     * follows the ADDRESS-size attribute (SDM MOV moffs: 66 A1 in flat
+     * code is a 4-byte offset with a 16-bit load), NOT the operand
+     * size.  The bytes live in the code stream (CS-relative fetch). */
     if ((opnd_is_mem(out->opnd[0]) || opnd_is_mem(out->opnd[1])) &&
         !out->has_modrm) {
-        unsigned w = out->pfx_opsize ? 2U : 4U;
+        unsigned w = out->pfx_addrsize ? 2U : 4U;
         out->ea_has = 1;
         out->ea_base = REG_NONE;
         out->ea_index = REG_NONE;

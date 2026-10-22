@@ -31,10 +31,12 @@
  *
  * Fault encoding shared by the interface (handlers map to guest
  * SIGSEGV with correct trapno/error code, §3.5):
- *   SEG_OK          0  no fault
- *   SEG_GP          1  #GP(sel)  trapno 13, error = selector bits
- *   SEG_NP          2  #NP(sel)  trapno 11 (not-present descriptor)
- *   SEG_SS          3  #SS(sel)  trapno 12 (stack limit)
+ *   I686_SEG_F_OK     0  no fault
+ *   I686_SEG_F_GP     1  #GP(sel)  trapno 13, error = selector bits
+ *   I686_SEG_F_NP     2  #NP(sel)  trapno 11 (not-present descriptor)
+ *   I686_SEG_F_SS     3  #SS(sel)  trapno 12 (stack limit)
+ * (F_-prefixed since I686_SEG_SS is the SS register index in
+ * i686rt.h; seg.c additionally keeps local register-index uses.)
  */
 
 #ifndef I686_SEG_H
@@ -65,11 +67,11 @@ typedef struct i686_desc {
 #define I686_DESC_SYSTEM  0x4u
 #define I686_DESC_USEABLE 0x8u
 
-/* Fault codes (header comment). */
-#define I686_SEG_OK 0
-#define I686_SEG_GP 1
-#define I686_SEG_NP 2
-#define I686_SEG_SS 3
+/* Fault codes (header comment; F_-prefixed, see above). */
+#define I686_SEG_F_OK 0
+#define I686_SEG_F_GP 1
+#define I686_SEG_F_NP 2
+#define I686_SEG_F_SS 3
 
 /* Per-process segment state (ctx->ldt points here once i686_seg_init
  * ran; the Phase-0 placeholder comment in i686rt.h is superseded by

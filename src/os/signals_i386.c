@@ -106,7 +106,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     sc.ebx = ctx->gpr[I686_REG_EBX]; sc.edx = ctx->gpr[I686_REG_EDX];
     sc.ecx = ctx->gpr[I686_REG_ECX]; sc.eax = ctx->gpr[I686_REG_EAX];
     sc.trapno = ctx->exit_arg; /* fault exit stores trapno in arg */
-    sc.err = 0;
+    sc.err = (sig == 11) ? (uint32_t)ctx->exit_dest : 0; /* seg error code */
     sc.eip = ctx->eip;
     sc.cs = ctx->seg_sel[I686_SEG_CS];
     sc.eflags = ctx->eflags;
@@ -179,6 +179,24 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
     ctx->eip = sc.eip;
     ctx->eflags = sc.eflags;
     ctx->fault_addr = sc.cr2;
+    /* Segment-register round-trip (phase-7.md freeze): kernel reloads
+     * blindly from the sigcontext; invalid selectors fault on next use.
+     * i686_seg_sc_decode revalidates bases/cs_d without faulting. */
+    {
+        uint8_t segs[12];
+
+        memcpy(segs + 0, &sc.gs, 2);
+        memcpy(segs + 2, &sc.fs, 2);
+        memcpy(segs + 4, &sc.es, 2);
+        memcpy(segs + 6, &sc.ds, 2);
+        memcpy(segs + 8, &sc.cs, 2);
+        memcpy(segs + 10, &sc.ss, 2);
+        {
+            extern void i686_seg_sc_decode(i686_ctx_t *ctx,
+                                           const uint8_t in[12]);
+            i686_seg_sc_decode(ctx, segs);
+        }
+    }
     /* fpstate restore */
     if (sc.fpstate != 0U) {
         i686_fpstate_32_t fp;
@@ -224,7 +242,13 @@ int i686_deliver_sync(i686_ctx_t *ctx, int reason)
         }
     }
     if (sig == 11) {
-        ctx->exit_arg = 14; /* trapno = #GP(13)/#PF(14): page fault */
+        /* Segment faults (#GP 13 / #NP 11 / #SS 12, seg.c/h_seg.c) carry
+         * their trapno in exit_arg and the error code in exit_dest;
+         * every other FAULT is a page fault (#PF 14). */
+        if (ctx->exit_arg != 11U && ctx->exit_arg != 12U &&
+            ctx->exit_arg != 13U) {
+            ctx->exit_arg = 14; /* trapno = #PF: page fault */
+        }
     }
     {
         int rt = 0; /* SA_SIGINFO detection via flags */

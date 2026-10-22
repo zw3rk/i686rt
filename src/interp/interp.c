@@ -84,8 +84,10 @@ void i686_interp_init_all(void)
     {
         extern void i686_interp_x87_init(void);
         extern void i686_interp_sse_init(void);
+        extern void i686_interp_seg_init(void);
         i686_interp_x87_init();
         i686_interp_sse_init();
+        i686_interp_seg_init();
     }
 }
 
