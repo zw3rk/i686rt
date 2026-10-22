@@ -66,6 +66,10 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
             rc = i686_emit_string(&e, &insn);
         }
         if (rc < 0) {
+            extern int i686_emit_sse(i686_emit_ctx_t *, const x86_insn_t *);
+            rc = i686_emit_sse(&e, &insn);
+        }
+        if (rc < 0) {
             /* Not emittable: end block; the engine interprets ONE insn
              * (the D2 fallback) and re-enters translation at pc+len. */
             i686_emit_exit(&e, I686_EXIT_UNDEF, insn.len, pc);
