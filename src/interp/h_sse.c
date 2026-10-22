@@ -761,10 +761,11 @@ static int h_movq_xmm(i686_ctx_t *ctx, const x86_insn_t *insn)
             mm_wr(ctx, insn->modrm_reg, (uint64_t)v);
         }
     } else if (insn->pfx_rep == 1U) {
-        /* F3 0F 7E: MOVQ xmm1, xmm2/m64 (low 64, upper preserved). */
+        /* F3 0F 7E: MOVQ xmm1, xmm2/m64.  Legacy MOVQ CLEARS
+         * dest[127:64] (RC7b T2, oracle-verified; only the VEX form
+         * preserves). */
         uint8_t dst[16];
         uint64_t v;
-        sse_get_xmm(ctx, insn->modrm_reg, dst);
         if (insn->modrm_mod == 3U) {
             uint8_t src[16];
             sse_get_xmm(ctx, insn->modrm_rm, src);
@@ -772,6 +773,7 @@ static int h_movq_xmm(i686_ctx_t *ctx, const x86_insn_t *insn)
         } else {
             sse_ld(ctx, insn, &v, 8);
         }
+        memset(dst, 0, sizeof dst);
         memcpy(dst, &v, 8);
         sse_set_xmm(ctx, insn->modrm_reg, dst);
     } else {
@@ -1651,7 +1653,12 @@ static int sse_aligned_fault(i686_ctx_t *ctx, const x86_insn_t *insn)
  * direction from opnd[0]): 66 = MOVDQA (#GP(0) on a misaligned 16-byte
  * EA), F3 = MOVDQU, plain = MMX MOVQ (8 bytes, m64/mm); F2 is undefined
  * x86.  MOVAPS keeps its documented v1 no-fault behavior -- only the
- * RC7b aligned forms check alignment. */
+ * RC7b aligned forms check alignment.  RC7b T2 fix: the plain-form test
+ * is (opsize == 0 && rep == 0); the old pfx_rep == 0 test also caught
+ * the 66 prefix (which rides opsize, not rep), so every MOVDQA executed
+ * as an 8-byte MMX MOVQ through the x87_st slot and left the XMM file
+ * stale -- the exact wedge that made glibc's aligned-loop strchr return
+ * NULL inside dash. */
 static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     int load = (insn->opnd[0] == I686_OPND_R32);
@@ -1660,7 +1667,7 @@ static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->pfx_rep == 2U) {
         return I686_EXIT_UNDEF; /* F2 0F 6F/7F: undefined x86 */
     }
-    if (insn->pfx_rep == 0U) { /* plain: MMX MOVQ mm <-> m64/mm */
+    if (insn->pfx_opsize == 0U && insn->pfx_rep == 0U) { /* plain MMX */
         uint64_t v;
         if (load) {
             if (insn->modrm_mod == 3U) {
@@ -1697,20 +1704,23 @@ static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
     return sse_done(ctx, insn);
 }
 
-/* MOVQ family row (0F D6): 66 = MOVQ m64/xmm-low64 <- xmm.d0 (reg-reg
- * keeps the dest upper), F2 = MOVDQ2Q mm <- xmm.d0 (reg-only), F3 =
- * MOVQ2DQ xmm <- mm (upper zeroed); plain D6 is undefined x86. */
+/* MOVQ family row (0F D6): 66 = MOVQ m64/xmm-low64 <- xmm.d0 (the store
+ * form: reg field is the source, rm the destination; a register dest
+ * has its upper half CLEARED, matching legacy MOVQ -- verified against
+ * the linux/386 oracle in RC7b T2), F2 = MOVDQ2Q mm <- xmm.d0 (reg-
+ * only), F3 = MOVQ2DQ xmm <- mm (upper zeroed); plain D6 is undefined
+ * x86. */
 static int h_movq2dq(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t src[16];
     uint64_t v;
 
-    if (insn->pfx_opsize != 0U) { /* 66 0F D6: MOVQ xmm2/m64, xmm1 */
+    if (insn->pfx_opsize != 0U) { /* 66: MOVQ xmm2/m64, xmm1 */
         sse_get_xmm(ctx, insn->modrm_reg, src);
         memcpy(&v, src, 8);
         if (insn->modrm_mod == 3U) {
             uint8_t dst[16];
-            sse_get_xmm(ctx, insn->modrm_rm, dst);
+            memset(dst, 0, sizeof dst); /* legacy MOVQ clears the upper */
             memcpy(dst, &v, 8);
             sse_set_xmm(ctx, insn->modrm_rm, dst);
         } else {
@@ -1761,9 +1771,19 @@ static int h_movntdq(i686_ctx_t *ctx, const x86_insn_t *insn)
     return sse_done(ctx, insn);
 }
 
-/* PSRLDQ row (0F 73): 66 /2 = PSRLDQ, /3 = PSLLDQ (whole-register byte
- * shifts by imm8, >= 16 gives zero); plain /2 = MMX PSRLQ, /6 = PSLLQ
- * (count masked to 6 bits); other /digits and F2/F3 are undefined. */
+/* PSRLDQ row (0F 73).  RC7b T2 rewrite: this is the shift-by-imm8
+ * GROUP, so the modrm reg field carries the /digit and the register
+ * operand is modrm_rm (the old code wrote the result to the digit-
+ * indexed register and left the real destination stale).  Group map
+ * (Intel SDM "PSRLDQ/PSLLQ/PSRLQ/PSLLW", verified against the
+ * linux/386 oracle):
+ *   66 /2 PSRLQ  (packed 64-bit BIT shift, BOTH quadwords)
+ *   66 /3 PSRLDQ (whole-register byte shift, out[j] = s[j+imm])
+ *   66 /6 PSLLQ  (packed 64-bit BIT shift)
+ *   66 /7 PSLLDQ (out[j] = s[j-imm])
+ * plain /2 MMX PSRLQ, /6 MMX PSLLQ (single qword, bit shift; counts
+ * masked to 6 bits).  imm8 >= 16 gives zero for the byte shifts;
+ * other /digits and F2/F3 are undefined. */
 static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     unsigned imm = insn->imm & 0xFFu;
@@ -1774,19 +1794,36 @@ static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     if (insn->pfx_opsize != 0U) { /* 66: xmm forms */
         uint8_t s[16], out[16];
-        if (dig != 2U && dig != 3U) {
+        if (dig != 2U && dig != 3U && dig != 6U && dig != 7U) {
             return I686_EXIT_UNDEF;
         }
         src128(ctx, insn, s);
         memset(out, 0, sizeof out);
-        if (imm < 16U) {
-            if (dig == 2U) { /* PSRLDQ: out[j] = s[j - imm] */
-                memcpy(out + imm, s, 16U - imm);
-            } else { /* PSLLDQ: out[j] = s[j + imm] */
+        if (dig == 3U) { /* PSRLDQ: out[j] = s[j+imm] */
+            if (imm < 16U) {
                 memcpy(out, s + imm, 16U - imm);
             }
+        } else if (dig == 7U) { /* PSLLDQ: out[j] = s[j-imm] */
+            if (imm < 16U) {
+                memcpy(out + imm, s, 16U - imm);
+            }
+        } else { /* PSRLQ (/2) / PSLLQ (/6): packed 64-bit bit shifts */
+            uint64_t lo = lane64(s, 0);
+            uint64_t hi = lane64(s, 1);
+            unsigned cnt = imm & 63U;
+            if (cnt != 0U) {
+                if (dig == 2U) {
+                    lo >>= cnt;
+                    hi >>= cnt;
+                } else {
+                    lo <<= cnt;
+                    hi <<= cnt;
+                }
+            }
+            set_lane64(out, 0, lo);
+            set_lane64(out, 1, hi);
         }
-        sse_set_xmm(ctx, insn->modrm_reg, out);
+        sse_set_xmm(ctx, insn->modrm_rm, out);
     } else { /* plain: MMX PSRLQ /2, PSLLQ /6 */
         uint64_t v;
         unsigned cnt;
@@ -1799,12 +1836,10 @@ static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
             sse_ld(ctx, insn, &v, 8);
         }
         cnt = imm & 63U; /* MMX: count masked to 6 bits */
-        if (dig == 2U) {
-            v = (cnt == 0U) ? v : (v >> cnt);
-        } else {
-            v = (cnt == 0U) ? v : (v << cnt);
+        if (cnt != 0U) {
+            v = (dig == 2U) ? (v >> cnt) : (v << cnt);
         }
-        mm_wr(ctx, insn->modrm_reg, v);
+        mm_wr(ctx, insn->modrm_rm, v);
     }
     return sse_done(ctx, insn);
 }
