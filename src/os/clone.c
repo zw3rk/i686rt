@@ -4,8 +4,9 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * v1 (single host thread per guest process): CLONE_THREAD without
- * CLONE_VM is -EINVAL; CLONE_VM|CLONE_THREAD guest threads run
+ * v1 (single host thread per guest process): CLONE_VM without
+ * CLONE_THREAD is -EINVAL. CLONE_THREAD without CLONE_VM takes the
+ * fork path. CLONE_VM|CLONE_THREAD guest threads run
  * cooperatively on the interpreter's safe points when the host is
  * single-threaded — under fork() semantics CLONE_VM is impossible, so
  * glibc pthread_create paths in v1 actually take the fork-per-thread

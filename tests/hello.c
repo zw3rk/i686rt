@@ -1,8 +1,9 @@
 /*
  * tests/hello.c — minimal freestanding i386 smoke fixture for i686rt
  *
- * Writes "hello\n" to stdout and exits 0 using only raw int 0x80
- * syscalls: write(eax=4, ebx=1, ecx=msg, edx=5) then exit(eax=1,
+ * msg is "hello\n" (6 bytes). write uses edx=5, so the newline is not
+ * sent. Exits 0 using only raw int 0x80 syscalls:
+ * write(eax=4, ebx=1, ecx=msg, edx=5) then exit(eax=1,
  * ebx=0).  No libc, no crt; _start is the ELF entry point.  Build via
  * tools/build_fixture.sh (docker linux/386 alpine gcc, E06).
  *

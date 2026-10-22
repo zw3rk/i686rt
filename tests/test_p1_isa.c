@@ -15,9 +15,10 @@
  *   docker run --rm -v "$PWD/_build":/w --platform linux/386 alpine \
  *       /w/test_p1_isa        # must print PASS
  *
- * Undefined flags (AF after logic/shifts, OF for count != 1) are
- * masked out of the comparisons so the fixture stays exact on both
- * the QEMU oracle and i686rt.  cpuid leaf 0: i686rt reports
+ * Shift helpers return flags masked by F_CC, which still includes AF.
+ * An exact comparison can therefore fail when a shift sets AF. OF for
+ * a shift count other than 1 is simply absent from the expected masks.
+ * cpuid leaf 0: i686rt reports
  * "GenuineIntel"; the docker/QEMU oracle reports its default CPU
  * vendor "AuthenticAMD" — both are accepted, garbage is not.
  *

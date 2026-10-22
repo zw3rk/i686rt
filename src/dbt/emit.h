@@ -52,9 +52,10 @@ uint8_t *i686_emit_finish(i686_emit_ctx_t *e, size_t *out_len); /* seal */
 void i686_emit_exit(i686_emit_ctx_t *e, uint32_t reason, uint32_t arg,
                     uint32_t dest /* only for BRANCH */);
 
-/* Guest EA materialization: emits loads of base/index from w-regs and
- * computes xG + ea into x21 (returns nothing; caller may re-run). Seg
- * base added when the insn needs it (non-flat). Clobbers x21..x23. */
+/* Guest EA materialization: writes the 32-bit guest offset
+ * disp + base + (index << scale) into w21, wrapped with UXTW.
+ * Does not add xG. Callers address with [x20, w21, uxtw].
+ * Segment base is added in w21 when add_seg is set. Clobbers w21 and w22. */
 void i686_emit_ea(i686_emit_ctx_t *e, const x86_insn_t *insn, int add_seg);
 
 /* x86 GPR access on the fixed map: wreg(insn->modrm_reg) etc. */

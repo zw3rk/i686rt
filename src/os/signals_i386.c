@@ -81,7 +81,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     fp_va = push_bytes(ctx, &sp, &fp, sizeof(fp));
     sp &= ~7U;
 
-    sp &= ~0xFU; /* frame base (and thus handler esp) 16-aligned */
+    sp &= ~0xFU; /* before the push. The 268-byte rt frame then leaves ESP 4 mod 16. */
     if (sa_siginfo) {
         i686_rt_sigframe_t rt;
         memset(&rt, 0, sizeof(rt));

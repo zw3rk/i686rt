@@ -1,7 +1,7 @@
 /*
  * src/interp/x87_80.h — frozen softfloat-extended core API (Phase 5, D9)
  *
- * Copyright 2026 Moritz Angermann <moritz@zw3erk.com>, zw3rk pte. ltd.
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Exact 80-bit extended-precision arithmetic, zero dependencies beyond

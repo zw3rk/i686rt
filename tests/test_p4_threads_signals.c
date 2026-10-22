@@ -29,7 +29,7 @@
  *        `idiv %ecx` with ecx=0 raises #DE; the handler checks
  *        si_code == FPE_INTDIV, sigcontext eip/trapno == 0, defines
  *        eax/edx (idiv leaves them unwritten), skips the 2-byte idiv
- *        and returns through sigreturn; execution continues to exit 0.
+ *        and returns through rt_sigreturn(173); execution continues to exit 0.
  *   (3)  set_thread_area(user_desc{entry -1 auto-alloc, base = static
  *        .data TLS block}) + `mov %ax,%gs` to establish the process
  *        TLS slot (i386 TLS: process-wide selector index, per-thread
@@ -424,7 +424,7 @@ static void segv_plain_handler(int sig)
 }
 
 /* (2) SA_SIGINFO SIGFPE from `idiv %ecx', ecx=0: record, define the
- * unwritten idiv outputs, skip the 2-byte idiv, sigreturn, continue. */
+ * unwritten idiv outputs, skip the 2-byte idiv, rt_sigreturn, continue. */
 static void fpe_handler(int sig, struct siginfo_x *info,
                         struct ucontext_x *uc)
 {

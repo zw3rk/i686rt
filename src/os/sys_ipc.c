@@ -262,8 +262,8 @@ typedef struct __attribute__((packed)) {
     int32_t semaem;
 } i686_seminfo_t;
 
-/* struct msginfo (include/uapi/linux/msg.h): 7 ints + 1 u16,
- * layout-identical on i386 and aarch64. */
+/* struct msginfo (include/uapi/linux/msg.h): 7 ints + 1 u16.
+ * Linux v6.12 uapi does not pack that struct. This copy is packed. */
 typedef struct __attribute__((packed)) {
     int32_t  msgpool;
     int32_t  msgmap;
@@ -899,7 +899,7 @@ static int64_t ipc_msgctl(i686_ctx_t *ctx, uint32_t qid, uint32_t cmd_raw,
         if (buf_va < 0x1000U) {
             return -EFAULT;
         }
-        i686_msginfo_t mi; /* layout-identical on i386 and aarch64 */
+        i686_msginfo_t mi; /* packed; uapi struct msginfo is not */
         memset(&mi, 0, sizeof mi);
         long r = msgctl((int)qid, (int)cmd, (struct msqid_ds *)(void *)&mi);
         if (r < 0) {

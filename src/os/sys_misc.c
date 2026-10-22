@@ -460,9 +460,9 @@ void i686_rlimit_h2g(i686_rlimit_t *g, uint64_t cur, uint64_t max)
                                               : (uint32_t)max;
 }
 
-/* O_ flag translation (i386 -> aarch64): bit-identical values; the
- * guest's O_LARGEFILE (a no-op on 64-bit) is dropped; unknown bits
- * masked.  Host -> guest is the identity over the known mask. */
+/* g2h keeps I686_O_KNOWN and drops O_LARGEFILE. It does not swap
+ * DIRECTORY, DIRECT, or NOFOLLOW. i686_open_flags_to_host does that
+ * for open. h2g below rewrites host DIRECT and NOFOLLOW only. */
 uint32_t i686_oflags_g2h(uint32_t g)
 {
     return g & I686_O_KNOWN & ~(uint32_t)I686_GO_LARGEFILE;

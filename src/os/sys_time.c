@@ -594,7 +594,8 @@ static int64_t sys_settimeofday(i686_ctx_t *ctx, uint32_t tv_va, uint32_t tz_va)
 
 #if defined(__linux__)
     {
-        /* aarch64 timeval: { s64 tv_sec, s64 tv_usec }; tz identical. */
+        /* aarch64 timeval is two 64-bit fields. htz is two host longs.
+         * Linux struct timezone is 8 bytes, so the kernel reads htz[0] only. */
         long long htv[2];
         long htz[2];
 

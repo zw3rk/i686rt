@@ -28,10 +28,10 @@
  *    TU, keeping -Wall quiet for TUs that only need the types.
  *  - 66/67 prefixes select operand/address width at RUNTIME; the table
  *    always carries the 32-bit kind: RM32 == RMv, I32 == Iz, REL32 == Jz.
- *  - I686_OP_NOP and I686_OP_CBW have no direct opcode byte: 0x90 maps to
- *    XCHG_eAXGv (rm==0, i.e. eAX<->eAX, is reported as NOP by the decoder)
- *    and CBW is `66 98` (the decoder swaps CWDE->CBW when pfx_opsize is
- *    set; `66 99` keeps CDQ, no CWD id exists in v1).
+ *  - I686_OP_NOP has no direct opcode byte: 0x90 maps to XCHG_eAXGv
+ *    (rm==0, i.e. eAX<->eAX, is reported as NOP by the decoder).
+ *    0x98 stays I686_OP_CWDE. A 66 prefix sets pfx_opsize and does not
+ *    rewrite the id to I686_OP_CBW. `66 99` keeps CDQ; no CWD id exists.
  *  - 0x40-0x4F (INC/DEC r32) reuse INC_Ev/DEC_Ev -- the contract defines
  *    no dedicated ids; the decoder synthesizes mod=3, rm=opcode&7.
  *  - Hardware aliases kept: 82 == 80 (Eb,Ib), G2 /6 == SHL (/4, SAL),
@@ -43,8 +43,9 @@
  *  - Left INVALID per the contract (decode -> I686_EXIT_UNDEF, D2):
  *    x87 (D8-DF, 0F 0x/1x/2x/5x-7x/Ex), SSE, BCD (27 2F 37 3F D4-D6),
  *    I/O (E4-E7 EC-EF 6C-6F), far transfers (9A EA CA CB), LES/LDS
- *    (C4 C5), BOUND/ARPL (62 63), PUSH/POP CS/SS (0E 16 17), and
- *    69/6B (IMUL Gv,Ev,Iz/Ib has no v1 contract id).
+ *    (C4 C5), BOUND/ARPL (62 63), and PUSH/POP CS/SS (0E 16 17).
+ *    69/6B are not in that list: the rows map them to
+ *    I686_OP_IMUL_GvEvIz and I686_OP_IMUL_GvEvIb.
  */
 
 #ifndef I686RT_X86_INSN_TAB_H
@@ -128,7 +129,7 @@ typedef enum {
     I686_OP_MOVZX_GvEb, I686_OP_MOVZX_GvEw, I686_OP_MOVSX_GvEb, I686_OP_MOVSX_GvEw,
     I686_OP_LEA_GvM,
 
-    /* branches (JCC/SETcc/CMOVcc carry the condition in modrm_reg) */
+    /* JCC/SETcc carry the condition in modrm_reg; CMOVcc parks it in imm */
     I686_OP_JMP_Jb, I686_OP_JMP_Jz, I686_OP_CALL_Jz, I686_OP_RET,
     I686_OP_RET_Iw, I686_OP_JCC_Jb, I686_OP_JCC_Jz, I686_OP_SETcc_Eb,
     I686_OP_CMOVcc_Gv, I686_OP_LOOPNZ_Jb, I686_OP_LOOPZ_Jb, I686_OP_LOOP_Jb,
@@ -314,7 +315,7 @@ static const i686_insn_desc_t i686_insn_tab_1b[256] = {
     /* 0x95 */ { I686_OP_XCHG_eAXGv, { 3u, 3u, 0u }, 0u, 0u, 0u }, /* rm=opcode&7; opnd[0] is eAX */
     /* 0x96 */ { I686_OP_XCHG_eAXGv, { 3u, 3u, 0u }, 0u, 0u, 0u }, /* rm=opcode&7; opnd[0] is eAX */
     /* 0x97 */ { I686_OP_XCHG_eAXGv, { 3u, 3u, 0u }, 0u, 0u, 0u }, /* rm=opcode&7; opnd[0] is eAX */
-    /* 0x98 */ { I686_OP_CWDE, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* 66 98 = CBW (decoder swaps the id) */
+    /* 0x98 */ { I686_OP_CWDE, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* 66 sets pfx_opsize; id stays CWDE */
     /* 0x99 */ { I686_OP_CDQ, { 0u, 0u, 0u }, 0u, 0u, 0u },
     /* 0x9A */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* CALLF: far transfer excluded */
     /* 0x9B */ { I686_OP_WAIT, { 0u, 0u, 0u }, 0u, 0u, 0u },
@@ -374,8 +375,8 @@ static const i686_insn_desc_t i686_insn_tab_1b[256] = {
     /* 0xD1 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 1u, 1u, 0u }, /* G2 shift Ev,1 (see i686_group_tab) */
     /* 0xD2 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 1u, 1u, 0u }, /* G2 shift Eb,CL (see i686_group_tab) */
     /* 0xD3 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 1u, 1u, 0u }, /* G2 shift Ev,CL (see i686_group_tab) */
-    /* 0xD4 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* DAA: BCD excluded */
-    /* 0xD5 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* AAA: BCD excluded */
+    /* 0xD4 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* AAM: BCD excluded */
+    /* 0xD5 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* AAD: BCD excluded */
     /* 0xD6 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SALC: excluded */
     /* 0xD7 */ { I686_OP_XLAT, { 0u, 0u, 0u }, 0u, 0u, 0u },
     /* 0xD8 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* x87: excluded in v1 */
@@ -485,22 +486,22 @@ static const i686_insn_desc_t i686_insn_tab_0f[256] = {
     /* 0x3D */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* unassigned */
     /* 0x3E */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* unassigned */
     /* 0x3F */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* unassigned */
-    /* 0x40 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x41 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x42 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x43 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x44 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x45 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x46 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x47 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x48 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x49 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x4A */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x4B */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x4C */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x4D */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x4E */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
-    /* 0x4F */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in modrm_reg */
+    /* 0x40 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x41 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x42 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x43 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x44 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x45 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x46 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x47 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x48 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x49 */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x4A */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x4B */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x4C */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x4D */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x4E */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
+    /* 0x4F */ { I686_OP_CMOVcc_Gv, { 3u, 6u, 0u }, 1u, 0u, 0u }, /* cond=opcode&0xF carried in imm */
     /* 0x50 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
     /* 0x51 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */
     /* 0x52 */ { I686_OP_INVALID, { 0u, 0u, 0u }, 0u, 0u, 0u }, /* SSE excluded */

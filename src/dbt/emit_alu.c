@@ -119,9 +119,9 @@ static void emit_guest_load(i686_emit_ctx_t *e, unsigned rt, unsigned width)
         }
         return;
     }
-    /* D5 TSO mode: LDAR-class through x23 = xG + uxtw(w21).  Ordered
-     * loads require natural alignment; misaligned guest EAs are a Phase 4
-     * concern (LDAPR policy), and tso is only enabled post-clone. */
+    /* LDAR-class through x23 = xG + uxtw(w21). Ordered loads require
+     * natural alignment. i686_emit_begin leaves e->tso false, so this
+     * arm is not emitted. */
     a64_emit_add_uxtw_x(b, 23U, 20U, 21U);
     if (width == 8U) {
         a64_emit(b, 0x08DFFC00U | (23U << 5) | (rt & 31U));

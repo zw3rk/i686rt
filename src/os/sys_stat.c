@@ -308,8 +308,10 @@ static void rec_store_u64(uint8_t *p, uint64_t v)
 
 /* ---- d_off cookie remap (a32rt map_dir_cookie pattern) -----------------
  *
- * Host getdents64 d_off values are 64-bit hashes; the i386 ABI only has
- * 32-bit d_off, so raw truncation could collide and would not be stable
+ * Host getdents64 d_off values are 64-bit. i386 getdents64 d_off is
+ * also 64-bit. This remap still folds offsets at or above the cookie
+ * base into a 32-bit cookie and writes it into that 64-bit field. Raw
+ * truncation of the unmapped values could collide and would not be stable
  * across batches. Host offsets at or above L2A_DIR_COOKIE_BASE are mapped
  * injectively (per fd) into stable small cookies; smaller offsets pass
  * through untouched (tmpfs-style filesystems use tiny offsets). Guest

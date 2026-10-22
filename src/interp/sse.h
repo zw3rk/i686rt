@@ -6,7 +6,7 @@
  *
  * xmm0..7 live in ctx->xmm[8][16] (frozen offsets).  MXCSR is the
  * authoritative control/status in ctx->mxcsr; the FPCR translation:
- *   MXCSR RC(14-15) -> FPCR(22-23) (same encoding: 0=nearest,1=down,
+ *   MXCSR RC(13-14) -> FPCR(22-23) (same encoding: 0=nearest,1=down,
  *     2=up,3=zero)
  *   MXCSR FTZ(15) -> FPCR.FZ(24); MXCSR DAZ(6) -> FPCR.EPF... v1 keeps
  *     MXCSR emulation pure-C: FTZ/DAZ honoured in the helpers, FPCR is

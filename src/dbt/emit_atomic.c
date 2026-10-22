@@ -75,9 +75,8 @@
  * than a guest exception (split-lock #AC emulation is a later phase).
  * FEAT_LSE is assumed (any ARMv8.1+ host; the HWCAP_ATOMICS runtime
  * check plus an LDXR/STXR fallback path is Phase H per the card).
- * TSO (D5): the AL variants are acquire+release, which is correct in
- * both plain single-threaded and post-clone TSO modes; e->tso needs no
- * branch here.
+ * TSO (D5): the AL variants are acquire+release. e->tso is not read
+ * here; i686_emit_begin leaves it false.
  *
  * Scratch map (w0..w7 guest GPRs, x19 ctx, x20 xG, w21/w22 EA per
  * i686_emit_ea): w8 = LSE source operand (transformed), w9 = old value

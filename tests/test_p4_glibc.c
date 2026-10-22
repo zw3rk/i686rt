@@ -48,7 +48,7 @@ int main(void)
     if (pthread_join(th, NULL) != 0) { rc = 6; goto out; }
     if (shared != 0x5a5a) { rc = 7; goto out; }
 
-    /* fork + wait4 */
+    /* fork + waitpid */
     {
         pid_t p = fork();
         if (p == 0) { _exit(42); }

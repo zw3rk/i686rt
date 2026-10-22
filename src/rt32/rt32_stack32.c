@@ -129,7 +129,7 @@ int rt32_stack_setup(i686_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     i686_auxv_i386_args_t aux_args;
     memset(&aux_args, 0, sizeof(aux_args));
     aux_args.phdr_vaddr     = elf_info->phdr_vaddr;
-    aux_args.phent          = elf_info->phent; /* 56: sizeof(Elf32_Phdr) */
+    aux_args.phent          = elf_info->phent; /* elf32_phdr_t is 32 bytes */
     aux_args.phnum          = elf_info->phnum;
     aux_args.interp_base    = elf_info->interp_base;
     aux_args.entry          = elf_info->entry;

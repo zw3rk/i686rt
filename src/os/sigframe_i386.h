@@ -23,7 +23,7 @@ typedef struct __attribute__((packed)) {
     uint16_t fs, __fsh;
     uint16_t es, __esh;
     uint16_t ds, __dsh;
-    uint32_t edi;          /* 0x1c */
+    uint32_t edi;          /* 0x10; esp is 0x1c */
     uint32_t esi;
     uint32_t ebp;
     uint32_t esp;
@@ -58,7 +58,7 @@ typedef struct __attribute__((packed)) {
     uint32_t fpu_ds2;
     uint32_t mxcsr;
     uint32_t mxcsr_mask;
-    uint32_t xmm_space[32];   /* xmm0..7, 16 B each (to 0x188)          */
+    uint32_t xmm_space[32];   /* xmm0..7 at 0x90, 128 B, ends at 0x110 */
     uint8_t  __pad1[304];     /* to 0x240 (E05: sw_reserved at +0x240)  */
     uint32_t sw_reserved[6]; /* FP_XSTATE_MAGIC1 in [0] on fxsr frames */
     uint8_t  __tail[24];     /* xsave tail; 624 B total (E05)          */
@@ -95,8 +95,9 @@ void i686_signals_i386_init(void);          /* host sigaction registration */
 int  i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
                          uint32_t restorer, int sa_siginfo,
                          uint32_t info_va, uint32_t uc_va);
-/* Returns new guest ESP with the frame pushed; sigcontext filled from
- * ctx (regs, eip, eflags, cr2/fault, fpstate from ctx x87/xmm fields). */
+/* Returns 0 after the frame is pushed. The new guest ESP is stored in
+ * ctx->gpr[ESP], not in the return value. Returns -1 for SIG_DFL/SIG_IGN.
+ * sigcontext is filled from ctx (regs, eip, eflags, cr2, fpstate). */
 
 /* sigreturn entry: called by the engine when the guest's restorer/retcode
  * invokes sigreturn(119)/rt_sigreturn(173). Restores sigcontext into ctx

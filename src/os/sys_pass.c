@@ -66,9 +66,9 @@
  * (Phase 4), and execve(11)/execveat(358) stay -ENOSYS for the
  * coordinator's in-process exec at S2.
  *
- * futex(240) v1 single-threaded stopgap (Phase 4 brings real futexes):
- *   FUTEX_WAKE -> 0, FUTEX_WAIT -> -EAGAIN when *uaddr != val else 0
- *   (never blocks), other ops -> -ENOSYS.
+ * futex(240): sys_futex calls host SYS_futex, so FUTEX_WAIT can block.
+ * The timeout pointer is read from EBP (i386 arg6 / val3). ESI (i386
+ * arg4) is the timespec register in the i386 ABI and is not read here.
  */
 
 #include <errno.h>
@@ -1031,8 +1031,9 @@ static long sys_prctl(i686_ctx_t *ctx, uint32_t option, uint32_t arg2)
 
 static long sys_set_tid_address(i686_ctx_t *ctx, uint32_t tidptr_va)
 {
-    /* Kernel returns the previous clear_child_tid; the first call — the
-     * only one in a single-threaded v1 — returns 0. */
+    /* Returns the previous ctx->clear_child_tid value, then stores
+     * tidptr_va. The first call returns 0 because that field starts at 0.
+     * Linux set_tid_address returns the caller's thread id; this does not. */
     uint32_t prev = ctx->clear_child_tid;
     ctx->clear_child_tid = tidptr_va;
     return (long)prev;
@@ -1052,8 +1053,9 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
      * Phase 4: real futexes on the shared window.  The guest uaddr maps
      * 1:1 to a host address (guest_base + uaddr) and every thread of
      * the process shares the mapping, so the host futex word IS the
-     * guest futex word.  Timeout (arg5 on i386: a guest timespec*) is
-     * converted to a host timespec; NULL = infinite.
+     * guest futex word. The timeout pointer is read from EBP (i386
+     * arg6 / val3) and copied into a host timespec. NULL leaves the
+     * host timeout NULL. ESI (i386 arg4) is not read.
      */
     long hcmd = (op & FUTEX_CMD_MASK_) + 128 /* FUTEX_PRIVATE_FLAG */;
     struct timespec ts, *pts = NULL;
