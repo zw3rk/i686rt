@@ -117,3 +117,29 @@ default mode is allowed to miss: default-mode check skips lines marked
 X87ONLY). Makefile: test-p5-lima target. Check: mkgolden.sh regenerates
 both files; then `i686rt -- fixture` output == p5.txt (default) and
 `--x87-80` output == p5_x87_80.txt → L5E OK.
+
+## RC5 record (2026-10-22) — PASSED
+
+Check (docker arm64 alpine:3.20, staged /tmp/rc3): `i686rt -- test_p5_fpu_sse`
+vs tests/golden/p5.txt minus X87ONLY lines, and `i686rt --x87-80 -- ...` vs
+p5_x87_80.txt (every line). Evidence: default rc=0, 77 cases, diff-lines=0;
+--x87-80 rc=0, 83 cases, diff-lines=0. One mismatch preceded the pass
+(`x87_subn_mul_m64` gold=0 got=1) and traced to two defects, both fixed in
+e31dccc:
+
+- src/interp/x87_80.c to_ieee_bits called rnd_sig with eff < 0 (values below
+  half the target format's minimum subnormal), outside rnd_sig's documented
+  eff-in-[0,64] contract — its leading-bit-as-guard logic fits only the
+  halfway exponent, so every inexact tiny value rounded up to 1 ulp of the
+  smallest denormal. Now handled explicitly: signed zero under
+  nearest/toward-zero, 1 ulp only toward infinity with matching sign
+  (verified for f64 and f32 across RC modes, ties, and below/above-halfway).
+- tests/test_p5_fpu_sse.c g_d_2pN600 was one hex digit short of 2^-600
+  (1.4375*2^-997); goldens regenerated via mkgolden.sh came out
+  byte-identical (the oracle also rounds the corrected product to 0).
+
+Open question (recorded for the final report): round_pack80's eff < 0 branch
+zeroes ext80 arithmetic results below half the min subnormal under ALL RC
+modes; IEEE-correct toward-infinity would take 1 ulp for the matching sign.
+No fixture exercises it (needs |result| < 2^-16446 under a directed RC);
+left unchanged to keep the golden baseline stable.
