@@ -34,7 +34,12 @@ Both runners are idempotent: fetches and builds are cached under `_build/`
 (default 30 s per test), `H2_GLOBAL_TIMEOUT` (default 5400 s libctest /
 3600 s LTP run-loop bound; expired tests are recorded as `global-bound`
 skips, never silently dropped), `H2_IMAGE` (default `alpine:3.20`),
-`I686RT_ENGINE` (default `interp`).  Every container is named
+`I686RT_ENGINE` (default `interp`).  For `run-libctest.sh` only:
+`H2_X87_80=1` runs i686rt with `--x87-80` (SPEC decision D9's exact
+80-bit x87 mode) and names the TAP log
+`results/libctest-x87_80.tap` so the default-mode `libctest.tap` is
+never overwritten; with the knob unset the runner behaves exactly as
+before.  Every container is named
 (`h2-libctest-*`, `h2-ltp-*`), bounded by `--memory 2g --cpus 2` plus a
 busybox `timeout`, and its removal is verified after the run (repo test
 lifecycle rules).

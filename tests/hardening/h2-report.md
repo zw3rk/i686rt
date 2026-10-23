@@ -25,6 +25,52 @@ Raw result lines: `# RESULT libctest pass=125 fail=194 timeout=19 skip=5 total=3
 
 (# API api-compile compiled=78 of=79 main.exe=dynamic-only — the api suite is compile-time-only, see README.md; not part of the runtime totals.)
 
+## Two-mode measurement: default x87 (64-bit) vs --x87-80 (exact 80-bit)
+
+Campaign C11 measurement of SPEC decision D9's exact 80-bit x87 mode
+(no fix obligation): same runner, same bounds; the only knob is
+`H2_X87_80=1` (`i686rt --x87-80`).  Default numbers are cited
+from the committed log `results/libctest.tap`; 80-bit numbers from
+`results/libctest-x87_80.tap`.  Delta = 80-bit pass rate minus
+default pass rate, in percentage points; flips count per-suite tests
+passing in exactly one of the two logs (gained/lost by 80-bit).
+
+| suite | default pass/total (rate) | --x87-80 pass/total (rate) | delta | flips (80-bit gained/lost) |
+|---|---|---|---|---|
+| functional | 42/75 (56.0%) | 41/77 (53.2%) | -2.8 pp | 0/1 |
+| regression | 51/69 (73.9%) | 51/69 (73.9%) | +0.0 pp | 1/1 |
+| **math** | 32/199 (16.1%) | 30/199 (15.1%) | **-1.0 pp** | 20/22 |
+| api (compile-time) | 78/79 compiled | 78/79 compiled | n/a (oracle-side) | n/a |
+
+The **math** delta is the D9 signal: musl's math vectors demand exact
+80-bit x87 results (and fenv flags); functional/regression do not use
+x87 transcendentals and are recorded as measured, no threshold.
+The api suite is compile-time-only in the i386 oracle container and
+is translator- and mode-independent (listed for provenance).
+
+Source-tree note: default log libc-test @ a0c28c7673121dcb9305d1ea21aa5a42a5d9929d,
+80-bit log libc-test @ 7b95dfa5f5d5ca4d949221e0228ccc290bacc14e.
+Test-name drift (rows present in one log only; those suites' deltas
+mix tree drift with mode — math/regression carry the D9 signal):
+
+- functional: added-upstream: mntent wordexp
+
+80-bit run header:
+
+```
+date: 2026-10-23T13:32:31Z
+host: Darwin arm64
+i686rt: sha256=4665607bea58bbd178d27a76f7ad86fdb7d41daaf50d5fcf69ea1da65e57ec7f
+engine: interp   per-test-timeout: 30s   global-bound: 5400s
+x87: 80-bit exact mode (--x87-80; SPEC D9 measurement, H2_X87_80=1)
+containers: runtime alpine:3.20 linux/arm64, build alpine:3.20 linux/386 (gcc oracle)
+source: https://repo.or.cz/libc-test.git @ 7b95dfa5f5d5ca4d949221e0228ccc290bacc14e
+suites: functional, regression, math (static -static.exe binaries;
+wall: 250 s (run loop, excludes fetch/build)
+```
+
+Raw 80-bit log: `tests/hardening/results/libctest-x87_80.tap`.
+
 ## LTP 20240930 subset (static i386, oracle-built) — per directory
 
 | directory | pass | fail | timeout | skip | total | pass rate |
