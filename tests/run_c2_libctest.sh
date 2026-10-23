@@ -134,10 +134,24 @@ for t in $TESTS; do
         echo "  $t: build-fail"
         continue
     fi
+    # The container always exits 0 and reports the test's exit code via
+    # the C2RC= line: a container whose PID1 exits 137 (inner timeout
+    # killed the translator) leaves THIS docker client hanging on
+    # stream teardown (Docker Desktop), which a host-side `timeout`
+    # then punishes — in-container capture avoids the whole class.
+    # Verdict: C2RC=0 pass, 137 inner-timeout, anything else fail.
     c2_run "c2-test-$$-$name" "$((TEST_TIMEOUT + 90))" linux/arm64 2g 2 sh -c \
-        "cd /tmp && timeout -s KILL $TEST_TIMEOUT /w/_build/i686rt -- $bin" \
+        "cd /tmp && timeout -s KILL $TEST_TIMEOUT /w/_build/i686rt -- $bin >/tmp/c2.out 2>/tmp/c2.err; echo C2RC=\$?; cat /tmp/c2.out" \
         > "$BUILD/c2-cids/out.$name" 2> "$BUILD/c2-cids/err.$name" || rc=$?
     rc=${rc:-0}
+    c2_rc_line=$(grep -a '^C2RC=' "$BUILD/c2-cids/out.$name" 2>/dev/null | tail -n 1 | cut -d= -f2)
+    [ -n "$c2_rc_line" ] || c2_rc_line="$rc"
+    case "$c2_rc_line" in
+        137|124) rc=137 ;;
+        *) rc=$c2_rc_line ;;
+    esac
+    grep -av '^C2RC=' "$BUILD/c2-cids/out.$name" > "$BUILD/c2-cids/out.$name.clean" 2>/dev/null || true
+    mv "$BUILD/c2-cids/out.$name.clean" "$BUILD/c2-cids/out.$name"
     if [ "$rc" -eq 0 ]; then
         sum_p=$((sum_p + 1))
         printf 'ok %d - %s\n' "$i" "$t" >> "$TAP"
