@@ -277,20 +277,23 @@ long i686_sys_set_thread_area(i686_ctx_t *ctx, uint32_t ua)
     uint32_t slot;
     i686_segstate_t *st;
     i686_desc_t d;
-    uint16_t sel;
     uint8_t back[4];
 
     if (i686_copy_from_guest(ctx, ud, ua, sizeof(ud)) != 0) {
         return -EFAULT;
     }
     entry = le32(ud);
-    if (entry == 0xFFFFFFFFu) { /* -1: auto-allocate, kernel tls.c order */
-        for (slot = 0u; slot < (uint32_t)I686_GDT_TLS_SLOTS; slot++) {
-            if (ctx->gdt_tls_slots[slot] == 0u) {
+    if (entry == 0xFFFFFFFFu) { /* -1: auto-allocate, kernel tls.c order.
+                                 * Per-THREAD slots (RC7b T4b): glibc's
+                                 * TCB and wine's TEB each allocate from
+                                 * their own thread's three entries. */
+        for (slot = 0u; slot < 3u; slot++) {
+            i686_desc_t *ts = (i686_desc_t *)(void *)ctx->tls_desc[slot];
+            if ((ts->flags & I686_DESC_PRESENT) == 0u) {
                 break;
             }
         }
-        if (slot == (uint32_t)I686_GDT_TLS_SLOTS) {
+        if (slot == 3u) {
             return -ESRCH;
         }
     } else {
@@ -301,15 +304,18 @@ long i686_sys_set_thread_area(i686_ctx_t *ctx, uint32_t ua)
         slot = entry - (uint32_t)I686_GDT_TLS_FIRST;
     }
 
-    st = ldt_state(ctx);
-    if (st == NULL) {
-        return -ENOMEM;
-    }
     desc_from_user_desc(ud, &d);
-    st->gdt_tls[slot] = d;
-    st->gdt_used[slot] = (d.flags & I686_DESC_PRESENT) != 0u;
-    st->gen++;
-    ctx->gdt_tls_slots[slot] = st->gdt_used[slot] ? d.base : 0u;
+    {
+        i686_desc_t *ts = (i686_desc_t *)(void *)ctx->tls_desc[slot];
+
+        *ts = d; /* per-thread; kernel tls_array */
+    }
+    st = ldt_state(ctx);
+    if (st != NULL) {
+        st->gen++;
+    }
+    ctx->gdt_tls_slots[slot] =
+        (d.flags & I686_DESC_PRESENT) != 0u ? d.base : 0u;
 
     entry = (uint32_t)I686_GDT_TLS_FIRST + slot;
     store_le32(back, entry);
@@ -329,10 +335,9 @@ long i686_sys_set_thread_area(i686_ctx_t *ctx, uint32_t ua)
             (void)fprintf(stderr,
                           "STA tid=%d entry=%u base=%08x present=%u\n",
                           (int)syscall(SYS_gettid), entry, d.base,
-                          (unsigned)(st->gdt_used[slot] != 0u));
+                          (unsigned)((d.flags & I686_DESC_PRESENT) != 0u));
         }
     }
-    (void)sel;
     return 0;
 }
 
@@ -341,7 +346,6 @@ long i686_sys_get_thread_area(i686_ctx_t *ctx, uint32_t ua)
     uint8_t ud[16];
     uint32_t entry;
     uint32_t slot;
-    i686_segstate_t *st;
     i686_desc_t d;
 
     if (i686_copy_from_guest(ctx, ud, ua, sizeof(ud)) != 0) {
@@ -354,10 +358,15 @@ long i686_sys_get_thread_area(i686_ctx_t *ctx, uint32_t ua)
     }
     slot = entry - (uint32_t)I686_GDT_TLS_FIRST;
 
-    st = ldt_state(ctx);
-    if (st != NULL && st->gdt_used[slot]) {
-        d = st->gdt_tls[slot];
-    } else if (ctx->gdt_tls_slots[slot] != 0u) {
+    {
+        i686_desc_t *ts = (i686_desc_t *)(void *)ctx->tls_desc[slot];
+
+        if ((ts->flags & I686_DESC_PRESENT) != 0u) {
+            d = *ts;
+            goto have_desc;
+        }
+    }
+    if (ctx->gdt_tls_slots[slot] != 0u) {
         /* v1 handler installed a bare base (no segstate desc): report
          * the equivalent 32-bit RW data descriptor. */
         memset(&d, 0, sizeof(d));
@@ -370,6 +379,7 @@ long i686_sys_get_thread_area(i686_ctx_t *ctx, uint32_t ua)
     } else {
         memset(&d, 0, sizeof(d));
     }
+have_desc:;
 
     user_desc_from_desc(ud, &d); /* entry_number field preserved as passed */
     if (i686_copy_to_guest(ctx, ua + 4u, ud + 4u, 12u) != 0) {

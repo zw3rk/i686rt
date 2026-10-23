@@ -258,6 +258,13 @@ typedef struct i686_ctx {
      * across host threads; wine is threaded).  Extends the C-only tail. */
     uint32_t sig_last_frame_va; /* 0 = none pending */
     uint32_t sig_last_frame_rt;
+
+    /* Per-thread GDT TLS descriptors (kernel tls_array semantics,
+     * RC7b T4b escalation: entries 6..8 belong to the THREAD — dup'd on
+     * clone, reset on exec; wine's TEB and glibc's TCB each get their
+     * own slot state).  Raw i686_desc_t images (interp/seg.h shape);
+     * zero = free. */
+    uint8_t  tls_desc[3][16];
 } i686_ctx_t;
 
 /* ABI-locked offsets (src/trampoline.S, Phase 3, must agree). */

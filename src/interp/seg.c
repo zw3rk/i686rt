@@ -147,11 +147,23 @@ int i686_seg_lookup(const i686_ctx_t *ctx, uint16_t sel, i686_desc_t *out)
      * behaviour preserved exactly. */
     if (idx >= (uint32_t)I686_GDT_TLS_FIRST &&
         idx < (uint32_t)(I686_GDT_TLS_FIRST + I686_GDT_TLS_SLOTS)) {
-        uint32_t base = ctx->gdt_tls_slots[idx - (uint32_t)I686_GDT_TLS_FIRST];
-        if (base == 0u) {
+        uint32_t slot = idx - (uint32_t)I686_GDT_TLS_FIRST;
+        /* Per-thread descriptor first (kernel tls_array, RC7b T4b);
+         * fall back to the v1 bare-base for slots installed before
+         * the descriptor path existed. */
+        {
+            const i686_desc_t *ts =
+                (const i686_desc_t *)(const void *)ctx->tls_desc[slot];
+
+            if ((ts->flags & I686_DESC_PRESENT) != 0u) {
+                *out = *ts;
+                return SEG_F_OK;
+            }
+        }
+        if (ctx->gdt_tls_slots[slot] == 0u) {
             return SEG_F_NP; /* free TLS slot */
         }
-        out->base = base;
+        out->base = ctx->gdt_tls_slots[slot];
         out->limit = 0xFFFFFFFFu;
         out->type = 0x13u;
         out->dpl = 3u;
@@ -247,8 +259,9 @@ void i686_seg_exec_reset_tls(i686_ctx_t *ctx)
                                             : NULL;
     unsigned i;
 
-    for (i = 0U; i < (unsigned)I686_GDT_TLS_SLOTS; i++) {
+    for (i = 0U; i < 3U; i++) {
         ctx->gdt_tls_slots[i] = 0U;
+        memset(ctx->tls_desc[i], 0, sizeof(ctx->tls_desc[i]));
         if (st != NULL) {
             st->gdt_used[i] = false;
         }

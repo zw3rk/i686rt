@@ -76,6 +76,8 @@ MIRROR=https://deb.debian.org/debian
 WINE_POOL=pool/main/w/wine
 GLIBC_POOL=pool/main/g/glibc
 DASH_POOL=pool/main/d/dash
+GCC_POOL=pool/main/g/gcc-14
+ZLIBMW_POOL=pool/main/libz/libz-mingw-w64
 
 self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$self_dir/.." && pwd)
@@ -284,13 +286,28 @@ Debian i386 glibc is i686-optimized in libc6 itself)"
     [ -n "$dash_deb" ] || die "no dash_*_i386.deb in $DASH_POOL"
     info "dash: newest $dash_deb"
 
+    # T4b findings: user32.dll needs zlib1.dll (libz-mingw-w64) and the
+    # loader needs libgcc_s.so.1 (libgcc-s1) — qemu oracle-confirmed.
+    gcc_listing=$(http_get "$MIRROR/$GCC_POOL/") \
+        || die "cannot list $MIRROR/$GCC_POOL/"
+    libgcc_deb=$(deb_candidates "$gcc_listing" libgcc-s1 i386 | newest_deb)
+    [ -n "$libgcc_deb" ] || die "no libgcc-s1_*_i386.deb in $GCC_POOL"
+    info "libgcc-s1: newest $libgcc_deb"
+    zlibmw_listing=$(http_get "$MIRROR/$ZLIBMW_POOL/") \
+        || die "cannot list $MIRROR/$ZLIBMW_POOL/"
+    zlibmw_deb=$(deb_candidates "$zlibmw_listing" libz-mingw-w64 all | newest_deb)
+    [ -n "$zlibmw_deb" ] || die "no libz-mingw-w64_*_all.deb in $ZLIBMW_POOL"
+    info "libz-mingw-w64: newest $zlibmw_deb"
+
     # --- download everything before touching the tree --------------------
     w_entries=
-    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $dash_deb $w_pkgs; do
+    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $dash_deb $libgcc_deb $zlibmw_deb $w_pkgs; do
         case $w_deb in
         libc6-*) w_pool=$GLIBC_POOL ;;
         libc6_*) w_pool=$GLIBC_POOL ;;
         dash_*)  w_pool=$DASH_POOL ;;
+        libgcc-s1_*) w_pool=$GCC_POOL ;;
+        libz-mingw-w64_*) w_pool=$ZLIBMW_POOL ;;
         *)       w_pool=$WINE_POOL ;;
         esac
         fetch_deb "$MIRROR/$w_pool/$w_deb" "$w_deb"
@@ -300,7 +317,7 @@ Debian i386 glibc is i686-optimized in libc6 itself)"
     # --- fresh extraction, then fixups + stamp ---------------------------
     rm -rf "$sysroot"
     mkdir -p "$sysroot"
-    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $dash_deb $w_pkgs; do
+    for w_deb in $libc6_deb ${libc6i686_deb:-} $libwine_deb $dash_deb $libgcc_deb $zlibmw_deb $w_pkgs; do
         info "extracting $w_deb"
         extract_deb "$cache_dir/$w_deb"
     done
