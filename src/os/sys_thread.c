@@ -8,7 +8,9 @@
  * thread/sched class (tkill 238, tgkill 270, sched_getaffinity 242,
  * set_robust_list 311, get_robust_list 312) registers from this file
  * so the file-descriptor class keeps exclusive ownership of
- * sys_pass.c (DEFECTS.md C1a/C1b lane split).  Empty until C1b landed.
+ * sys_pass.c (DEFECTS.md C1a/C1b lane split).  C1b also registers the
+ * tid-namespace pair this family leans on: set_tid_address 258 and
+ * gettid 224 (see the handlers below).  Empty until C1b landed.
  *
  * Signal delivery model (fix-campaign C1b, C2 follows later): raising
  * on another guest thread only sets the target ctx's pending_signals
@@ -200,9 +202,17 @@ static long sys_set_tid_address(i686_ctx_t *ctx, uint32_t tidptr_va)
     return (long)i686_thread_registry_self_tid(ctx);
 }
 
+/* gettid(224) — no register arguments; returns the caller's own guest
+ * tid (the same value set_tid_address handed out).  Unregistered
+ * before C1b; guests address tkill/tgkill by it. */
+static long sys_gettid(i686_ctx_t *ctx)
+{
+    return (long)i686_thread_registry_self_tid(ctx);
+}
+
 /* Register-argument adapters: i386 int 0x80 args ride EBX, ECX, EDX,
- * ESI, EDI in order (verified against syscall_32.tbl rows 238, 242,
- * 270, 311, 312, 258). */
+ * ESI, EDI in order (verified against syscall_32.tbl rows 224, 238,
+ * 242, 258, 270, 311, 312; gettid takes none). */
 static int64_t r_tkill(i686_ctx_t *ctx)
 {
     return sys_tkill((int32_t)ctx->gpr[I686_REG_EBX],
@@ -241,9 +251,15 @@ static int64_t r_set_tid_address(i686_ctx_t *ctx)
     return sys_set_tid_address(ctx, ctx->gpr[I686_REG_EBX]);
 }
 
+static int64_t r_gettid(i686_ctx_t *ctx)
+{
+    return sys_gettid(ctx);
+}
+
 void i686_syscalls_thread_init(void)
 {
     i686_sys_register(I686__NR_set_tid_address, r_set_tid_address);
+    i686_sys_register(I686__NR_gettid, r_gettid);
     i686_sys_register(I686__NR_tkill, r_tkill);
     i686_sys_register(I686__NR_tgkill, r_tgkill);
     i686_sys_register(I686__NR_sched_getaffinity, r_sched_getaffinity);
