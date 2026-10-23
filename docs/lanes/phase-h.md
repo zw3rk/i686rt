@@ -163,3 +163,120 @@ master).  Thresholds for interpretation:
   get_robust_list 312, statx 383) go to the final report as the H2
   triage output.  pthread cancel/cond/robust timeouts (19) join the
   DBT-stall item as H-grade open work.
+
+## H3 card — CoreMark performance: interp vs dbt vs oracle
+
+Worktree `../i686rt-h3`, branch `lane/h-h3`.  Owned (exclusive):
+`tools/run-coremark.sh` (new), `tests/hardening/h3-coremark.md` (the
+report: scores table, environment, counters, machine line),
+`docs/lanes/phase-h.md` (this file).  Bounded: `Makefile` (one
+`h3-coremark` target mirroring the `h2-report` style).  No src/
+changes.  Accept (single chain, once): `tools/run-coremark.sh &&
+make h3-coremark` -> exit 0 with `h3-coremark.md` ending in
+`H3: interp=<score> dbt=<score> oracle=<score>`, all three scores from
+real bounded runs.  This is the MEASUREMENT lane: record honest numbers
++ the existing counters' readings; do NOT implement optimizations; a
+failing DBT is evidence, not a blocker.
+
+## H3 record (2026-10-23)
+
+Delivered, all in the owned file set:
+
+- `tools/run-coremark.sh` (POSIX sh, `set -eu`, difftest.sh header
+  style): fetches CoreMark v1.01 (GitHub mirror of the canonical tag
+  first, then eembc.org; bounded curl in a named arm64 container;
+  cached `_build/coremark-1.01.tar.gz`, sha256
+  `99c5a6d63af85a281b4e4d6ccb522c446653c435dfec9455ad73ef9e71f28bde`);
+  builds ONE static i386 binary in the docker linux/386 alpine:3.20 gcc
+  oracle container: `make PORT_DIR=linux compile XCFLAGS="-march=i686
+  -static -DPERFORMANCE_RUN=1 -DHAS_FLOAT=0"`; then runs the canonical
+  performance invocation `coremark.exe 0x0 0x0 0x66 <iters> 7 1 2000`
+  three times (sequential, each `timeout -s KILL 600`, `--memory 2g
+  --cpus 2`, named containers h3-coremark-{fetch,build,oracle,interp,
+  dbt} with removal verified): (a) oracle natively in the linux/386
+  container, (b) interp under `_build/i686rt` in the arm64 container,
+  (c) dbt under `I686RT_ENGINE=dbt`.  Iterations ride the port's
+  SEED_ARG command line, so one binary serves all three runs; per-run
+  counts only tune wall time (oracle 300000 / interp 30000 / dbt 9000,
+  from calibration rates: oracle in the card's 60-120 s window, each
+  engine run well inside the 600 s bound and far above CoreMark's 10 s
+  validity minimum).  Raw evidence + an env stamp land in
+  `tests/hardening/results/coremark-*.{log,err,txt}`; the `report`
+  subcommand (what `make h3-coremark` runs) assembles
+  `tests/hardening/h3-coremark.md` from them, idempotently.
+- `-DHAS_FLOAT=0` is a port knob that changes ONLY score printing
+  ("%f" -> "%d"; secs_ret double -> ee_u32; the "CoreMark 1.0 : ..."
+  banner is omitted, "Iterations/Sec" remains the metric).  The
+  workload — list, matrix incl. the float matmul, state machine — and
+  the CRC validation are unchanged; the standard 2K performance CRCs
+  (list 0xe714 / matrix 0x1fd7 / state 0x8e3a, seedcrc 0xe9f5) validate
+  on all three runs.  This knob exists because the default-port build
+  CANNOT finish under i686rt — see finding 1.
+- `tests/hardening/h3-coremark.md`: scores table (CoreMark score +
+  wall-derived precise iters/s + wall/rc + validation per engine),
+  environment, counters status, findings, repro, machine line.
+- `Makefile`: `h3-coremark` target (mirrors `h2-report`).
+
+### Official numbers (single chain, 2026-10-23T11:34Z, chain exit 0)
+
+| engine | iterations | CoreMark Iterations/Sec | precise (wall) | wall s | validation |
+|---|---|---|---|---|---|
+| interp (i686rt default) | 30000 | 71 | 71.5 | 419 | ok |
+| dbt (I686RT_ENGINE=dbt) | 9000 | 23 | 23.8 | 378 | ok |
+| oracle (linux/386 container) | 300000 | 5000 | 5000.0 | 60 | ok |
+
+    H3: interp=71 dbt=23 oracle=5000
+
+Environment: macOS arm64 Docker Desktop; i686rt `_build/i686rt` sha256
+`8c43655697e4f752944d32e16bde8457411cd6b710cf9b8d52d23a60c11b0dc1`
+(37-TU cross-musl build, only the documented pre-existing
+`sse_emit_prefetch` warning); gcc (Alpine 13.2.1_git20240309) 13.2.1
+20240309.  Counters: NOT OBSERVABLE — `stats_enabled` is never set by
+any flag or env var in the current tree (no `--stats`; `parse_args`
+rejects it), so main.c's stats line is unreachable, and
+`flags_elided`/`chain_hits` have no runtime readout at all (chain_hits
+is accumulated only in DBT trampoline registers).  Recorded honestly;
+the wiring work belongs to lanes that own src/.
+
+### Findings (measurement lane; not fixed here)
+
+1. INTERPRETER DECODE DEFECT (escalated to the coordinator;
+   DEFECTS.md is not lane-owned): the stock-port build
+   (-DHAS_FLOAT=1) dies under BOTH engines after completing all
+   iterations, in the final score PRINTING — musl's static printf
+   float formatter `fmt_fp` executes `DA E9` (FUCOMPP; then FNSTSW AX,
+   SAHF) and i686rt reports `interp: undecodable instruction at
+   eip=0x0804e76f (op:0)`.  The DA-page group row in
+   `src/x86/insn_tab.h` routes mod=3 reg=5 (DA E8+i FUCOMP family,
+   which is where FUCOMPP/DA E9 lives) to I686_OP_INVALID even though
+   the row comment claims "DA E9 FUCOMPP"; the registered `h_fucompp`
+   handler is unreachable.  dbt dies through the D2
+   interpret-one-then-resume exit at the same eip (0 DBTFALL lines —
+   the fall-back itself hits the interp hole).  Calibration evidence:
+   interp died at 28 s, dbt at 87 s, both with 2000/2000 iterations
+   done.  Any static-musl i386 binary that printf's a float will hit
+   this (alpine musl was built upstream; the caller's XCFLAGS do not
+   change libc.a).
+2. dbt is ~3x SLOWER than interp on CoreMark (23 vs 71 Iterations/
+   Sec).  These are the honest baseline numbers for the H-grade perf
+   work named in the card (dead-flag elimination, block linking); no
+   DBTFALL interpreter fallbacks occurred in the dbt run.
+3. The "oracle" is NOT qemu TCG: Docker Desktop on Apple Silicon runs
+   linux/386 containers with user-space x86 translation (Rosetta-class)
+   over an arm64 kernel (/proc/cpuinfo exposes the Apple ARM cpu;
+   observed 4170-5000 iter/s is 1-2 orders above qemu-TCG class).  The
+   card's "(qemu TCG)" assumption is corrected here; the number is
+   still a genuine timed oracle run, just a much stronger reference.
+   Rosetta timing is noisy on this host (3333 / ~4170 / 5000 across
+   three full invocations — treat the oracle as +/-25%; engine numbers
+   repeated within ~2%).
+
+### Acceptance chain
+
+    tools/run-coremark.sh && make h3-coremark
+
+Chain exit 0 on the second invocation (first invocation aborted the
+interp/dbt runs before any guest execution on a harness argument bug —
+the runner got no `--`-separated guest argv and exited rc=2 with its
+usage; harness fixed, attempt discarded, no numbers from it are
+reported).  Every container named, bounded, removal verified.
