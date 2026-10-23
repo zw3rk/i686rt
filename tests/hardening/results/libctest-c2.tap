@@ -1,0 +1,40 @@
+# run_c2_libctest.sh (fix-campaign C2) 2026-10-23T18:42:22Z
+# source: https://git.musl-libc.org/libc-test @ a0c28c7673121dcb9305d1ea21aa5a42a5d9929d
+# engine: interp  per-test-timeout: 30s
+not ok 1 - functional/clocale_mbfuncs
+# class=timeout
+not ok 2 - functional/crypt
+# class=timeout
+not ok 3 - functional/pthread_cancel
+# class=timeout
+ok 4 - functional/pthread_cond
+ok 5 - functional/pthread_robust
+not ok 6 - regression/pthread_once-deadlock
+# class=timeout
+not ok 7 - regression/raise-race
+# class=timeout
+not ok 8 - regression/tls_get_new-dtv
+# class=timeout
+not ok 9 - math/drem
+# class=timeout
+not ok 10 - math/dremf
+# class=timeout
+not ok 11 - math/fmod
+# class=timeout
+not ok 12 - math/fmodf
+# class=timeout
+not ok 13 - math/fmodl
+# class=timeout
+not ok 14 - math/remainder
+# class=timeout
+not ok 15 - math/remainderf
+# class=timeout
+not ok 16 - math/remainderl
+# class=timeout
+not ok 17 - math/remquo
+# class=timeout
+not ok 18 - math/remquof
+# class=timeout
+not ok 19 - math/remquol
+# class=timeout
+# RESULT libctest-c2 pass=2 fail=0 timeout=17 total=19

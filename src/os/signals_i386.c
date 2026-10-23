@@ -164,14 +164,47 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     sc.fpstate = fp_va;
     sc.cr2 = ctx->fault_addr;
 
-    /* siginfo bytes for the rt frame (frame+0x10..0x90). */
+    /* siginfo bytes for the rt frame (frame+0x10..0x90).  The handler
+     * return address ([frame]) is the SA_RESTORER trampoline when the
+     * guest registered one — the kernel uses it too.  The embedded
+     * on-stack retcode is only the no-restorer fallback: the window
+     * stack is rw-, so executing it would fault (musl libc-test found
+     * this — every musl sigaction carries SA_RESTORER).
+     *
+     * The blocked mask rides IN the frame (kernel semantics): the
+     * handler runs under sig_mask | sig | sa_mask and sigreturn
+     * restores it.  musl's SIGCANCEL handler depends on this — it
+     * edits uc_sigmask and re-raises itself so the signal stays masked
+     * until the next cancellation point; without the frame mask the
+     * pending re-raise delivered at a random pc. */
+    {
+        /* The frame carries the PRE-DELIVERY mask (the kernel saves
+         * current->blocked unmodified; the sig | sa_mask blocking is
+         * live task state for the handler's duration and sigreturn
+         * restores the frame's copy — that is how a handler's own
+         * uc_sigmask edit (musl's SIGCANCEL re-raise) survives). */
+        uint64_t pre = ctx->sig_mask;
+        uint64_t blocked = pre | (1ULL << (uint32_t)(sig - 1));
+
+        blocked |= ((uint64_t)ga->mask[1] << 32) | (uint64_t)ga->mask[0];
+        ctx->sig_mask = blocked;
+        if (sa_siginfo) {
+            /* uc_sigmask: ucontext@frame+0x90, +0x14 mcontext(88) -> +0x6c */
+            uint8_t m[8];
+            memcpy(m, &pre, sizeof(m));
+            memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 0x6c), m, sizeof(m));
+        } else {
+            sc.oldmask = (uint32_t)pre;
+        }
+    }
     if (sa_siginfo) {
         /* rt frame: sc lives in ucontext at frame+0x90+20 */
         memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 20), &sc, sizeof(sc));
         memcpy(i686_guest_ptr(ctx, frame_va + sizeof(i686_rt_sigframe_t) - 8),
                retcode_rt, 8);
         *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
-            frame_va + sizeof(i686_rt_sigframe_t) - 8;
+            ((ga->flags & SA_RESTORER_) != 0U) ? ga->restorer
+                : frame_va + sizeof(i686_rt_sigframe_t) - 8;
         *(uint32_t *)i686_guest_ptr(ctx, frame_va + 8) = frame_va + 0x10;
         *(uint32_t *)i686_guest_ptr(ctx, frame_va + 12) = frame_va + 0x90;
         {
@@ -191,7 +224,8 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
         memcpy(i686_guest_ptr(ctx, frame_va + sizeof(i686_sigframe_t) - 8),
                retcode_nonrt, 8);
         *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
-            frame_va + sizeof(i686_sigframe_t) - 8;
+            ((ga->flags & SA_RESTORER_) != 0U) ? ga->restorer
+                : frame_va + sizeof(i686_sigframe_t) - 8;
     }
 
     /* Kernel-contiguous handler entry (i386): esp = frame base;
@@ -220,7 +254,9 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
             (void)fprintf(stderr,
                           "SIG tid=%ld sig=%d trapno=%u eip=%08x cr2=%08x "
                           "esp=%08x frame=%08x gs=%04x/%08x ret=%08x "
-                          "sys=%08x tcb=%08x %08x %08x %08x\n",
+                          "sys=%08x tcb=%08x %08x %08x %08x\n"
+                          "SIGGPR ax=%08x bx=%08x cx=%08x dx=%08x "
+                          "si=%08x di=%08x bp=%08x\n",
                           syscall(SYS_gettid), sig, sc.trapno, sc.eip,
                           sc.cr2, ctx->gpr[I686_REG_ESP], frame_va,
                           ctx->seg_sel[I686_SEG_GS],
@@ -228,7 +264,9 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
                           *(const uint32_t *)(const void *)(tcbdump + 0),
                           *(const uint32_t *)(const void *)(tcbdump + 4),
                           *(const uint32_t *)(const void *)(tcbdump + 8),
-                          *(const uint32_t *)(const void *)(tcbdump + 12));
+                          *(const uint32_t *)(const void *)(tcbdump + 12),
+                          sc.eax, sc.ebx, sc.ecx, sc.edx, sc.esi, sc.edi,
+                          sc.ebp);
         }
     }
     ctx->gpr[I686_REG_ESP] = frame_va;
@@ -242,18 +280,45 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
 int i686_sigreturn(i686_ctx_t *ctx, int rt)
 {
     i686_sigcontext_t sc;
-    uint32_t base;
-    if (ctx->sig_last_frame_va == 0U ||
-        (!!rt) != (!!ctx->sig_last_frame_rt)) {
-        /* sigreturn outside our delivered frame: kernel behavior is a
-         * SIGSEGV; v1 restores nothing and reports EFAULT. */
-        ctx->sig_last_frame_va = 0U;
-        return -1;
+    uint32_t base, frame;
+    extern int i686_sigtrace_on(void);
+
+    /* The kernel locates the frame from the stack, not from bookkeeping
+     * (fs/signal.c): at the restorer's int 0x80 the SA_RESTORER of the
+     * guest has already consumed the frame header — musl/glibc's non-rt
+     * __restore pops the sig word (esp = frame + 8), the rt __restore_rt
+     * does not (esp = frame + 4; kernel rt_sigreturn computes sp - 4).
+     * Derived frames make NESTED delivery (the kernel delivers a second
+     * unmasked signal inside a running handler) unwind in the right
+     * LIFO order — a single recorded frame slot unwound the inner
+     * sigreturn and then failed the outer one with EFAULT (musl's
+     * __restore crash path).  The recorded frame stays as the fallback
+     * for a restorer that shifted esp. */
+    frame = ctx->gpr[I686_REG_ESP] - (rt ? 4U : 8U);
+    if (ctx->sig_last_frame_va != 0U && frame != ctx->sig_last_frame_va) {
+        frame = ctx->sig_last_frame_va;
     }
-    base = ctx->sig_last_frame_va + (rt ? (0x90U + 20U) : 8U);
     ctx->sig_last_frame_va = 0U;
+    base = frame + (rt ? (0x90U + 20U) : 8U);
     if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
         return -1;
+    }
+    if (i686_sigtrace_on()) {
+        (void)fprintf(stderr,
+                      "SIGRET rt=%d esp=%08x frame=%08x rec=%08x "
+                      "ax=%08x bp=%08x eip=%08x\n",
+                      rt, ctx->gpr[I686_REG_ESP], frame,
+                      ctx->sig_last_frame_va, sc.eax, sc.ebp, sc.eip);
+    }
+    /* Restore the blocked mask from the frame (the delivery blocked
+     * sig | sa_mask; the handler may have edited uc_sigmask — musl's
+     * SIGCANCEL re-raise relies on the edit surviving). */
+    if (rt) {
+        uint8_t m[8];
+        memcpy(m, i686_guest_ptr(ctx, frame + 0x90U + 0x6cU), sizeof(m));
+        memcpy(&ctx->sig_mask, m, sizeof(ctx->sig_mask));
+    } else {
+        ctx->sig_mask = (uint64_t)sc.oldmask;
     }
     ctx->gpr[I686_REG_EDI] = sc.edi; ctx->gpr[I686_REG_ESI] = sc.esi;
     ctx->gpr[I686_REG_EBP] = sc.ebp; ctx->gpr[I686_REG_ESP] = sc.esp;
@@ -354,32 +419,49 @@ int i686_deliver_sync(i686_ctx_t *ctx, int reason)
 }
 
 /* Deliver the lowest pending, unblocked signal at an interpreter safe
- * point.  Unblock check against the guest mask in sys_pass.c v1 store. */
+ * point.  Unblock check against the guest mask (ctx->sig_mask, the
+ * sys_rt_sigprocmask store).
+ *
+ * Kernel pending semantics (fix-campaign C1b handoff): a bit stays
+ * pending while MASKED and delivers when the mask is lifted — musl's
+ * raise() blocks all signals, tkills itself and restores, so the poll
+ * runs inside the blocked window and MUST NOT drop the bit.  The v1
+ * core wiped every pending bit after each poll, dropping exactly those
+ * raise() signals ("handler did not run").  Now only a bit that is
+ * actually delivered is cleared; blocked bits (and, for v1's lack of
+ * default-action machinery, unblocked SIG_DFL/SIG_IGN-disposition
+ * bits) survive the poll. */
 int i686_deliver_pending(i686_ctx_t *ctx)
 {
-    struct i686_gsigaction *ga;
-    int sig;
-    for (sig = 1; sig <= 64; sig++) {
-        if ((ctx->pending_signals & (1ULL << (sig - 1))) == 0ULL) {
-            continue;
+    uint64_t pend = ctx->pending_signals;
+    while (pend != 0ULL) {
+        uint64_t bit = pend & (~pend + 1ULL); /* lowest set bit */
+        struct i686_gsigaction *ga;
+        int sig = 1;
+        uint64_t scan;
+
+        pend ^= bit;
+        for (scan = bit; scan > 1ULL; scan >>= 1) {
+            sig++;
         }
         ga = i686_gsig_tab(sig);
         if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
+            if ((ctx->sig_mask & bit) == 0ULL) {
+                /* unblocked with no guest handler: v1 has no
+                 * default-action machinery; keep v1's drop semantics
+                 * so the bit cannot wedge the scan forever */
+                ctx->pending_signals &= ~bit;
+            }
             continue;
         }
-        {
-            extern uint64_t i686_sigmask_get(void);
-            if (i686_sigmask_get() & (1ULL << (sig - 1))) {
-                continue; /* blocked */
-            }
+        if ((ctx->sig_mask & bit) != 0ULL) {
+            continue; /* blocked: stays pending until unmasked */
         }
-        ctx->pending_signals &= ~(1ULL << (sig - 1));
+        ctx->pending_signals &= ~bit;
         ctx->exit_arg = 0; /* no trapno for async */
         return i686_sigframe_build(ctx, sig, ga->handler, ga->restorer,
                                    (ga->flags & 0x4U) ? 1 : 0, 0U, 0U);
     }
-    /* unhandled pending bits: drop them (v1) */
-    ctx->pending_signals = 0ULL;
     return -1;
 }
 
