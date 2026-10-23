@@ -58,4 +58,11 @@ void i686_threads_init(void);
 void i686_threads_main_init(i686_ctx_t *ctx);
 i686_ctx_t *i686_current_ctx(void);
 
+/* Fix-campaign C2/C10: kernel-shaped thread-exit teardown (robust-list
+ * walk, registry removal, cleartid clear + dual wake), run inside the
+ * exit syscall; idempotent.  i686_thread_is_main distinguishes the
+ * process's main thread (its SYS_exit stays a process exit). */
+void i686_thread_exit_teardown(i686_ctx_t *ctx);
+int  i686_thread_is_main(i686_ctx_t *ctx);
+
 #endif /* I686RT_OS_THREADS_H */

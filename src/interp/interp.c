@@ -100,6 +100,14 @@ int i686_fault_sig(void)
     return (int)s_fault_sig;
 }
 
+/* C3f: synthetic fault exits (h_muldiv's #DE) pin the channel the same
+ * way the host handler does, so deliver_sync classifies them by signal
+ * instead of by a stale ctx->exit_arg. */
+void i686_fault_sig_record(int sig)
+{
+    s_fault_sig = (sig_atomic_t)sig;
+}
+
 static void host_faults_install(void); /* fwd (below) */
 
 void i686_host_faults_install(void)

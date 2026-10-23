@@ -380,17 +380,35 @@ int i686_sigtrace_on(void)
 }
 
 /* Sync-fault delivery hook for the engine exit switch.
- * Map: FAULT(div-by-zero exit_arg==0) -> SIGFPE(8); FAULT(other) ->
- * SIGSEGV(11, cr2=fault_addr, trapno=14); TRAP -> SIGTRAP(5);
- * UNDEF -> SIGILL(4). Returns 0 when a guest handler was installed
- * (frame pushed, eip=handler), -1 otherwise. */
+ * Classification (C3f): a fault that rode the host-fault checkpoint
+ * carries its real host signal (i686_fault_sig) — SIGFPE -> 8,
+ * SIGILL -> 4, SIGSEGV/SIGBUS -> 11 — which no longer depends on
+ * possibly-stale ctx->exit_arg (the DBT writes exit_arg = 0 on every
+ * BRANCH exit, so a plain guest page fault used to arrive as an
+ * unhandleable divide error at a stale EIP).  Faults synthesized
+ * without a checkpoint (the interpreter's #DE) record their signal
+ * via i686_fault_sig_record; the exit_arg==0 convention survives only
+ * as the legacy fallback for unrecorded channels.
+ * TRAP -> SIGTRAP(5); UNDEF -> SIGILL(4). Returns 0 when a guest
+ * handler was installed (frame pushed, eip=handler), -1 otherwise. */
 int i686_deliver_sync(i686_ctx_t *ctx, int reason)
 {
     int sig;
+    extern int i686_fault_sig(void);
     switch (reason) {
-    case I686_EXIT_FAULT:
-        sig = (ctx->exit_arg == 0U) ? 8 : 11; /* div0 -> SIGFPE */
+    case I686_EXIT_FAULT: {
+        int hsig = i686_fault_sig();
+        if (hsig == 8 /*SIGFPE*/) {
+            sig = 8;
+        } else if (hsig == 4 /*SIGILL*/) {
+            sig = 4;
+        } else if (hsig == 11 /*SIGSEGV*/ || hsig == 7 /*SIGBUS*/) {
+            sig = 11;
+        } else {
+            sig = (ctx->exit_arg == 0U) ? 8 : 11; /* legacy convention */
+        }
         break;
+    }
     case I686_EXIT_TRAP: sig = 5; break;
     default:             sig = 4; break; /* SIGILL */
     }

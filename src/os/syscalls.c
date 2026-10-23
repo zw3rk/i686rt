@@ -42,6 +42,7 @@ long syscall(long, ...);
 #include "i686rt.h"
 #include "os/syscalls_i386.h"
 #include "os/marshal.h"
+#include "os/threads.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -200,7 +201,18 @@ static int64_t r_write(i686_ctx_t *ctx)
 static int64_t r_exit(i686_ctx_t *ctx)
 {
     /* Terminal: the engine loop stops via i686_syscall_is_exit(); the
-     * guest exit status rides back in EAX and our return value. */
+     * guest exit status rides back in EAX and our return value.
+     * C2/C10: for a CLONED thread this syscall IS the thread's do_exit
+     * — the kernel-shaped teardown (robust walk, cleartid clear + wake)
+     * completes HERE, inside the dying thread's last syscall.  musl's
+     * exit path wakes the joiner in guest code before SYS_enter, so any
+     * teardown the thread performs after this syscall returns can write
+     * into the stack range the woken joiner already munmapped and
+     * re-mapped (the C2 rt32 stack-overlap defect).  The main thread's
+     * SYS_exit stays a plain process exit. */
+    if (!i686_thread_is_main(ctx)) {
+        i686_thread_exit_teardown(ctx);
+    }
     return (int64_t)(int32_t)ctx->gpr[I686_REG_EBX];
 }
 

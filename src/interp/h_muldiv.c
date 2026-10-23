@@ -92,11 +92,16 @@ static void md_set_cf_of(i686_ctx_t *ctx, int set)
 }
 
 /* Divide error: #DE → SIGFPE.  Phase 4 synthesizes the guest signal from
- * exit_reason/exit_arg; nothing else is modified here. */
+ * exit_reason/exit_arg; nothing else is modified here.  C3f: the record
+ * pins the checkpoint channel to SIGFPE — deliver_sync classifies by the
+ * recorded host signal first, and a stale SIGSEGV from an earlier handled
+ * fault would otherwise misroute this synthetic #DE. */
 static int md_divide_fault(i686_ctx_t *ctx)
 {
+    extern void i686_fault_sig_record(int sig);
     ctx->exit_reason = I686_EXIT_FAULT;
     ctx->exit_arg = 0U;
+    i686_fault_sig_record(8); /* SIGFPE */
     return I686_EXIT_FAULT;
 }
 

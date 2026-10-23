@@ -466,6 +466,9 @@ dispatch:
             return i686_interp_run(ctx);
         }
         ctx->exit_reason = I686_EXIT_NONE;
+        ctx->exit_arg = 0U; /* C3f: a stale arg must not classify a
+                             * checkpoint fault (deliver_sync's legacy
+                             * fallback reads it) */
         if (s_trace_blocks) {
             (void)fprintf(stderr, "B %08x\n", ctx->eip);
         }

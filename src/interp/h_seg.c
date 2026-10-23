@@ -143,14 +143,19 @@ static uint32_t stack_pop(i686_ctx_t *ctx, unsigned width)
 
 /* Fault mapping SEG_* -> trapno; error code (selector bits) rides
  * exit_dest for the S7 delivery wiring.  EIP is NOT advanced: the fault
- * is resumable at the faulting instruction (E09). */
+ * is resumable at the faulting instruction (E09).  C3f: the fault rides
+ * no checkpoint, so it records its channel — deliver_sync classifies by
+ * the recorded host signal first, and a stale value from an earlier
+ * handled fault would misroute these exits. */
 static int seg_fault(i686_ctx_t *ctx, int f, uint16_t sel)
 {
+    extern void i686_fault_sig_record(int sig);
     switch (f) {
     case SEG_F_NP: ctx->exit_arg = 11u; break; /* #NP */
     case SEG_F_SS: ctx->exit_arg = 12u; break; /* #SS */
     default:          ctx->exit_arg = 13u; break; /* #GP */
     }
+    i686_fault_sig_record(11); /* SIGSEGV */
     ctx->exit_dest = sel;
     ctx->fault_addr = 0u;
     return I686_EXIT_FAULT;

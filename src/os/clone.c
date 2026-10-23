@@ -98,6 +98,17 @@ void i686_thread_registry_main(i686_ctx_t *ctx)
     (void)pthread_mutex_unlock(&s_registry_lock);
 }
 
+/* r_exit runs the thread-exit teardown only for cloned threads; the
+ * main thread's SYS_exit stays a process exit. */
+int i686_thread_is_main(i686_ctx_t *ctx);
+int i686_thread_is_main(i686_ctx_t *ctx)
+{
+    (void)pthread_mutex_lock(&s_registry_lock);
+    int is_main = (s_main_ctx == ctx);
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    return is_main;
+}
+
 void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid);
 void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
 {
@@ -418,9 +429,34 @@ static void *thread_entry(void *arg)
             (void)i686_interp_run(ctx);
         }
     }
-    /* Robust-list recovery BEFORE the exit cleartid, in kernel do_exit
-     * order: a waiter woken EOWNERDEAD may join behind us, and the
-     * cleartid is the join-release event. */
+    /* Normally the exit syscall ran the teardown already (see
+     * i686_thread_exit_teardown — kernel do_exit completes it inside
+     * the dying thread's last syscall, before the guest-side joiner
+     * wake can free the stack); the guard keeps this tail idempotent
+     * for exits that skip the syscall path.  After the teardown the
+     * thread must touch NO guest memory: musl's exit wakes the joiner
+     * in guest code BEFORE SYS_exit, and every guest write past that
+     * point lands in the recycled range (the C2 rt32 stack-overlap
+     * defect). */
+    i686_thread_exit_teardown(ctx);
+    return NULL;
+}
+
+/* Kernel do_exit tail for a guest thread, run at the exit syscall (see
+ * r_exit): robust-list recovery BEFORE the exit cleartid, in kernel
+ * do_exit order — a waiter woken EOWNERDEAD may join behind us, and the
+ * cleartid is the join-release event.  Once this returns, the dying
+ * thread must never write guest memory again. */
+void i686_thread_exit_teardown(i686_ctx_t *ctx)
+{
+    static __thread int s_done;
+    uint32_t tid;
+
+    if (s_done != 0) {
+        return;
+    }
+    s_done = 1;
+    tid = (uint32_t)syscall(SYS_gettid);
     robust_exit_walk(ctx, tid);
     /* CLONE_CHILD_CLEARTID: clear the tid word and futex-wake it
      * (kernel exit_mm/exit_notify behavior).  The registry entry is
@@ -448,7 +484,6 @@ static void *thread_entry(void *arg)
         }
         ctx->clear_child_tid = 0U;
     }
-    return NULL;
 }
 
 /* CLONE_SETTLS: kernel copy_thread semantics — the descriptor lives in
