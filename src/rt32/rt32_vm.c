@@ -69,13 +69,13 @@ static int vm_reserve_prot_none(i686_ctx_t *ctx, uint32_t start, uint32_t len)
     return 0;
 }
 
+/* Translation-cache invalidation on guest mm ops (D11 SMC): real since
+ * Phase H H1; the interpreter has no code cache (the call is cheap). */
+extern void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start,
+                                      uint32_t end);
 static inline void vm_invalidate_jit(i686_ctx_t *ctx, uint32_t start, uint32_t end)
 {
-    /* Translation-cache invalidation is a DBT (Phase 3) concern; the interpreter
-     * has no code cache, so this is a no-op until src/dbt/ hooks in. */
-    (void)ctx;
-    (void)start;
-    (void)end;
+    i686_dbt_invalidate_range(ctx, start, end);
 }
 
 static void vm_sync_from_ctx(i686_ctx_t *ctx)

@@ -37,6 +37,15 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
 {
     (void)uc_;
     sigjmp_buf *jb = s_fault_jmp;
+    if (sig == SIGSEGV && si->si_code == SEGV_ACCERR) {
+        /* D11 SMC: a write to a DBT code-protected window page.  The
+         * engine drops the page's blocks and restores RW; returning
+         * re-executes the store. */
+        extern int i686_dbt_smc_write_fault(uint64_t host_addr);
+        if (i686_dbt_smc_write_fault((uint64_t)(uintptr_t)si->si_addr)) {
+            return;
+        }
+    }
     if (s_in_run && jb != NULL) {
         s_fault_jmp = NULL; /* disarm: a nested fault must not re-jump */
         s_fault_addr = (uint64_t)(uintptr_t)si->si_addr;
@@ -44,6 +53,61 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
         siglongjmp(*jb, 1);
     }
     _exit(128 + sig);
+}
+
+void i686_host_faults_install(void); /* engine.c uses the same checkpoint */
+
+void i686_fault_arm(sigjmp_buf *jb)
+{
+    s_fault_jmp = jb;
+    s_in_run = 1;
+}
+
+void i686_diag_fault(i686_ctx_t *ctx)
+{
+    (void)fprintf(stderr,
+                  "i686rt: dbt: guest fault (host) pid=%d at eip=0x%08x, "
+                  "fault_addr=0x%08x\n",
+                  (int)getpid(), ctx->eip, ctx->fault_addr);
+    if (ctx->region_count > 0U) {
+        size_t i;
+        for (i = 0U; i < ctx->region_count; i++) {
+            const i686_region_t *rg = &ctx->regions[i];
+            (void)fprintf(stderr, "MAP %08x-%08x %c%c%c %s\n",
+                          rg->start, rg->end,
+                          (rg->prot & 0x1U) ? 'r' : '-',
+                          (rg->prot & 0x2U) ? 'w' : '-',
+                          (rg->prot & 0x4U) ? 'x' : '-',
+                          rg->name[0] != '\0' ? rg->name : "");
+        }
+    }
+}
+
+void i686_fault_disarm(void)
+{
+    s_fault_jmp = NULL;
+}
+
+uint64_t i686_fault_addr(void)
+{
+    return s_fault_addr;
+}
+
+int i686_fault_sig(void)
+{
+    return (int)s_fault_sig;
+}
+
+static void host_faults_install(void); /* fwd (below) */
+
+void i686_host_faults_install(void)
+{
+    /* idempotent wrap for the DBT engine loop (H1). */
+    static int s_installed;
+    if (!s_installed) {
+        s_installed = 1;
+        host_faults_install();
+    }
 }
 
 static void host_faults_install(void)
