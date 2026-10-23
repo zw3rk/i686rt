@@ -489,6 +489,20 @@ Method (coordinator's direction):
 3. Iterate on the individual timeout tests from the libc-test tree
    (build once, run per-test) — dev evidence.
 
+C1b handoff (2026-10-23, verified evidence — fold into step 1/2):
+musl 1.2.5 raise() = rt_sigprocmask(SIG_BLOCK,all) -> tkill -> restore,
+and i686_deliver_pending (src/os/signals_i386.c, tail) wipes ALL
+pending bits after the single poll, so a signal raised inside the
+blocked window is dropped before the mask restores ("handler did not
+run"; SYSTRACE: 258->1000, 174->0, block 175->0, tkill(1000,10)->0,
+restore 175->0).  Kernel semantics: bits stay pending while masked
+and deliver at unmask.  Fix belongs in the delivery core (drop only
+the bits actually delivered/popped; keep the rest), plus the
+blocked-target wake problem below.  glibc raise()->tgkill works with
+C1b as landed (no mask window).  C1b also superseded set_tid_address
+(258, returns caller tid) and added gettid(224) via the sys_thread.c
+seam — the D31 behavior note is thereby fixed on master.
+
 Acceptance check (run ONCE, on your worktree): the 19 named tests
 re-run with the per-test bound; record pass/fail/timeout per test.  A
 test that still times out MUST come with your root-cause paragraph
