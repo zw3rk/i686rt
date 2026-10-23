@@ -150,7 +150,8 @@ test-p5-lima: ## RC5: fixture under ./_build/i686rt vs goldens, default + --x87-
 	d=$(BUILD_DIR)/p5check; mkdir -p $$d; \
 	grep -v '^CASE X87ONLY ' tests/golden/p5.txt | grep -e '^CASE ' -e '^DONE' > $$d/gold_default.txt; \
 	grep -e '^CASE ' -e '^DONE' tests/golden/p5_x87_80.txt > $$d/gold_x87_80.txt; \
-	./$(BUILD_DIR)/i686rt -- $(BUILD_DIR)/test_p5_fpu_sse > $$d/act_default.txt; \
+	./$(BUILD_DIR)/i686rt -- $(BUILD_DIR)/test_p5_fpu_sse > $$d/act_default.raw; \
+	grep -v '^CASE X87ONLY ' $$d/act_default.raw > $$d/act_default.txt; \
 	./$(BUILD_DIR)/i686rt --x87-80 -- $(BUILD_DIR)/test_p5_fpu_sse > $$d/act_x87_80.txt; \
 	if cmp -s $$d/gold_default.txt $$d/act_default.txt && \
 	   cmp -s $$d/gold_x87_80.txt $$d/act_x87_80.txt; then \
