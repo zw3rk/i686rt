@@ -242,3 +242,33 @@ Still open (not experiment-shaped):
 ## 6. Unverified items (all resolved at RC-E, rev 3 — each maps to its experiment)
 - hl a32rt integration (flake input, `src/a32.c`, `/dev/a32host`) not on public hl master `8048a96`; A32RT.md cites hl `d76cd75`, absent upstream. (Not an experiment: ask Moritz for the branch; Phase 6 blocked on it.)
 - RosettaLinux on ELFCLASS32 → E03: rejects pre-translation, exact behaviour recorded. i386 TASK_SIZE → E04: 0xFFFFE000 (+ADDR_LIMIT_3GB). `_fpstate` magic → E05: MAGIC1 0x46505853 in sw_reserved on every fxsr frame, MAGIC2 0x46505845 xsave-only, u16 magic 0x0000 never checked. nixpkgs i686 cross attrs → E06: `pkgsCross.musl32`/`gnu32`, never `pkgsi686Linux`. glibc SYSINFO offset + vDSO versions → E07: `%gs:0x10`, `LINUX_2.5`+`LINUX_2.6`. FEX/Box86 TSO policies → E08: static vs opt-in; D5 revised. Apple HW TSO under HVF → E01: settable, sticks. ia32_emulation=0 compat CS → E02: CS kept, entry blocked. Wine LDT usage → E09: func 0x11 + `set_thread_area(-1)` only. vm86 feasibility → E10: PASS, pure guest-state emulation, IRQ stubs.
+
+## 7. Open questions (final report, 2026-10-23)
+
+All phase gates RC-E, RC0–RC8 (incl. RC6/RC7/RC7b) and H1–H4 passed
+once; docs/FINAL-REPORT.md is the campaign record.  Items left open:
+
+1. x87_80 round_pack80 zeroes ext80 results below half the min
+   subnormal under ALL RC modes; IEEE-correct toward-infinity would
+   take 1 ulp for the matching sign (RC5; untested by any fixture).
+2. hl materialises guest_env before translator finalize's setenv —
+   the same ordering gap breaks a32's A32RT_WINDOW hint upstream
+   (a32rt masks it with its scan fallback); RC6 worked around it in
+   the i686 launch branch (local hl branch lane/6-l6a).
+3. The wine chain stalls under I686RT_ENGINE=dbt (RC7b); H1 found the
+   DBT engine never installed the host-fault handler (window faults
+   killed the process) and fixed it — a re-run of the wine chain
+   under dbt is outstanding.
+4. winevdm prints three "winedevice.exe is a DOS application" stderr
+   lines during wineboot (stdout/rc clean; the oracle is silent) —
+   launch-vs-slow-copy overlap, not a syscall divergence.
+5. H2 triage: _llseek(140), readv(145), msync(144), ftruncate64(194),
+   tkill(238), sched_getaffinity(242), get_robust_list(312),
+   statx(383) unimplemented (the LTP framework dies in setup on the
+   first two); 19 pthread cancel/cond/robust timeouts
+   (deadlock/livelock class).
+6. H3 baseline: the DBT is ~3× slower than the -Os interpreter on
+   CoreMark (71 vs 23 iter/s; oracle 5000 ±25% Rosetta-class) — the
+   dead-flag-elimination and block-linking work named in H3.
+7. H1 residual: SMC-invalidated blocks are dead-marked (never freed
+   mid-flight); reclamation rides the direct-mapped eviction.
