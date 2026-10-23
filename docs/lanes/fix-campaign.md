@@ -356,3 +356,171 @@ functional/regression must not regress (they don't use x87 transcendentals,
 but record whatever you measure — measurement card, no threshold).
 
 Escalate if: making the knob touches other tools' files.
+
+---
+
+# Wave 2 cards (dispatched after Wave 1 merges; branch from merged master)
+
+## Card L-C6a — dead-flag elimination (FROZEN contract)
+
+The seam `i686_emit_ctx_t.flags_src` (src/dbt/emit.h) is frozen on
+master BEFORE you branch: I686_FLAGS_DEAD / I686_FLAGS_EFLAGS /
+I686_FLAGS_NZCV with the semantics in that comment.  You own
+src/dbt/emit_alu.c, src/dbt/emit_branch.c, src/dbt/emit_sse.c,
+src/dbt/flags_dbt.c — NOT emit.h, NOT translate.c, NOT engine.c.
+
+Task:
+1. Producers: the fused ALU ops (emit_alu.c ADD/SUB/CMP/AND/OR/XOR/TEST
+   via SUBS/ANDS + emit_lazy) set `e->flags_src = I686_FLAGS_NZCV`;
+   eager-eflags producers (IMUL/shift class that write ctx->eflags
+   directly and store lazy_op = NONE) set I686_FLAGS_EFLAGS; anything
+   that can invalidate NZCV (a blr through the helper, an exit, an
+   UNDEF-declined insn mid-block — the block ends there anyway) leaves
+   DEAD or is unreachable.
+2. Consumers (jcc/jcc-rel/setcc/cmovcc in emit_branch.c; COMISS/COMISD/
+   UCOMISS/UCOMISD class in emit_sse.c): switch on e->flags_src.
+   NZCV -> emit ONLY the cond-map consume (l3c_cond_map path) and bump
+   ctx->flags_elided by 1 (uint64; add a _Static_assert for its
+   offsetof in i686rt.h and use it in the asm increment; a consumer
+   that TOOK the NZCV path may leave flags_src = NZCV for the next
+   consumer only if NZCV still holds that image — setcc/cmovcc do not
+   disturb NZCV, so yes).  EFLAGS -> rebuild NZCV from ctx->eflags
+   WITHOUT the park/sync helper (the w9 mask build + msr).  DEAD ->
+   today's full l3c sequence unchanged.
+3. PF (parity) conditions still decline (return -1) — unchanged.
+4. ctx->flags_elided is diagnostics: I686RT_STATS=1 readout already
+   prints counters — verify it appears (see H3 record), no new report.
+
+Correctness floor (dev iteration, not the acceptance): tools/difftest.sh
+on test_p1_isa (interp-vs-dbt (eip,op,len) trace EQUAL) and the p5
+golden check used at RC5 (0 diff, both modes).  Run difftest as often
+as you like; goldens once at the end.
+
+Acceptance check (run ONCE): difftest EQUAL on test_p1_isa AND busybox
+echo smoke under dbt AND test_p5_fpu_sse vs goldens 0-diff both modes —
+one pass, recorded verbatim.  (CoreMark speed measurement is C6b's
+acceptance, not yours.)
+
+## Card L-C6b — block linking via IBTC slots (FROZEN contract;
+SEQUENTIAL after C6a merges — you share emit/engine files)
+
+Frozen constants (all ABI-locked, static-asserted in i686rt.h):
+exit_reason @0x78 (I686_EXIT_BRANCH == 1), exit_dest @0x84, eip @0x20,
+ibtc[] @0x9e8, entry stride 32 {key@0, epoch@4, host_code@8, entry@16},
+hash = (eip >> 2) & 1023, ibtc_hits @0x1d0 (uint64), gpr[8] @0x0.
+You own src/dbt/engine.c and src/trampoline.S.  NOT translate.c,
+NOT emit_*.c.  The C7 graveyard drain (already merged) sits at the
+loop top — keep its call site and order untouched.
+
+Task:
+1. engine.c `dbt_get_or_compile`: after a successful translate+install,
+   fill the slot: `ctx->ibtc[i686_ibtc_hash(eip)] = (i686_ibtc_entry_t)
+   { .key = eip, .epoch = 1U, .host_code = code, .entry = code }`.
+   Dead-marked slots (eip == 0xFFFFFFFFU) are never refilled except by
+   a fresh successful compile (the eviction path already handles it).
+2. trampoline.S: turn the single-shot body into a dispatch loop.
+   After `blr x23` and the GPR store-back:
+   - ldr w8, [x19, #120]; cmp w8, #1 (I686_EXIT_BRANCH); b.ne -> exit
+     to the C epilogue as today.
+   - ldr w9, [x19, #132] (exit_dest); idx = w9 >> 2, and #1023;
+     slot = x19 + 0x9e8 + idx*32.
+   - ldr w10, [slot]; cmp w10, w9; b.ne -> C epilogue.
+   - ldr x11, [slot, #8] (host_code); cbz x11 -> C epilogue.
+   - x23 = x11; reload GPRs from ctx (4x ldp); bump ibtc_hits
+     (ldr/add/str x12); blr x23; branch back to the GPR store-back.
+   Keep the existing prologue/epilogue framing exactly (callee-save
+   d8-d15, x19-x28).  cur_entry/epoch_ptr (x21/x22) stay unused.
+3. Add C-side _Static_asserts in engine.c pinning what the asm
+   assumes: I686_EXIT_BRANCH == 1, offsetof(ibtc) == 2536, sizeof entry
+   == 32, offsetof(exit_reason) == 120, offsetof(exit_dest) == 132.
+
+Safety argument (include in your commit message): the chain decision
+reads ctx->ibtc only between blocks (no emitted block on the host
+stack); every invalidation path (i686_dbt_invalidate_range, SMC fault,
+flush_all) clears keys/entries BEFORE the next dispatch, so a cleared
+or collided slot falls back to the C engine loop, which recompiles.
+
+Acceptance check (run ONCE): `tools/run-coremark.sh` full chain — new
+H3 line with dbt strictly ABOVE interp (71 iter/s) and the standard 2K
+CRCs validating; append/refresh the H3 record table.  If dbt lands at
+or below interp after profiling: STOP, do not iterate on benchmarks —
+write up where the time goes (I686RT_STATS=1 block/ibtc counters) and
+escalate for the re-scope decision.
+
+## Card L-C2 — pthread cancel/cond/robust/once timeouts
+
+Prerequisite: L-C1b merged (tkill/tgkill/robust-list acceptance stored
+in ctx).  Start from merged master.  You own src/os/sys_pass.c (futex),
+src/os/sys_thread.c, src/os/clone.c, tests/ fixtures you add.  h_sse.c/
+interp files are off-limits.
+
+Evidence base: the 19 timeout tests are listed per-suite in
+tests/hardening/results/libctest.tap (timeout= counts; the H2 record in
+tests/hardening/h2-report.md names the cluster).  T4d already fixed the
+base WAIT/WAKE/REQUEUE/CMP_REQUEUE + BITSET ABI; the PI family
+(LOCK_PI 6, UNLOCK_PI 7, TRYLOCK_PI 8, WAIT_REQUEUE_PI 9? — check the
+linux futex_op values, WAIT_REQUEUE_PI 11, REQUEUE_PI 13,
+CMP_REQUEUE_PI 14) is unverified, robust-list processing at thread exit
+is not implemented (C1b only stores), and cancellation delivery needs a
+runnable-target wake (pending bit set by tkill/tgkill from another
+guest thread; a futex-blocked target never polls).
+
+Method (coordinator's direction):
+1. Dual-oracle fixtures first (tools/probe_strfuncs style): a static
+   i386 musl fixture per semantic area — (a) futex PI family vs the
+   host kernel's return values/timeouts (docker 386 runs the SAME
+   fixture natively as the oracle), (b) robust-list walk on thread
+   exit (muslpthread exit with a held robust mutex: oracle = the lock
+   word gets FUTEX_OWNER_DIED | TID cleared and a FUTEX_WAKE issued),
+   (c) pthread_cancel join (SIGRTMIN-order signal via tgkill to a
+   running and to a futex-blocked target).  Bound everything.
+2. Fix what the fixtures prove broken, in your files: sys_futex PI
+   commands (host futex supports PI natively — map the uaddr 1:1 as
+   T4d does and pass through, re-encoding op exactly like the T4d
+   re-encode does for the base family), robust-list walk in the thread
+   exit path (clone.c), and for cancellation: a waker that marks
+   pending AND wakes a host-futex-blocked target (a host tgkill with a
+   dedicated SIGUSR-class signal whose handler only interrupts the
+   futex, if pending-bit polling proves insufficient — coordinate with
+   the host-fault checkpoint install; the interp arms/disarms the
+   SIGSEGV handler and a second host signal must not fight it — if it
+   does, STOP and escalate the design question instead of hacking the
+   fault path).
+3. Iterate on the individual timeout tests from the libc-test tree
+   (build once, run per-test) — dev evidence.
+
+Acceptance check (run ONCE, on your worktree): the 19 named tests
+re-run with the per-test bound; record pass/fail/timeout per test.  A
+test that still times out MUST come with your root-cause paragraph
+(that is the DEFECTS.md note format).  Also run the futex PI
+unit-vs-host fixture once (the card's new pin): same results as the
+host oracle.
+
+## Card L-C12 — quarantine-stash reconciliation + D-series re-read
+
+Read-mostly hygiene card, dispatched last (after C2/C6 settle the
+tree).  Worktree ../i686rt-c12, branch lane/fix-c12.  You may edit
+DEFECTS.md and docs/lanes/fix-c12-*.md ONLY — any code port goes
+through the coordinator first.
+
+Tasks:
+1. `git stash list` on master shows quarantine and quarantine-2 (the
+   Phase-5 lane-leak quarantines).  Diff each against current master:
+   every hunk is either (a) already on master (superseded), (b) a
+   still-valid comment correction matching a DEFECTS.md D-entry, or
+   (c) obsolete.  Produce the disposition table in
+   docs/lanes/fix-c12-stashes.md.  Port candidates (b) as a patch file
+   in your report — do NOT touch src/ yourself.
+2. Re-read every OPEN correctness D-entry (D13, D14, D25, D26, D27,
+   D28, D31, D34, D37, D39, D41, D43, D47, D51, D52, D53, D57-D64,
+   D65-D73 on the lane branches only — check which are on master) and
+   mark in docs/lanes/fix-c12-dseries.md: FIXED-on-master (cite the
+   commit), STILL-LIVE (the defect's code unchanged on master), or
+   MOOT (the code path is gone/different).  Verify by reading the
+   current master file, not the D-entry's cited commit.
+3. Hand both documents to the coordinator (final message).  Stash drops
+   and any src/ ports happen by the coordinator after review — not you.
+
+Acceptance check (run ONCE): the two disposition documents complete
+(every stash hunk and every D-entry classified), committed on your
+branch.  No docker needed except none — this is a reading card.

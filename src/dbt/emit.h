@@ -40,6 +40,30 @@ typedef struct i686_emit_ctx {
                                    must use LDAPR/STLR class (or LDAR/STLR
                                    base) when true */
     bool           block_open;  /* epilogue emitted yet? */
+    /* C6a dead-flag-elimination seam (frozen, fix campaign): what a
+     * flag consumer emitted LATER IN THIS BLOCK may rely on.  ZERO is
+     * the memset default and the conservative value.
+     *   I686_FLAGS_DEAD   nothing: consumer emits the full sequence
+     *                     (park GPRs, blr i686_dbt_flags_sync so any
+     *                     pending interpreter descriptor materializes,
+     *                     reload, rebuild NZCV from ctx->eflags).
+     *   I686_FLAGS_EFLAGS ctx->eflags is architecturally current
+     *                     (eager producer ran: shifts/IMUL class, or a
+     *                     consumer already materialized): consumer
+     *                     rebuilds NZCV WITHOUT the helper call.
+     *   I686_FLAGS_NZCV   the last fused ALU op left the architectural
+     *                     flags live in A64 NZCV: consumer emits only
+     *                     the cond-map consume (the fusion), bumps
+     *                     ctx->flags_elided.
+     * Producers (fused ALU ops, eager-eflags ops, the sync path itself)
+     * maintain this field; when unsure, downgrade — DEAD is always
+     * correct.  Block exits require nothing (the ctx descriptor is the
+     * architectural state, exactly like the interpreter). */
+    enum {
+        I686_FLAGS_DEAD = 0,
+        I686_FLAGS_EFLAGS = 1,
+        I686_FLAGS_NZCV = 2
+    } flags_src;
 } i686_emit_ctx_t;
 
 /* Lifecycle (translate.c owns; frozen for lanes). */
