@@ -47,14 +47,138 @@ static void make_key(void)
     (void)pthread_key_create(&s_ctx_key, NULL);
 }
 
+/* ---- guest tid registry (fix-campaign C1b) ----------------------------
+ * tkill(238)/tgkill(270)/get_robust_list(312) route by guest tid, so a
+ * tid -> ctx table lives next to the tid allocation in r_clone.  The
+ * main ctx is found under its live process pid (the kernel main-thread
+ * tid == pid convention, and the same value sys_getpid reports:
+ * host_tid when a fork child, else the flat-model 1000); clone(2)
+ * threads register under their synthetic tids.  Cross-thread signal
+ * delivery means one host thread can lookup while another registers,
+ * so the table is mutex-protected.  Entries of exited threads are
+ * removed before the exit cleartid, so tkill to a dead tid reports
+ * -ESRCH like the kernel.  Contexts are never freed in v1 (heap ctx
+ * per thread, existing behavior), so a pointer handed out by
+ * i686_thread_registry_find stays valid for the process lifetime.
+ */
+#define I686_THREAD_REGISTRY_MAX 64U
+
+static struct {
+    uint32_t    tid;
+    i686_ctx_t *ctx;
+} s_registry[I686_THREAD_REGISTRY_MAX];
+static size_t       s_registry_n;
+static pthread_mutex_t s_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static i686_ctx_t  *s_main_ctx;
+
+static uint32_t thread_registry_main_pid_locked(void)
+{
+    if (s_main_ctx == NULL) {
+        return 0U;
+    }
+    /* Must stay in lockstep with sys_getpid (src/os/syscalls.c). */
+    return (s_main_ctx->host_tid > 0) ? (uint32_t)s_main_ctx->host_tid
+                                      : 1000U;
+}
+
+void i686_thread_registry_main(i686_ctx_t *ctx);
+void i686_thread_registry_main(i686_ctx_t *ctx)
+{
+    (void)pthread_mutex_lock(&s_registry_lock);
+    s_main_ctx = ctx;
+    (void)pthread_mutex_unlock(&s_registry_lock);
+}
+
+void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid);
+void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
+{
+    (void)pthread_mutex_lock(&s_registry_lock);
+    if (s_registry_n < I686_THREAD_REGISTRY_MAX) {
+        s_registry[s_registry_n].tid = tid;
+        s_registry[s_registry_n].ctx = ctx;
+        s_registry_n++;
+    }
+    /* Over the bound: the tid stays unregistered, tkill reports -ESRCH
+     * for it (bounded table, v1 thread count is small). */
+    (void)pthread_mutex_unlock(&s_registry_lock);
+}
+
+void i686_thread_registry_remove(uint32_t tid);
+void i686_thread_registry_remove(uint32_t tid)
+{
+    size_t i;
+    (void)pthread_mutex_lock(&s_registry_lock);
+    for (i = 0U; i < s_registry_n; i++) {
+        if (s_registry[i].tid == tid) {
+            s_registry[i] = s_registry[s_registry_n - 1U];
+            s_registry_n--;
+            break;
+        }
+    }
+    (void)pthread_mutex_unlock(&s_registry_lock);
+}
+
+i686_ctx_t *i686_thread_registry_find(uint32_t tid);
+i686_ctx_t *i686_thread_registry_find(uint32_t tid)
+{
+    i686_ctx_t *found = NULL;
+    size_t i;
+    (void)pthread_mutex_lock(&s_registry_lock);
+    for (i = 0U; i < s_registry_n; i++) {
+        if (s_registry[i].tid == tid) {
+            found = s_registry[i].ctx;
+            break;
+        }
+    }
+    if (found == NULL && tid == thread_registry_main_pid_locked()) {
+        found = s_main_ctx;
+    }
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    return found;
+}
+
+/* The process id every thread clone shares (tgkill checks it). */
+uint32_t i686_thread_registry_tgid(void);
+uint32_t i686_thread_registry_tgid(void)
+{
+    uint32_t tgid;
+    (void)pthread_mutex_lock(&s_registry_lock);
+    tgid = thread_registry_main_pid_locked();
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    return tgid;
+}
+
+/* The caller's own guest tid (set_tid_address's kernel return value).
+ * find() compares pointers, so threads that share no ctx cannot alias. */
+uint32_t i686_thread_registry_self_tid(const i686_ctx_t *ctx);
+uint32_t i686_thread_registry_self_tid(const i686_ctx_t *ctx)
+{
+    uint32_t tid = 0U;
+    size_t i;
+    (void)pthread_mutex_lock(&s_registry_lock);
+    for (i = 0U; i < s_registry_n; i++) {
+        if (s_registry[i].ctx == ctx) {
+            tid = s_registry[i].tid;
+            break;
+        }
+    }
+    if (tid == 0U && s_main_ctx == ctx) {
+        tid = thread_registry_main_pid_locked();
+    }
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    return tid;
+}
+
 struct clone_arg {
     i686_ctx_t *ctx;   /* child's private ctx copy (heap) */
+    uint32_t tid;      /* guest tid registered for this child (C1b) */
 };
 
 static void *thread_entry(void *arg)
 {
     struct clone_arg *ca = arg;
     i686_ctx_t *ctx = ca->ctx;
+    uint32_t tid = ca->tid;
     free(ca);
 
     (void)pthread_once(&s_once, make_key);
@@ -78,7 +202,10 @@ static void *thread_entry(void *arg)
         }
     }
     /* CLONE_CHILD_CLEARTID: clear the tid word and futex-wake it
-     * (kernel exit_mm/exit_notify behavior). */
+     * (kernel exit_mm/exit_notify behavior).  The registry entry is
+     * removed first, so a concurrent tkill sees -ESRCH for this dead
+     * tid rather than signaling a ctx no thread will ever poll. */
+    i686_thread_registry_remove(tid);
     if (ctx->clear_child_tid != 0U) {
         uint32_t zero = 0U;
         memcpy(i686_guest_ptr(ctx, ctx->clear_child_tid), &zero, 4U);
@@ -226,7 +353,10 @@ static int64_t r_clone(i686_ctx_t *ctx)
     }
 
     ca->ctx = child;
+    ca->tid = r_val;
+    i686_thread_registry_add(child, r_val);
     if (pthread_create(&th, NULL, thread_entry, ca) != 0) {
+        i686_thread_registry_remove(r_val);
         free(child); free(ca);
         return -ENOMEM;
     }
@@ -240,6 +370,7 @@ void i686_threads_main_init(i686_ctx_t *ctx)
     (void)pthread_once(&s_once, make_key);
     s_thread_ctx = ctx;
     (void)pthread_setspecific(s_ctx_key, ctx);
+    i686_thread_registry_main(ctx);
     i686_sys_register(120 /* clone */, r_clone);
 }
 
