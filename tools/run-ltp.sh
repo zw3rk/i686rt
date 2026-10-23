@@ -260,7 +260,12 @@ for suite in $LTP_DIRS; do
             continue
         fi
         cd /tmp
-        timeout -s KILL "$TEST_TIMEOUT" "$RT" -- "$path" >/tmp/h2.out 2>/tmp/h2.err
+        # The guest path must be ABSOLUTE: the translator resolves it
+        # against its own cwd (/tmp here), so a bare $path would look
+        # for /tmp/testcases/... and every test would exit 1 without
+        # running (vacuous all-fail logs; found by the fix-campaign C1
+        # acceptance rerun).
+        timeout -s KILL "$TEST_TIMEOUT" "$RT" -- "/w/$LTP_TREE/$path" >/tmp/h2.out 2>/tmp/h2.err
         rc=$?
         i=$((i + 1))
         if [ "$rc" -eq 0 ]; then
