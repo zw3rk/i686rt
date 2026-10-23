@@ -246,10 +246,18 @@ int pipe2(int [2], int);
 #define PR_GET_NAME_ 16
 
 /* futex op encoding (include/uapi/linux/futex.h). */
-#define FUTEX_WAIT_         0u
-#define FUTEX_WAKE_         1u
-#define FUTEX_PRIVATE_FLAG_ 128u
-#define FUTEX_CMD_MASK_     0x7Fu
+#define FUTEX_WAIT_            0u
+#define FUTEX_WAKE_            1u
+#define FUTEX_REQUEUE_         3u
+#define FUTEX_CMP_REQUEUE_     4u
+#define FUTEX_WAKE_OP_         5u
+#define FUTEX_LOCK_PI_         6u
+#define FUTEX_WAIT_BITSET_     9u
+#define FUTEX_WAIT_REQUEUE_PI_ 11u
+#define FUTEX_CMP_REQUEUE_PI_  12u
+#define FUTEX_PRIVATE_FLAG_    128u
+#define FUTEX_CLOCK_REALTIME_  256u
+#define FUTEX_CMD_MASK_        0x7Fu
 
 /* Linux resource limits / stack constants. */
 #define NGROUPS_MAX_ 65536u
@@ -1257,30 +1265,54 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
      * Phase 4: real futexes on the shared window.  The guest uaddr maps
      * 1:1 to a host address (guest_base + uaddr) and every thread of
      * the process shares the mapping, so the host futex word IS the
-     * guest futex word. The timeout pointer is read from EBP (i386
-     * arg6 / val3) and copied into a host timespec. NULL leaves the
-     * host timeout NULL. ESI (i386 arg4) is not read.
+     * guest futex word.  The full i386 6-arg ABI is marshalled
+     * (EBX=uaddr, ECX=op, EDX=val, ESI=utime, EDI=uaddr2, EBP=val3).
+     *
+     * op and val3 pass through VERBATIM.  The host kernel decodes
+     * FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256) and the
+     * WAIT_BITSET bitset exactly like the i386 kernel would, and guest
+     * shared/private semantics carry over because a guest shared futex
+     * lives in a shared window mapping.  The earlier re-encode
+     * ((op & 0x7f) + 128, val3 = 0) broke every FUTEX_WAIT_BITSET
+     * (the kernel rejects a zero bitset with -EINVAL -> glibc
+     * clockwait callers spin) and silently dropped the realtime clock
+     * flag from absolute waits.
      */
-    long hcmd = (op & FUTEX_CMD_MASK_) + 128 /* FUTEX_PRIVATE_FLAG */;
+    static const uint32_t timeout_cmds =
+        (1u << FUTEX_WAIT_) | (1u << FUTEX_LOCK_PI_) |
+        (1u << FUTEX_WAIT_BITSET_) | (1u << FUTEX_WAIT_REQUEUE_PI_);
+    static const uint32_t uaddr2_cmds =
+        (1u << FUTEX_REQUEUE_) | (1u << FUTEX_CMP_REQUEUE_) |
+        (1u << FUTEX_WAKE_OP_) | (1u << FUTEX_CMP_REQUEUE_PI_);
+    uint32_t cmd = op & FUTEX_CMD_MASK_;
+    uint32_t utime_va = ctx->gpr[I686_REG_ESI];
+    uint32_t uaddr2_va = ctx->gpr[I686_REG_EDI];
+    uint32_t val3 = ctx->gpr[I686_REG_EBP];
     struct timespec ts, *pts = NULL;
-    int r;
+    void *huaddr2 = NULL;
+    long r;
 
     if (guest_ptr_bad(uaddr)) {
         return -EFAULT;
     }
-    if ((op & FUTEX_CMD_MASK_) == FUTEX_WAIT_) {
-        uint32_t timeout_va = ctx->gpr[I686_REG_EBP];
-        if (timeout_va != 0U) {
-            struct { uint32_t sec, nsec; } gts;
-            if (i686_copy_from_guest(ctx, &gts, timeout_va, sizeof gts) == 0) {
-                ts.tv_sec = gts.sec;
-                ts.tv_nsec = gts.nsec;
-                pts = &ts;
-            }
+    if (cmd < 32u && ((timeout_cmds >> cmd) & 1u) && utime_va != 0U) {
+        /* compat_get_timespec: s32 tv_sec sign-extended, u32 tv_nsec. */
+        struct { int32_t sec; uint32_t nsec; } gts;
+        if (i686_copy_from_guest(ctx, &gts, utime_va, sizeof gts) != 0) {
+            return -EFAULT;
         }
+        ts.tv_sec = (time_t)gts.sec;
+        ts.tv_nsec = (long)gts.nsec;
+        pts = &ts;
     }
-    r = (int)syscall(SYS_futex, i686_guest_ptr(ctx, uaddr), hcmd, val,
-                     pts, NULL, 0);
+    if (cmd < 32u && ((uaddr2_cmds >> cmd) & 1u)) {
+        if (guest_ptr_bad(uaddr2_va)) {
+            return -EFAULT;
+        }
+        huaddr2 = i686_guest_ptr(ctx, uaddr2_va);
+    }
+    r = (long)syscall(SYS_futex, i686_guest_ptr(ctx, uaddr), (unsigned int)op,
+                      (unsigned int)val, pts, huaddr2, (unsigned int)val3);
     if (r < 0) {
         return (errno == EWOULDBLOCK) ? -EAGAIN : -errno;
     }

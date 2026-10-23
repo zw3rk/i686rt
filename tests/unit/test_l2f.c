@@ -281,31 +281,53 @@ static void t_futex(void)
     reset();
     i686_syscalls_pass_init();
 
-    /* FUTEX_WAIT(0): value match -> 0 (pretend woken), mismatch -> EAGAIN. */
+    /* FUTEX_WAIT(0) with a mismatched word -> -EAGAIN (kernel
+     * futex_wait_setup).  A matching word would block the unit run, so
+     * the timeout path is exercised with a zero relative timespec. */
     wr32(0x4000, 7);
     ctx.gpr[I686_REG_EBX] = 0x4000;
     ctx.gpr[I686_REG_ECX] = 0;  /* FUTEX_WAIT */
-    ctx.gpr[I686_REG_EDX] = 7;
-    CHECK(i686_sys_dispatch(&ctx, 240) == 0);
     ctx.gpr[I686_REG_EDX] = 9;
     CHECK(i686_sys_dispatch(&ctx, 240) == -EAGAIN);
 
-    /* FUTEX_WAKE(1): no waiters -> 0. */
+    /* Timeout path: utime is ESI (i386 arg4); timespec32 {0,0} times
+     * out immediately. */
+    wr32(0x4100, 7);
+    wr32(0x4200, 0);
+    wr32(0x4204, 0);
+    ctx.gpr[I686_REG_EBX] = 0x4100;
+    ctx.gpr[I686_REG_ECX] = 0;
+    ctx.gpr[I686_REG_EDX] = 7;
+    ctx.gpr[I686_REG_ESI] = 0x4200;
+    CHECK(i686_sys_dispatch(&ctx, 240) == -ETIMEDOUT);
+
+    /* FUTEX_WAIT_BITSET(9)|FUTEX_CLOCK_REALTIME(256) with a zero
+     * bitset (EBP, i386 arg6) -> kernel -EINVAL.  RC7b T4d: dropping
+     * val3 made every glibc clockwait spin at -EINVAL. */
+    wr32(0x4300, 7);
+    ctx.gpr[I686_REG_EBX] = 0x4300;
+    ctx.gpr[I686_REG_ECX] = 9u | 256u;
+    ctx.gpr[I686_REG_EDX] = 7;
+    ctx.gpr[I686_REG_ESI] = 0;
+    ctx.gpr[I686_REG_EBP] = 0;
+    CHECK(i686_sys_dispatch(&ctx, 240) == -EINVAL);
+
+    /* FUTEX_WAKE(1): no waiters -> 0; PRIVATE (128) passes through. */
+    ctx.gpr[I686_REG_EBX] = 0x4000;
     ctx.gpr[I686_REG_ECX] = 1;
     CHECK(i686_sys_dispatch(&ctx, 240) == 0);
-
-    /* FUTEX_PRIVATE_FLAG (128) is masked off the command. */
-    ctx.gpr[I686_REG_ECX] = 128u; /* FUTEX_WAIT|PRIVATE */
-    ctx.gpr[I686_REG_EDX] = 7;
-    CHECK(i686_sys_dispatch(&ctx, 240) == 0);
-    ctx.gpr[I686_REG_ECX] = 128u + 1u; /* FUTEX_WAKE|PRIVATE */
+    ctx.gpr[I686_REG_ECX] = 128u + 1u; /* WAKE|PRIVATE */
     CHECK(i686_sys_dispatch(&ctx, 240) == 0);
 
-    /* Other futex operations stay -ENOSYS (Phase 4). */
-    ctx.gpr[I686_REG_ECX] = 2; /* FUTEX_FD */
+    /* FUTEX_FD(2): removed by the kernel -> -ENOSYS (verbatim op). */
+    ctx.gpr[I686_REG_ECX] = 2;
     CHECK(i686_sys_dispatch(&ctx, 240) == -ENOSYS);
-    ctx.gpr[I686_REG_ECX] = 5; /* FUTEX_WAKE_OP */
-    CHECK(i686_sys_dispatch(&ctx, 240) == -ENOSYS);
+
+    /* WAKE_OP(5) without uaddr2 (EDI, i386 arg5) -> -EFAULT, like the
+     * kernel's access_ok on the second futex word. */
+    ctx.gpr[I686_REG_ECX] = 5;
+    ctx.gpr[I686_REG_EDI] = 0;
+    CHECK(i686_sys_dispatch(&ctx, 240) == -EFAULT);
 
     /* Bad uaddr -> EFAULT. */
     ctx.gpr[I686_REG_EBX] = 0x100;
