@@ -622,10 +622,22 @@ static unsigned round_pack80(xf_t *r, bool sign, u2 m, int32_t exp, bool sticky,
     eff = (int)pc < 64 - shift ? (int)pc : 64 - shift;
 
     if (eff < 0 || (eff == 0 && exp < X_EMIN - 64)) {
-        /* below half the minimum subnormal: rounds to (signed) zero */
-        r->cls = X_ZERO;
-        r->mant = 0;
-        r->exp = 0;
+        /* Entire value below half the minimum subnormal: nearest-even
+         * and toward-zero keep the signed zero; toward -inf of a
+         * negative / +inf of a positive tiny value rounds to the
+         * minimum subnormal (1 ulp of 2^-16445). */
+        bool up = (g_rc == 1u && sign) || (g_rc == 2u && !sign);
+
+        if (up) {
+            r->cls = X_NUM;
+            r->mant = 1;
+            r->exp = X_EMIN;
+            r->den_enc = true;
+        } else {
+            r->cls = X_ZERO;
+            r->mant = 0;
+            r->exp = 0;
+        }
         return X_UE | X_PE;
     }
     if (eff == 0) {
