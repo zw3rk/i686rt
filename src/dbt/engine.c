@@ -8,7 +8,9 @@
  * each entry a malloc'd executable block. UNDEF exits carry the insn
  * length in exit_arg: the engine interprets ONE insn (D2) and resumes
  * translation at pc+len. Blocks run through i686_jit_run_block
- * (src/trampoline.S).
+ * (src/trampoline.S), which since C6b links BRANCH exits through the
+ * per-ctx IBTC (filled here on install) without returning to C; every
+ * path that frees or dead-marks a block severs its IBTC entry first.
  */
 
 #include <setjmp.h>
@@ -21,6 +23,28 @@
 
 uint32_t i686_jit_run_block(i686_ctx_t *ctx, const void *code_ptr,
                             void *cur_entry, const void *epoch_ptr);
+
+/* C6b: the dispatch loop in src/trampoline.S is hand-assembled against
+ * these ABI facts; the C side pins them so a struct or constant drift
+ * breaks the build here instead of guest execution. */
+_Static_assert(I686_EXIT_BRANCH == 1U,
+               "trampoline pins I686_EXIT_BRANCH == 1");
+_Static_assert(offsetof(i686_ctx_t, exit_reason) == 120,
+               "trampoline pins exit_reason @0x78");
+_Static_assert(offsetof(i686_ctx_t, exit_dest) == 132,
+               "trampoline pins exit_dest @0x84");
+_Static_assert(offsetof(i686_ctx_t, ibtc) == 2536,
+               "trampoline pins ibtc @0x9e8 (2536)");
+_Static_assert(sizeof(i686_ibtc_entry_t) == 32,
+               "trampoline pins the 32-byte IBTC entry stride");
+_Static_assert(offsetof(i686_ibtc_entry_t, key) == 0,
+               "trampoline pins ibtc entry.key @0");
+_Static_assert(offsetof(i686_ibtc_entry_t, epoch) == 4,
+               "trampoline pins ibtc entry.epoch @4");
+_Static_assert(offsetof(i686_ibtc_entry_t, host_code) == 8,
+               "trampoline pins ibtc entry.host_code @8");
+_Static_assert(offsetof(i686_ctx_t, ibtc_hits) == 464,
+               "trampoline pins ibtc_hits @0x1d0 (464)");
 
 #define DBT_HT_BITS 12U
 #define DBT_HT_SIZE (1U << DBT_HT_BITS)
@@ -124,6 +148,22 @@ static void dbt_graveyard_drain(void)
     s_graveyard_n = 0U;
 }
 
+/* C6b: the trampoline chain decision follows a ctx->ibtc entry only when
+ * key == guest EIP AND host_code != NULL.  Sever the entry the moment
+ * its block mapping dies so a chain can never enter freed code: key=0
+ * alone would still collide for a branch to EIP 0. */
+static void dbt_ibtc_sever(i686_ctx_t *ctx, uint32_t eip)
+{
+    i686_ibtc_entry_t *slot = &ctx->ibtc[i686_ibtc_hash(eip)];
+
+    if (slot->key == eip) {
+        slot->key = 0U;
+        slot->epoch = 0U;
+        slot->host_code = NULL;
+        slot->entry = NULL;
+    }
+}
+
 /* D11: drop every translated block with eip in [start,end), unprotect
  * the pages, and clear IBTC/RAS entries that may chain into the freed
  * code (use-after-free guard). */
@@ -162,6 +202,10 @@ void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start, uint32_t end)
                 ctx->ibtc[i].key >= start && ctx->ibtc[i].key < end) {
                 ctx->ibtc[i].key = 0U;
                 ctx->ibtc[i].epoch = 0U;
+                /* C6b: the chain check needs key AND host_code; NULL it
+                 * so even a branch to EIP 0 cannot follow this entry. */
+                ctx->ibtc[i].host_code = NULL;
+                ctx->ibtc[i].entry = NULL;
             }
         }
         for (size_t i = 0U; i < I686_RAS_SIZE; i++) {
@@ -220,6 +264,9 @@ int i686_dbt_smc_write_fault(uint64_t host_addr)
                     s_run_ctx->ibtc[i].key < end) {
                     s_run_ctx->ibtc[i].key = 0U;
                     s_run_ctx->ibtc[i].epoch = 0U;
+                    /* C6b: NULL the pointers too (see invalidate_range). */
+                    s_run_ctx->ibtc[i].host_code = NULL;
+                    s_run_ctx->ibtc[i].entry = NULL;
                 }
             }
             for (size_t i = 0U; i < I686_RAS_SIZE; i++) {
@@ -255,6 +302,17 @@ void i686_dbt_flush_all(void)
     }
     memset(s_code_pages, 0, sizeof(s_code_pages)); /* pages die with the
         image (exec teardown munmaps the window anyway) */
+    /* C6b: every freed block's IBTC entry must be severed BEFORE the
+     * next dispatch — exec may reload overlapping EIPs, and a stale
+     * {key, host_code} pair would chain into munmapped code. */
+    if (s_run_ctx != NULL) {
+        for (size_t i = 0U; i < I686_IBTC_SIZE; i++) {
+            s_run_ctx->ibtc[i].key = 0U;
+            s_run_ctx->ibtc[i].epoch = 0U;
+            s_run_ctx->ibtc[i].host_code = NULL;
+            s_run_ctx->ibtc[i].entry = NULL;
+        }
+    }
     dbt_graveyard_drain(); /* dead blocks from this image's SMC history */
 }
 
@@ -272,6 +330,8 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
         if (e->eip == eip) {
             return e;
         }
+        dbt_ibtc_sever(ctx, e->eip); /* before the munmap: the victim's
+            IBTC entry must not chain into freed code (C6b) */
         munmap(e->code, e->cap); /* direct-mapped eviction */
         e->len = 0U;
     }
@@ -292,6 +352,12 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
             e->len = (uint32_t)len;
             e->code = code;
             e->cap = cap;
+            /* C6b: publish the IBTC slot so the trampoline links BRANCH
+             * exits straight into this block.  epoch=1 marks a live
+             * install; dead-marked slots refill only here (a fresh
+             * successful compile). */
+            ctx->ibtc[i686_ibtc_hash(eip)] = (i686_ibtc_entry_t){
+                .key = eip, .epoch = 1U, .host_code = code, .entry = code};
             /* H1-DEBUG */ if (getenv("I686RT_SMC_OFF") == NULL) smc_protect(ctx, eip);
             return e;
         }
