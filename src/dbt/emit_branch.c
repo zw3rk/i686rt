@@ -36,12 +36,13 @@
  *    (!CF&&!ZF), so the unsigned four are mapped per the natural
  *    polarity instead (BE->ls / A->hi as the card states them).  This
  *    is documented for coordinator ratification at S3.  The parity
- *    conditions P/NP (10/11) are declined (PF is not in NZCV).  This
- *    module always rebuilds the image from ctx->eflags rather than
- *    fusing on leftover in-block SUBS flags; flag-producing emitters
- *    must keep ctx->eflags authoritative (the L3c string module
- *    writes the NZCV-derived bits back; PF/AF stay until the
- *    flags_dbt.h materializer lands — coordinator-owned).
+ *    conditions P/NP (10/11) are declined (PF is not in NZCV).
+ *    C6a seam: which prelude the consumer emits switches on
+ *    e->flags_src (emit.h): NZCV consumes the fused image as-is and
+ *    bumps ctx->flags_elided; EFLAGS silently rebuilds NZCV from
+ *    ctx->eflags without the park/sync helper; DEAD runs the full
+ *    sequence.  All three leave the same NZCV image, so a following
+ *    same-block consumer may stay fused.
  *
  * 3. Per-insn PC recovery.  The frozen emitter API passes no PC (the
  *    decoded x86_insn_t has no address field and emit.h carries only
@@ -175,6 +176,9 @@ static void l3c_exit_dest_w10(i686_emit_ctx_t *e, uint32_t reason,
 
 /* ---- NZCV from ctx->eflags (coordination note 2) ------------------ */
 
+/* The DEAD path (C6a seam): park the guest GPRs, blr the helper so any
+ * pending interpreter descriptor materializes, reload, rebuild NZCV
+ * from ctx->eflags.  Exactly today's full sequence. */
 static void l3c_flags_to_nzcv(i686_emit_ctx_t *e)
 {
     a64_buf_t *b = &e->buf;
@@ -228,24 +232,42 @@ static void l3c_flags_to_nzcv(i686_emit_ctx_t *e)
         a64_emit_ldr_imm_w(b, 7U, A64_XCTX, 28U);
     }
 
-    a64_emit_ldr_imm_w(b, L3C_W8, A64_XCTX, 36U); /* ctx->eflags */
-    /* w9 = 0x0FFFFFFF (NZCV low 27 architectural bits are RES1) */
-    a64_emit_movz_w(b, L3C_W9, 0xFFFFU, 0U);
-    a64_emit_movk_w(b, L3C_W9, 0x0FFFU, 1U);
-    /* N<-SF(bit7) Z<-ZF(bit6) V<-OF(bit11), via BFI */
-    a64_emit_ubfm_w(b, L3C_W11, L3C_W8, 7U, 7U);
-    a64_emit_bfm_w(b, L3C_W9, L3C_W11, 1U, 0U);  /* insert at bit 31 */
-    a64_emit_ubfm_w(b, L3C_W11, L3C_W8, 6U, 6U);
-    a64_emit_bfm_w(b, L3C_W9, L3C_W11, 2U, 0U);  /* bit 30 */
-    a64_emit_ubfm_w(b, L3C_W11, L3C_W8, 11U, 11U);
-    a64_emit_bfm_w(b, L3C_W9, L3C_W11, 4U, 0U);  /* bit 28 */
-    /* C <- !CF (natural SUBS polarity): w11 = 1 - CF, inserted at 29 */
-    a64_emit_ubfm_w(b, L3C_W11, L3C_W8, 0U, 0U); /* w11 = CF */
-    a64_emit_movz_w(b, L3C_W8, 1U, 0U);          /* w8 = 1 (done with eflags) */
-    a64_emit_sub_reg_w(b, false, L3C_W11, L3C_W8, L3C_W11,
-                       A64_SHIFT_LSL, 0U);
-    a64_emit_bfm_w(b, L3C_W9, L3C_W11, 3U, 0U);  /* bit 29 */
-    a64_emit_msr_nzcv(b, L3C_W9);
+    /* Rebuild NZCV from ctx->eflags (shared C6a helper; identical word
+     * stream to the former inline tail). */
+    {
+        extern void i686_dbt_emit_rebuild_nzcv(i686_emit_ctx_t *);
+        i686_dbt_emit_rebuild_nzcv(e);
+    }
+}
+
+/* Consumer prelude on the frozen flags_src seam (emit.h, C6a): choose
+ * the architecturally-identical cheapest path for this consumer.
+ *   NZCV   -> the fused image is already live: consume it as-is and
+ *             count the elided park/sync/rebuild (ctx->flags_elided).
+ *   EFLAGS -> ctx->eflags is current (eager producer ran, lazy_op
+ *             NONE): silent rebuild, no park, no helper call.
+ *   DEAD   -> no proof: today's full sequence.
+ * Every path leaves NZCV holding the architectural image, so a
+ * following consumer may stay fused (setcc/cmovcc do not disturb NZCV;
+ * jcc ends the block either way). */
+static void l3c_flags_consume(i686_emit_ctx_t *e)
+{
+    switch (e->flags_src) {
+    case I686_FLAGS_NZCV: {
+        extern void i686_dbt_emit_elide_bump(i686_emit_ctx_t *);
+        i686_dbt_emit_elide_bump(e);
+        break;
+    }
+    case I686_FLAGS_EFLAGS: {
+        extern void i686_dbt_emit_rebuild_nzcv(i686_emit_ctx_t *);
+        i686_dbt_emit_rebuild_nzcv(e);
+        break;
+    }
+    default: /* I686_FLAGS_DEAD: conservative full sequence */
+        l3c_flags_to_nzcv(e);
+        break;
+    }
+    e->flags_src = I686_FLAGS_NZCV;
 }
 
 /* CSET w11, cond (local CSINC encoding; the frozen encoder has none). */
@@ -349,7 +371,7 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             return -1;
         }
         next = pc + (uint32_t)insn->len;
-        l3c_flags_to_nzcv(e);
+        l3c_flags_consume(e);
         /* b.cond taken -> exit to target; fallthrough -> exit to next */
         patch = a64_emit_b_cond_placeholder(b, (unsigned)a64c);
         l3c_exit_const(e, I686_EXIT_BRANCH, 0U, next);
@@ -413,7 +435,7 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             insn->pfx_rep != 0U) {
             return -1; /* reg forms only in v1 */
         }
-        l3c_flags_to_nzcv(e);
+        l3c_flags_consume(e);
         l3c_emit_cset_w11(e, (unsigned)a64c);
         if (insn->modrm_rm < 4U) { /* low byte: bfi wReg, w11, #0, #8 */
             a64_emit_bfm_w(b, i686_w(insn->modrm_rm), L3C_W11, 0U, 7U);
@@ -433,7 +455,7 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             insn->pfx_rep != 0U) {
             return -1; /* reg forms only in v1 */
         }
-        l3c_flags_to_nzcv(e);
+        l3c_flags_consume(e);
         if (insn->pfx_opsize != 0U) {
             /* 16-bit: keep the destination's upper half */
             a64_emit_csel_w(b, L3C_W11, rm, rd, (unsigned)a64c);
