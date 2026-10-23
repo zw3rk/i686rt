@@ -1,40 +1,40 @@
-# run_c2_libctest.sh (fix-campaign C2) 2026-10-23T16:01:03Z
+# run_c2_libctest.sh (fix-campaign C2) 2026-10-23T18:42:22Z
 # source: https://git.musl-libc.org/libc-test @ a0c28c7673121dcb9305d1ea21aa5a42a5d9929d
 # engine: interp  per-test-timeout: 30s
-ok 1 - functional/clocale_mbfuncs
-ok 2 - functional/crypt
+not ok 1 - functional/clocale_mbfuncs
+# class=timeout
+not ok 2 - functional/crypt
+# class=timeout
 not ok 3 - functional/pthread_cancel
-# class=rc125
-not ok 4 - functional/pthread_cond
-# class=rc125
-not ok 5 - functional/pthread_robust
-# class=rc125
+# class=timeout
+ok 4 - functional/pthread_cond
+ok 5 - functional/pthread_robust
 not ok 6 - regression/pthread_once-deadlock
-# class=rc125
+# class=timeout
 not ok 7 - regression/raise-race
-# class=rc125
+# class=timeout
 not ok 8 - regression/tls_get_new-dtv
-# class=rc125
+# class=timeout
 not ok 9 - math/drem
-# class=rc125
+# class=timeout
 not ok 10 - math/dremf
-# class=rc125
+# class=timeout
 not ok 11 - math/fmod
-# class=rc125
+# class=timeout
 not ok 12 - math/fmodf
-# class=rc125
+# class=timeout
 not ok 13 - math/fmodl
-# class=rc125
+# class=timeout
 not ok 14 - math/remainder
-# class=rc125
+# class=timeout
 not ok 15 - math/remainderf
-# class=rc125
+# class=timeout
 not ok 16 - math/remainderl
-# class=rc125
+# class=timeout
 not ok 17 - math/remquo
-# class=rc125
+# class=timeout
 not ok 18 - math/remquof
-# class=rc125
+# class=timeout
 not ok 19 - math/remquol
-# class=rc125
-# RESULT libctest-c2 pass=2 fail=17 timeout=0 total=19
+# class=timeout
+# RESULT libctest-c2 pass=2 fail=0 timeout=17 total=19
