@@ -38,6 +38,7 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
     (void)uc_;
     sigjmp_buf *jb = s_fault_jmp;
     if (sig == SIGSEGV && si->si_code == SEGV_ACCERR) {
+#ifndef I686RT_NO_DBT
         /* D11 SMC: a write to a DBT code-protected window page.  The
          * engine drops the page's blocks and restores RW; returning
          * re-executes the store. */
@@ -45,6 +46,7 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
         if (i686_dbt_smc_write_fault((uint64_t)(uintptr_t)si->si_addr)) {
             return;
         }
+#endif
     }
     if (s_in_run && jb != NULL) {
         s_fault_jmp = NULL; /* disarm: a nested fault must not re-jump */

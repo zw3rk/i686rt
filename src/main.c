@@ -318,9 +318,15 @@ static int run_guest(i686_ctx_t *ctx)
     }
     i686_interp_init_all();
     if (ctx->engine == I686_ENGINE_DBT) {
+#ifdef I686RT_NO_DBT
+        (void)fprintf(stderr,
+                      "i686rt: DBT unavailable on this host; interp\n");
+        r = i686_interp_run(ctx);
+#else
         extern void i686_dbt_trace_enable(int);
         i686_dbt_trace_enable(getenv("I686RT_TRACE") != NULL);
         r = i686_dbt_run(ctx);
+#endif
     } else {
         r = i686_interp_run(ctx);
     }

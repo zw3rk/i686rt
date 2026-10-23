@@ -258,9 +258,20 @@ _Static_assert(I686_GO_NOATIME == I686_HO_NOATIME, "O_NOATIME differs");
 #define I686_HOST_SYSINFO_SZ 112u
 
 #ifdef __linux__
+#if defined(__aarch64__)
 _Static_assert(sizeof(struct epoll_event) == I686_HOST_EPOLL_SZ,
                "host epoll_event layout");
 _Static_assert(offsetof(struct epoll_event, data) == 8, "host epoll data @8");
+#else
+/* musl packs epoll_event on x86 hosts (12 bytes, data @4) — the same
+ * layout as the i386 guest's epoll_event. */
+_Static_assert(sizeof(struct epoll_event) == 12u,
+               "host epoll_event layout (x86 packed)");
+_Static_assert(offsetof(struct epoll_event, data) == 4,
+               "host epoll data @4 (x86 packed)");
+#undef I686_HOST_EPOLL_SZ
+#define I686_HOST_EPOLL_SZ 12u
+#endif
 _Static_assert(sizeof(struct flock) == I686_HOST_FLOCK_SZ, "host flock layout");
 _Static_assert(offsetof(struct flock, l_start) == 8, "host flock l_start @8");
 _Static_assert(offsetof(struct flock, l_len) == 16, "host flock l_len @16");

@@ -71,12 +71,19 @@ static int vm_reserve_prot_none(i686_ctx_t *ctx, uint32_t start, uint32_t len)
 
 /* Translation-cache invalidation on guest mm ops (D11 SMC): real since
  * Phase H H1; the interpreter has no code cache (the call is cheap). */
+#ifdef I686RT_NO_DBT
+static inline void vm_invalidate_jit(i686_ctx_t *ctx, uint32_t start, uint32_t end)
+{
+    (void)ctx; (void)start; (void)end;
+}
+#else
 extern void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start,
                                       uint32_t end);
 static inline void vm_invalidate_jit(i686_ctx_t *ctx, uint32_t start, uint32_t end)
 {
     i686_dbt_invalidate_range(ctx, start, end);
 }
+#endif
 
 static void vm_sync_from_ctx(i686_ctx_t *ctx)
 {

@@ -422,8 +422,10 @@ static void guest_regions_teardown(i686_ctx_t *ctx)
         /* Exec invalidates the translation cache too (RC7b T4b): fork
          * children inherit the parent's COW JIT blocks, and a new image
          * at the same EIPs must not run the previous image's code. */
+#ifndef I686RT_NO_DBT
         extern void i686_dbt_flush_all(void);
         i686_dbt_flush_all();
+#endif
     }
 }
 

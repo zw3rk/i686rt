@@ -37,6 +37,19 @@ help: ## Show available build and verification targets
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
+SRCS_X64 := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
+        $(wildcard src/interp/*.c) $(wildcard src/os/*.c)
+SRCS_X64 := $(filter-out src/rt32/rt32_a64_emit.c,$(SRCS_X64))
+OBJS_X64  := $(patsubst src/%.c,$(OBJ_DIR)-x64/%.o,$(SRCS_X64))
+I686RT_X64 := $(BUILD_DIR)/i686rt-x86_64
+
+build-x86_64: $(I686RT_X64) ## Interpreter-only x86_64-host build (D3 tier 2, H4)
+$(I686RT_X64): $(OBJS_X64)
+	$(CC) $(CFLAGS) -DI686RT_NO_DBT $(OBJS_X64) $(LDFLAGS) -o $@
+$(OBJ_DIR)-x64/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DI686RT_NO_DBT -c $< -o $@
+
 all: build ## Build everything (currently just the i686rt binary)
 
 build: $(I686RT_BIN) ## Build static-PIE aarch64-linux i686rt binary

@@ -66,10 +66,14 @@ static void *thread_entry(void *arg)
      * for v1 the interp run function is invoked directly. */
     {
         extern int i686_interp_run(i686_ctx_t *);
+#ifndef I686RT_NO_DBT
         extern int i686_dbt_run(i686_ctx_t *);
         if (ctx->engine == I686_ENGINE_DBT) {
             (void)i686_dbt_run(ctx);
         } else {
+#else
+        {
+#endif
             (void)i686_interp_run(ctx);
         }
     }

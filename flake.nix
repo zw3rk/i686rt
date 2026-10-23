@@ -77,6 +77,36 @@
         };
       };
 
+      # H4 (SPEC §4 Phase H, D3 tier 2): interpreter-only x86_64-host
+      # build.  The DBT, trampoline.S and rt32_a64_emit are AArch64-only
+      # and are excluded via -DI686RT_NO_DBT guards; the interpreter
+      # core is portable Curated C11.
+      mkI686rtX64 = musl64Pkgs: musl64Pkgs.stdenv.mkDerivation {
+        pname = "i686rt-x86_64";
+        version = "0.1.0";
+        src = ./.;
+        dontStrip = true;
+        buildPhase = ''
+          runHook preBuild
+          CC="${musl64Pkgs.stdenv.cc.targetPrefix}gcc"
+          command -v "$CC" >/dev/null 2>&1 || CC="${musl64Pkgs.stdenv.cc.targetPrefix}cc"
+          make build-x86_64 CC="$CC"
+          runHook postBuild
+        '';
+        installPhase = ''
+          runHook preInstall
+          mkdir -p $out/bin
+          cp _build/i686rt-x86_64 $out/bin/i686rt
+          runHook postInstall
+        '';
+        meta = with musl64Pkgs.lib; {
+          description = "Interpreter-only x86_64-host i686 translator (D3 tier 2)";
+          mainProgram = "i686rt";
+          platforms = [ "x86_64-linux" ];
+          license = licenses.asl20;
+        };
+      };
+
       # mkI686rtTests — eval-only placeholder, intentionally a plain
       # attrset (nothing to build yet).  Phase 1 (experiments/E06) lands
       # the real guest fixture suite: i686 test binaries must be
@@ -99,6 +129,7 @@
       packages.${linuxSystem} = {
         i686rt  = mkI686rt linuxA64Musl;
         default = self.packages.${linuxSystem}.i686rt;
+        i686rt-x86_64 = mkI686rtX64 linuxPkgs.pkgsCross.musl64;
       };
 
       checks.${linuxSystem} = {
