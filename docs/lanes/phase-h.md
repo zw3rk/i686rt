@@ -280,3 +280,22 @@ interp/dbt runs before any guest execution on a harness argument bug —
 the runner got no `--`-separated guest argv and exited rc=2 with its
 usage; harness fixed, attempt discarded, no numbers from it are
 reported).  Every container named, bounded, removal verified.
+
+## H1 record (2026-10-23) — PASSED (both engines)
+
+D11 implemented: translated pages write-protected (bitmap over the
+window); guest stores to them fault, the handler invalidates the
+page's blocks (dead-mark — same-block SMC and the post-syscall path
+may still reference the code; eviction frees), clears IBTC/RAS
+entries, restores RW and re-executes the store.  vm mm-op hooks call
+the real invalidation.  The DBT loop now installs+arms the host-fault
+checkpoint (window faults under engine=dbt previously killed the
+process).  Acceptance (arm64 docker, staging /tmp/rc3):
+  interp: timeout 60 /w/i686rt -- /w/test_h1_smc -> smc-patch-imm ok /
+  smc-rewrite-stub ok / smc-same-page ok / PASS, rc=0
+  dbt (I686RT_ENGINE=dbt): identical, rc=0
+Regression: busybox echo ok under both engines.  Known residual
+(documented): dead-marked blocks free only on hash eviction (bounded
+leak per SMC event); the DBT same-block SMC tail (generation counter
+at block exit) is covered by the fault path instead of a pre-emptive
+block-end, per the a32rt precedent measured here.
