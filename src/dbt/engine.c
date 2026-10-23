@@ -11,6 +11,8 @@
  * (src/trampoline.S), which since C6b links BRANCH exits through the
  * per-ctx IBTC (filled here on install) without returning to C; every
  * path that frees or dead-marks a block severs its IBTC entry first.
+ * C6c: the host-fault checkpoint arms once per run (re-armed only in
+ * the fault path, interp.c style).
  */
 
 #include <setjmp.h>
@@ -389,33 +391,44 @@ int i686_dbt_run(i686_ctx_t *ctx)
     s_run_ctx = ctx;
     s_smc_window_base = ctx->guest_base;
     s_smc_window_end = ctx->guest_base + 0x100000000ULL;
+    /* C6c: arm the checkpoint ONCE per run and re-arm ONLY in the fault
+     * path after a longjmp — the interpreter's arm-once structure
+     * (interp.c, RC7b T4d).  The previous per-dispatch sigsetjmp cost
+     * one rt_sigprocmask host syscall per loop iteration (musl's
+     * savemask sigsetjmp), which dominated wall time on CoreMark.  The
+     * fault path's re-arm restores the checkpoint after the handler's
+     * pre-jump disarm (nested faults must not re-jump into a stale
+     * context), so the NEXT fault still lands here.  H1 invariant: the
+     * checkpoint is armed whenever emitted code runs — dispatch starts
+     * armed, and every exit that leaves guest execution disarms. */
+    if (sigsetjmp(fj, 1) != 0) {
+        uint64_t fa = i686_fault_addr();
+        extern int i686_deliver_sync(i686_ctx_t *, int);
+
+        i686_fault_arm(&fj); /* re-arm: nested faults disarm */
+        if (fa >= ctx->guest_base &&
+            fa < ctx->guest_base + 0x100000000ULL) {
+            ctx->fault_addr = (uint32_t)(fa - ctx->guest_base);
+        } else {
+            ctx->fault_addr = (uint32_t)fa;
+        }
+        if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
+            goto dispatch; /* guest handler installed; resume at it */
+        }
+        {
+            extern void i686_diag_fault(i686_ctx_t *ctx);
+            i686_diag_fault(ctx);
+        }
+        ctx->exit_reason = I686_EXIT_FAULT;
+        return I686_EXIT_FAULT;
+    }
+    i686_fault_arm(&fj);
+dispatch:
     for (;;) {
         /* C7 safe point (frozen call site): dispatch boundary — no
          * emitted block is on the host stack, so dead-marked blocks
          * can be reclaimed here. */
         dbt_graveyard_drain();
-        if (sigsetjmp(fj, 1) != 0) {
-            uint64_t fa = i686_fault_addr();
-            extern int i686_deliver_sync(i686_ctx_t *, int);
-
-            i686_fault_arm(&fj); /* re-arm: nested faults disarm */
-            if (fa >= ctx->guest_base &&
-                fa < ctx->guest_base + 0x100000000ULL) {
-                ctx->fault_addr = (uint32_t)(fa - ctx->guest_base);
-            } else {
-                ctx->fault_addr = (uint32_t)fa;
-            }
-            if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
-                continue; /* guest handler installed; resume at it */
-            }
-            {
-                extern void i686_diag_fault(i686_ctx_t *ctx);
-                i686_diag_fault(ctx);
-            }
-            ctx->exit_reason = I686_EXIT_FAULT;
-            return I686_EXIT_FAULT;
-        }
-        i686_fault_arm(&fj);
         {   /* D8 guard (phase-7.md freeze): non-flat CS (any LDT selector
              * or D=0 code) or active v86 runs interpreter-only, checked
              * per block dispatch.  A far transfer single-stepped through
