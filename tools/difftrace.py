@@ -34,8 +34,12 @@ import sys
 
 # Full interpreter format (src/interp/interp.c):
 #   "T %08x op=%u len=%u b=%02x.. esp=%08x"
+# Since the per-pid tracing change the interp prefixes the pid:
+#   "T <pid> %08x op=%u len=%u b=%02x.. esp=%08x"
+# The pid is run-local (the two engine runs are separate processes), so
+# it is skipped, not keyed: comparison stays (eip, op, len).
 T_FULL = re.compile(
-    r"^T ([0-9a-fA-F]{1,8}) op=(\d+) len=(\d+)"
+    r"^T (?:\d+ )?([0-9a-fA-F]{1,8}) op=(\d+) len=(\d+)"
     r"(?: b=([0-9a-fA-F]*) esp=([0-9a-fA-F]{1,8}))?$"
 )
 # Syscall lines: "S <nr> -> <rv>", "S <nr>(<a1>) -> <rv>",
