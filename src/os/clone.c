@@ -21,6 +21,8 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,11 +62,18 @@ static void make_key(void)
  * -ESRCH like the kernel.  Contexts are never freed in v1 (heap ctx
  * per thread, existing behavior), so a pointer handed out by
  * i686_thread_registry_find stays valid for the process lifetime.
+ *
+ * Each entry also carries the HOST tid of the interpreter thread that
+ * runs the guest ctx (fix-campaign C2): the blocked-target wake sends
+ * the dedicated host signal to it (thread_entry records it before the
+ * engine runs; the main ctx is always the process's initial host
+ * thread, whose tid == getpid()).
  */
 #define I686_THREAD_REGISTRY_MAX 64U
 
 static struct {
     uint32_t    tid;
+    int         host_tid; /* 0 until thread_entry records it */
     i686_ctx_t *ctx;
 } s_registry[I686_THREAD_REGISTRY_MAX];
 static size_t       s_registry_n;
@@ -95,11 +104,33 @@ void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
     (void)pthread_mutex_lock(&s_registry_lock);
     if (s_registry_n < I686_THREAD_REGISTRY_MAX) {
         s_registry[s_registry_n].tid = tid;
+        s_registry[s_registry_n].host_tid = 0;
         s_registry[s_registry_n].ctx = ctx;
         s_registry_n++;
     }
     /* Over the bound: the tid stays unregistered, tkill reports -ESRCH
      * for it (bounded table, v1 thread count is small). */
+    (void)pthread_mutex_unlock(&s_registry_lock);
+}
+
+/* thread_entry records the host tid of the interpreter thread running
+ * this guest ctx and RE-KEYS the registry entry to it (the tid
+ * namespace is the host one: PI futex words and robust-list recovery
+ * carry kernel tids, so the guest's own tid view must match — the
+ * kernel writes its tid into FUTEX_LOCK_PI words and dying-owner
+ * recovery compares against it). */
+void i686_thread_registry_set_host_tid(uint32_t tid, int host_tid);
+void i686_thread_registry_set_host_tid(uint32_t tid, int host_tid)
+{
+    size_t i;
+    (void)pthread_mutex_lock(&s_registry_lock);
+    for (i = 0; i < s_registry_n; i++) {
+        if (s_registry[i].tid == tid) {
+            s_registry[i].tid = (uint32_t)host_tid;
+            s_registry[i].host_tid = host_tid;
+            break;
+        }
+    }
     (void)pthread_mutex_unlock(&s_registry_lock);
 }
 
@@ -170,20 +201,206 @@ uint32_t i686_thread_registry_self_tid(const i686_ctx_t *ctx)
 }
 
 struct clone_arg {
-    i686_ctx_t *ctx;   /* child's private ctx copy (heap) */
-    uint32_t tid;      /* guest tid registered for this child (C1b) */
+    i686_ctx_t *ctx;          /* child's private ctx copy (heap) */
+    uint32_t tid;             /* pre-start registry tid (rekeyed at run) */
+    uint32_t parent_tid_va;   /* PARENT_SETTID word (musl's self->tid) */
+    uint32_t child_tid_va;    /* CHILD_SETTID word (glibc's tid slot) */
 };
+
+/* ---- blocked-target wake (fix-campaign C2) ----------------------------
+ * A guest thread sleeping in a host futex (pthread_cond_wait and
+ * friends) never reaches an interpreter safe point, so a pending
+ * signal bit set by another thread's tkill/tgkill is never polled and
+ * pthread_cancel/timers targeting it hang.  A raise with a deliverable
+ * (unmasked) bit therefore interrupts the target's host futex with a
+ * dedicated host signal: the futex returns -EINTR, the guest re-checks
+ * its futex value in interpreted code and reaches the safe-point poll,
+ * which delivers the pending signal.
+ *
+ * Host SIGUSR1 only: the guest's own signal namespace never touches
+ * host signal state, and the host-fault checkpoint (interp.c) is armed
+ * on the SIGSEGV/SIGBUS/SIGILL/SIGFPE family with its own handler — a
+ * second signal with an empty handler cannot interact with that jump
+ * buffer.  No SA_RESTART, deliberately: the EINTR is the point (the
+ * same EINTR a native kernel produces for an interrupting guest
+ * signal). */
+
+#define I686RT_HOST_WAKE_SIG SIGUSR1
+
+static pthread_once_t s_wake_once = PTHREAD_ONCE_INIT;
+
+static void wake_sig_handler(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig; (void)si; (void)uc; /* empty: the EINTR is the effect */
+}
+
+static void wake_sig_install(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = wake_sig_handler;
+    sa.sa_flags = SA_SIGINFO; /* NO SA_RESTART: the EINTR is the point */
+    (void)sigaction(I686RT_HOST_WAKE_SIG, &sa, NULL);
+}
+
+/* Interrupt target's host futex wait.  Called with the pending bit
+ * already set; errors ignored (a dead host tid simply raced an exit).
+ * No-op for the caller's own ctx: it is running and polls at its own
+ * safe points. */
+void i686_thread_registry_wake(i686_ctx_t *target);
+void i686_thread_registry_wake(i686_ctx_t *target)
+{
+    int host_tid = 0;
+    size_t i;
+
+    if (target == NULL || target == i686_current_ctx()) {
+        return;
+    }
+    (void)pthread_once(&s_wake_once, wake_sig_install);
+    (void)pthread_mutex_lock(&s_registry_lock);
+    for (i = 0; i < s_registry_n; i++) {
+        if (s_registry[i].ctx == target) {
+            host_tid = s_registry[i].host_tid;
+            break;
+        }
+    }
+    if (host_tid == 0 && target == s_main_ctx) {
+        host_tid = (int)getpid(); /* main thread: tid == pid */
+    }
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    if (host_tid > 0) {
+        (void)syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)host_tid,
+                      I686RT_HOST_WAKE_SIG);
+    }
+}
+
+/* ---- robust-list walk at thread exit (fix-campaign C2) ----------------
+ * The kernel walks the dying thread's robust list (exit_robust_list)
+ * when the guest never got to release its robust mutexes: every word
+ * still owned by this tid gains FUTEX_OWNER_DIED and, when the
+ * WAITERS bit shows a queued waiter, one waiter is futex-woken (it
+ * then observes EOWNERDEAD).  The translator walks the list itself:
+ * the guest head holds 32-bit guest pointers the host kernel cannot
+ * dereference.  musl sets the mutex word tid to the guest tid handed
+ * out by set_tid_address/gettid, so the ownership check uses the same
+ * registry tid that r_clone allocated. */
+
+#define FUTEX_WAITERS_BIT_      0x80000000u
+#define FUTEX_OWNER_DIED_BIT_   0x40000000u
+#define FUTEX_TID_MASK_         0x3fffffffu
+#define ROBUST_WALK_LIMIT_      1024u
+
+static int robust_fetch_u32(i686_ctx_t *ctx, uint32_t va, uint32_t *out)
+{
+    return i686_copy_from_guest(ctx, out, va, 4U);
+}
+
+/* kernel handle_futex_death: cmpxchg OWNER_DIED into the word while it
+ * still names this tid; wake one waiter when WAITERS is set (never for
+ * the list_op_pending entry, which may name a word under acquisition).
+ * The cmpxchg interlocks with guest LOCK-CMPXCHG executions on other
+ * interpreter threads; the window word is shared host memory. */
+static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
+                                uint32_t tid, int pending)
+{
+    volatile void *hp;
+    uint32_t uval;
+    int tries;
+
+    if (robust_fetch_u32(ctx, futex_va, &uval) != 0) {
+        return; /* faulted word: kernel stops the walk too */
+    }
+    if ((uval & FUTEX_TID_MASK_) != tid) {
+        return; /* not ours (or already recovered) */
+    }
+    hp = i686_guest_ptr(ctx, futex_va);
+    for (tries = 0; tries < 8; tries++) {
+        _Atomic uint32_t cur = uval;
+        if (atomic_compare_exchange_strong((_Atomic uint32_t *)hp, &cur,
+                                           uval | FUTEX_OWNER_DIED_BIT_)) {
+            break;
+        }
+        uval = cur; /* raced; retry like the kernel cmpxchg loop */
+    }
+    if (!pending) {
+        uint32_t after;
+        if (robust_fetch_u32(ctx, futex_va, &after) == 0 &&
+            (after & FUTEX_WAITERS_BIT_) != 0u) {
+            long hcmd = 1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/;
+            (void)syscall(SYS_futex, (void *)hp, hcmd, 1, NULL, NULL, 0);
+        }
+    }
+}
+
+static void robust_exit_walk(i686_ctx_t *ctx, uint32_t tid)
+{
+    struct {
+        uint32_t list;        /* struct robust_list __user *next */
+        int32_t  futex_offset;
+        uint32_t list_op_pending;
+    } head;
+    uint32_t entry, pending;
+    size_t n;
+
+    if (ctx->robust_list_head == 0U) {
+        return;
+    }
+    if (i686_copy_from_guest(ctx, &head, ctx->robust_list_head,
+                             sizeof(head)) != 0) {
+        return;
+    }
+    pending = head.list_op_pending;
+    entry = head.list;
+    for (n = 0; n < ROBUST_WALK_LIMIT_; n++) {
+        uint32_t next;
+        if (entry == 0U || entry == ctx->robust_list_head) {
+            break; /* empty or end of the circular list */
+        }
+        if (robust_fetch_u32(ctx, entry, &next) != 0) {
+            break; /* faulted next pointer: stop the walk */
+        }
+        robust_handle_death(ctx, entry + (uint32_t)head.futex_offset,
+                            tid, 0);
+        entry = next;
+    }
+    if (pending != 0U) {
+        robust_handle_death(ctx, pending + (uint32_t)head.futex_offset,
+                            tid, 1);
+    }
+}
 
 static void *thread_entry(void *arg)
 {
     struct clone_arg *ca = arg;
     i686_ctx_t *ctx = ca->ctx;
-    uint32_t tid = ca->tid;
+    uint32_t pre_tid = ca->tid;
+    uint32_t parent_tid_va = ca->parent_tid_va;
+    uint32_t child_tid_va = ca->child_tid_va;
+    uint32_t tid;
     free(ca);
 
     (void)pthread_once(&s_once, make_key);
     (void)pthread_setspecific(s_ctx_key, ctx);
     s_thread_ctx = ctx;
+    (void)pthread_once(&s_wake_once, wake_sig_install);
+
+    /* Adopt the host tid as the guest tid BEFORE any guest code runs
+     * (the kernel writes the true tid through CHILD_SETTID before the
+     * first instruction): PI futex ops write the kernel tid into the
+     * futex word and robust-list recovery compares against it, so the
+     * guest's tid view (set_tid_address/gettid, musl mutex words) must
+     * be the same number.  musl's self->tid is the PARENT_SETTID word
+     * (shared TLS, visible to the child); glibc's is CHILD_SETTID.
+     * The pre-start synthetic registry key is replaced in the same
+     * step. */
+    tid = (uint32_t)syscall(SYS_gettid);
+    i686_thread_registry_set_host_tid(pre_tid, (int)tid);
+    if (parent_tid_va != 0U) {
+        (void)i686_copy_to_guest(ctx, parent_tid_va, &tid, 4U);
+    }
+    if (child_tid_va != 0U) {
+        (void)i686_copy_to_guest(ctx, child_tid_va, &tid, 4U);
+    }
 
     /* Interpreter runs until the thread exits. The engine entry point
      * is provided by the coordinator glue (interp loop over the copy);
@@ -201,6 +418,10 @@ static void *thread_entry(void *arg)
             (void)i686_interp_run(ctx);
         }
     }
+    /* Robust-list recovery BEFORE the exit cleartid, in kernel do_exit
+     * order: a waiter woken EOWNERDEAD may join behind us, and the
+     * cleartid is the join-release event. */
+    robust_exit_walk(ctx, tid);
     /* CLONE_CHILD_CLEARTID: clear the tid word and futex-wake it
      * (kernel exit_mm/exit_notify behavior).  The registry entry is
      * removed first, so a concurrent tkill sees -ESRCH for this dead
@@ -305,7 +526,11 @@ static int64_t r_clone(i686_ctx_t *ctx)
     child->gpr[I686_REG_ESP] = newsp;
     child->gpr[I686_REG_EAX] = 0U;
     child->eip = child_eip;
-    child->host_tid = 0;
+    /* Threads share the thread group: getpid() reports the tgid (the
+     * process's live pid), not the thread's tid. */
+    child->host_tid = (int)getpid();
+    ca->parent_tid_va = 0U;
+    ca->child_tid_va = 0U;
 
     if ((flags & I686_CLONE_SETTLS) != 0U && tls_va != 0U) {
         /* Kernel-faithful (RC7b T4c): a bad TLS descriptor fails the
@@ -342,9 +567,15 @@ static int64_t r_clone(i686_ctx_t *ctx)
         uint32_t tid = s_next_tid++;
         if ((flags & I686_CLONE_PARENT_SETTID) != 0U && parent_tid != 0U) {
             (void)i686_copy_to_guest(ctx, parent_tid, &tid, 4U);
+            /* pre-start view; thread_entry rewrites the true (host)
+             * tid before any guest code runs */
+            ca->parent_tid_va = parent_tid;
         }
         if ((flags & I686_CLONE_CHILD_SETTID) != 0U && child_tid != 0U) {
             (void)i686_copy_to_guest(child, child_tid, &tid, 4U);
+            /* pre-start view; thread_entry rewrites the true (host)
+             * tid before any guest code runs */
+            ca->child_tid_va = child_tid;
         }
         if ((flags & I686_CLONE_CHILD_CLEARTID) != 0U && child_tid != 0U) {
             child->clear_child_tid = child_tid;
@@ -370,6 +601,12 @@ void i686_threads_main_init(i686_ctx_t *ctx)
     (void)pthread_once(&s_once, make_key);
     s_thread_ctx = ctx;
     (void)pthread_setspecific(s_ctx_key, ctx);
+    /* The main thread's host tid IS the process pid (kernel main-thread
+     * tid == pid convention): sys_getpid's lockstep rule reads this
+     * field, and set_tid_address/gettid return it — the tid namespace
+     * is the host one so kernel-owned futex words (PI ops, robust-list
+     * recovery, cleartid wakes) agree with the guest's view. */
+    ctx->host_tid = (int)getpid();
     i686_thread_registry_main(ctx);
     i686_sys_register(120 /* clone */, r_clone);
 }

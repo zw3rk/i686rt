@@ -63,13 +63,33 @@ static i686_ctx_t *sys_thread_resolve_tid(i686_ctx_t *ctx, int32_t tid)
 }
 
 /* set the pending bit exactly as an in-guest raise would (interp/v86.c
- * set the same bit shape); sig has been range-checked by the caller. */
+ * set the same bit shape); sig has been range-checked by the caller.
+ *
+ * Kernel raise semantics (fix-campaign C2): an ignored, unblocked
+ * signal is discarded at generation (sig_ignored); the pending bit of
+ * a MASKED signal stays set and delivers at unmask.  A target asleep
+ * in a host futex never reaches a safe point to poll the bit, so a
+ * deliverable bit is followed by the blocked-target wake (clone.c:
+ * host SIGUSR1, empty handler, interrupts the futex with EINTR).  A
+ * masked bit must NOT wake the target — the kernel keeps it sleeping
+ * too. */
 static long sys_thread_raise(i686_ctx_t *target, int32_t sig)
 {
+    extern int i686_gsig_is_ignored(int signum);
+    extern void i686_thread_registry_wake(i686_ctx_t *target);
+    uint64_t bit;
+
     if (sig == 0) {
         return 0; /* existence probe: kernel delivers nothing */
     }
-    target->pending_signals |= (uint64_t)1U << (uint32_t)(sig - 1);
+    bit = (uint64_t)1U << (uint32_t)(sig - 1);
+    if ((target->sig_mask & bit) == 0ULL && i686_gsig_is_ignored(sig)) {
+        return 0;
+    }
+    target->pending_signals |= bit;
+    if ((target->sig_mask & bit) == 0ULL) {
+        i686_thread_registry_wake(target);
+    }
     return 0;
 }
 

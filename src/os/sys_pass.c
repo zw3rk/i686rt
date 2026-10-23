@@ -257,7 +257,10 @@ int pipe2(int [2], int);
 #define FUTEX_CMP_REQUEUE_     4u
 #define FUTEX_WAKE_OP_         5u
 #define FUTEX_LOCK_PI_         6u
+#define FUTEX_UNLOCK_PI_       7u
+#define FUTEX_TRYLOCK_PI_      8u
 #define FUTEX_WAIT_BITSET_     9u
+#define FUTEX_WAKE_BITSET_    10u
 #define FUTEX_WAIT_REQUEUE_PI_ 11u
 #define FUTEX_CMP_REQUEUE_PI_  12u
 #define FUTEX_PRIVATE_FLAG_    128u
@@ -543,6 +546,16 @@ struct i686_gsigaction *i686_gsig_tab(int signum)
     v.restorer = s_sigact[signum].restorer;
     memcpy(v.mask, &s_sigact[signum].mask, sizeof(v.mask));
     return &v;
+}
+
+/* Ignored-disposition probe for the cross-thread raise path (the
+ * kernel's sig_ignored rule: an ignored, unblocked signal is discarded
+ * at generation; a blocked one must queue because the disposition can
+ * change before unmask).  handler == 1 is the SIG_IGN store. */
+int i686_gsig_is_ignored(int signum);
+int i686_gsig_is_ignored(int signum)
+{
+    return (signum >= 1 && signum <= 64 && s_sigact[signum].handler == 1U);
 }
 
 
@@ -1289,33 +1302,54 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
      * (the kernel rejects a zero bitset with -EINVAL -> glibc
      * clockwait callers spin) and silently dropped the realtime clock
      * flag from absolute waits.
+     *
+     * The i386 arg4 register (ESI, the "utime" slot) carries TWO
+     * different things by command class (kernel/futex/sys_i386_32.c
+     * passes it as `struct timespec __user *` and do_futex reinterprets
+     * it): a timeout for WAIT/LOCK_PI/WAIT_BITSET/WAIT_REQUEUE_PI, but
+     * the raw val2 word for REQUEUE/CMP_REQUEUE (nr_requeue),
+     * WAKE_OP (nr_wake2) and CMP_REQUEUE_PI (nr_requeue).  Passing the
+     * requeue class as a (NULL) timeout pointer zeroes val2 at the
+     * host: CMP_REQUEUE woke its nr_wake count and requeued NOBODY, so
+     * musl/glibc broadcast waiters stranded on the source futex until
+     * their own timeout — the pthread_cond/once timeout cluster.
+     * WAIT_REQUEUE_PI also needs uaddr2 (the PI target) marshalled.
      */
     static const uint32_t timeout_cmds =
         (1u << FUTEX_WAIT_) | (1u << FUTEX_LOCK_PI_) |
         (1u << FUTEX_WAIT_BITSET_) | (1u << FUTEX_WAIT_REQUEUE_PI_);
     static const uint32_t uaddr2_cmds =
         (1u << FUTEX_REQUEUE_) | (1u << FUTEX_CMP_REQUEUE_) |
+        (1u << FUTEX_WAKE_OP_) | (1u << FUTEX_WAIT_REQUEUE_PI_) |
+        (1u << FUTEX_CMP_REQUEUE_PI_);
+    static const uint32_t val2_cmds =
+        (1u << FUTEX_REQUEUE_) | (1u << FUTEX_CMP_REQUEUE_) |
         (1u << FUTEX_WAKE_OP_) | (1u << FUTEX_CMP_REQUEUE_PI_);
     uint32_t cmd = op & FUTEX_CMD_MASK_;
     uint32_t utime_va = ctx->gpr[I686_REG_ESI];
     uint32_t uaddr2_va = ctx->gpr[I686_REG_EDI];
     uint32_t val3 = ctx->gpr[I686_REG_EBP];
-    struct timespec ts, *pts = NULL;
+    struct timespec ts;
+    void *arg4;
     void *huaddr2 = NULL;
     long r;
 
     if (guest_ptr_bad(uaddr)) {
         return -EFAULT;
     }
-    if (cmd < 32u && ((timeout_cmds >> cmd) & 1u) && utime_va != 0U) {
-        /* compat_get_timespec: s32 tv_sec sign-extended, u32 tv_nsec. */
+    arg4 = NULL;
+    if (cmd < 32u && ((timeout_cmds >> cmd) & 1u) != 0u && utime_va != 0U) {
+        /* compat_get_timespec: s32 tv_sec sign-extended, u32 nsec. */
         struct { int32_t sec; uint32_t nsec; } gts;
         if (i686_copy_from_guest(ctx, &gts, utime_va, sizeof gts) != 0) {
             return -EFAULT;
         }
         ts.tv_sec = (time_t)gts.sec;
         ts.tv_nsec = (long)gts.nsec;
-        pts = &ts;
+        arg4 = &ts;
+    } else if (cmd < 32u && ((val2_cmds >> cmd) & 1u) != 0u) {
+        /* raw val2 word (nr_wake2/nr_requeue), never dereferenced */
+        arg4 = (void *)(uintptr_t)ctx->gpr[I686_REG_ESI];
     }
     if (cmd < 32u && ((uaddr2_cmds >> cmd) & 1u)) {
         if (guest_ptr_bad(uaddr2_va)) {
@@ -1324,7 +1358,7 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
         huaddr2 = i686_guest_ptr(ctx, uaddr2_va);
     }
     r = (long)syscall(SYS_futex, i686_guest_ptr(ctx, uaddr), (unsigned int)op,
-                      (unsigned int)val, pts, huaddr2, (unsigned int)val3);
+                      (unsigned int)val, arg4, huaddr2, (unsigned int)val3);
     if (r < 0) {
         return (errno == EWOULDBLOCK) ? -EAGAIN : -errno;
     }
