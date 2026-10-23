@@ -549,3 +549,25 @@ branch.  No docker needed except none — this is a reading card.
   fallback). The #DE misdelivery root cause (fix-c3f-diagnosis.md) is
   the actionable C3 finding; its fix routes to a dedicated lane once
   signals_i386.c (C2) and engine.c (C6c) free up.
+
+## Coordinator log (close-out additions, 2026-10-24)
+
+- Real LTP rerun (after harness fix b316069): 25 pass / 19 fail /
+  1 timeout / 72 TCONF skips — test bodies reached, zero framework
+  setup deaths; residuals are body-level (fcntl leases on overlayfs,
+  fcntl31/32 ENOSYS class, fork stress).
+- Wine-under-dbt gate after the #DE fix: still fails, now inside
+  wine's dash wrapper discovery ("unable to find wine executable")
+  after an empty-path STATX probe sequence — a dash-under-dbt
+  divergence, SYSTRACE-documented; C3 residual (SPEC §7 item 3).
+- C2 post-fix rerun: 8/19 pass; fmodl/remainderl/remquo complete but
+  miscompute FPREM quotient bits (D73 class); second-generation
+  cancel still zeroed-sc; clocale/crypt pass unbounded.
+- D34 fixed and probe-verified (fixed: D34-OK rc=0; pre-fix control:
+  FAIL with smeared slot bytes).  Stashes dropped after the port.
+- New still-live finding recorded (SPEC §7 item 5): siglongjmp out
+  of a delivered-signal handler refaults in a loop — suspected C2
+  sigframe-rework fallout; the RC4 p4 fixture rots with the same
+  signature.
+- Spot list green: dash interp+dbt, busybox interp+dbt, wine
+  --version interp (wine-10.0, rc=0).

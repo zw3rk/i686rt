@@ -274,7 +274,12 @@ the open questions below replace the 2026-10-23 list.
    The LTP runner's relative-path bug (b316069) means every
    pre-campaign LTP log was vacuous — H2's "0/117 framework deaths"
    line should be read as "not measured"; the first real numbers are
-   the campaign's 25/117 with zero framework setup deaths.
+   the campaign's 25/117 with zero framework setup deaths.  The
+   campaign's own verification also exposed a handler-escape
+   regression: siglongjmp out of a delivered-signal handler refaults
+   in a loop (SIGRET restores eip onto the faulting instruction) —
+   suspected C2 sigframe-rework fallout; the RC4-era
+   test_p4_threads_signals fixture rots with the same signature.
 6. H3/DBT performance RE-SCOPED (C6): dead-flag elimination, block
    linking, and the dispatch-cost levers are implemented; the
    remaining ~3x CoreMark gap is the block-granular translation model

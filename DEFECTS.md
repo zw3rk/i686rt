@@ -1093,7 +1093,13 @@ zeroed sigcontext (eip=0) after the teardown-race fix ba4e54f; the
 overlap evidence (docs/lanes/fix-c2-rt32-evidence.md) and the narrowed
 signature are committed; (3) clocale_mbfuncs/crypt pass unbounded
 (71s/42s) — the fixed 30s wall bound under host load, not a defect;
-(4) tls_get_new-dtv — the pre-existing dlopen DSO-not-built class.
+  (4) tls_get_new-dtv — the pre-existing dlopen DSO-not-built class.
+  (5) The verification probe additionally exposed a handler-escape
+  regression: siglongjmp out of a delivered-signal handler no longer
+  escapes (SIGRET restores eip onto the faulting instruction and
+  refaults in a loop; the RC4-era test_p4_threads_signals fixture
+  rots with the same signature) — likely introduced by the C2
+  sigframe mask/sigreturn rework; SPEC §7 item 5.
 
 
 ## C3. verification — wine chain under engine=dbt (CLOSED: VERIFIED with a documented residual)
@@ -1214,10 +1220,25 @@ distinct 80-bit rounding/signed-zero cluster flips 22 math tests to
 fail (ceil(-0) -> +0 etc.) — recorded as measured; the cluster is the
 x87_80-mode evidence for the D63/D73-class fix lanes.
 
-## C12. hygiene — quarantine stashes + open D-series reconciliation (OPEN, P3)
+## C12. hygiene — quarantine stashes + open D-series reconciliation (CLOSED: RECONCILED)
 
-Two quarantine stashes from the Phase 5 lane leaks remain on master
-(`git stash list`); content largely superseded by committed fixes.
-Reconcile: drop or port anything still relevant, then re-read the
-open correctness entries of the D-series above and route still-live
-ones into this campaign's triage.
+Close-out: RECONCILED (lane/fix-c12, docs/lanes/fix-c12-stashes.md +
+fix-c12-dseries.md).  The two Phase-5 quarantine stashes held the
+D4-D12 audit comment set: 8 hunks superseded on master, 6 insn_tab.h
+hunks (D9-D12) silently reverted by the l5c merge resolution — the
+verified port patch is applied and both stashes are dropped.  The
+open D-series dispositions: 3 fixed-on-master (D13, D25, D31), 1 moot
+(D39), 15 still-live, all listed with evidence in
+docs/lanes/fix-c12-dseries.md.  The standout still-live entry, D34
+(the sigframe builder's 128-byte st_space overcopy corrupting
+__pad0/the FXSAVE header/mxcsr on every fpstate-bearing delivery),
+is FIXED in this close-out (per-register 10-byte copies; verified by
+tests/probe_sigframe_fpstate.c — D34-OK on the fixed build, smeared
+slot bytes on the pre-fix control); the stale futex header comment
+is corrected.  The remaining 14 still-live D-entries are routed:
+they stay recorded in the dseries document as the audit's live
+defect inventory for future triage (D57/D60/D63 x87, D26 exec_path
+lifetime, D27 fchmodat arm, D28 x87 env precedence, D37 rt-frame
+alignment, D41 settimeofday tz, D43 getdents64 cookie, D47 O_DIRECTORY
+F_GETFL, D51 shl AF, D52 openat low-page, D53 statfs range, D14 16-bit
+SS segment default).
