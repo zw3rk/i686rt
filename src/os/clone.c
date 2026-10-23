@@ -89,47 +89,17 @@ static void *thread_entry(void *arg)
     return NULL;
 }
 
+/* CLONE_SETTLS: kernel copy_thread semantics — the descriptor lives in
+ * src/os/ldt.c (i686_ldt_clone_settls, per-thread tls_desc[3] from RC7b
+ * triage-6).  The desc's entry_number (6..8, glibc passes the parent's
+ * GS entry) is honored verbatim: no -1 auto-alloc, no write-back, no
+ * slot recycling.  Returns 0 or a negative errno; the caller must fail
+ * the clone on error, like the kernel does. */
 int i686_tls_install(i686_ctx_t *ctx, uint32_t ud_va)
 {
-    i686_user_desc_t ud;
-    int slot;
+    extern long i686_ldt_clone_settls(i686_ctx_t *ctx, uint32_t ua);
 
-    if (i686_copy_from_guest(ctx, &ud.entry_number, ud_va, 4U) != 0) {
-        return -EFAULT;
-    }
-    if (ud.entry_number == 0xFFFFFFFFU || ud.entry_number > 2U) {
-        for (slot = 0; slot < 3; slot++) {
-            if (ctx->gdt_tls_slots[slot] == 0U) {
-                break;
-            }
-        }
-        if (slot == 3) {
-            slot = 0; /* recycle slot 0 (v1: one TLS per thread) */
-        }
-        ud.entry_number = (uint32_t)(6 + slot);
-        if (i686_copy_to_guest(ctx, ud_va, &ud.entry_number, 4U) != 0) {
-            return -EFAULT;
-        }
-    } else {
-        slot = (int)ud.entry_number - 6;
-        if (slot < 0 || slot > 2) {
-            return -EINVAL;
-        }
-    }
-    if (i686_copy_from_guest(ctx, &ud.base_addr, ud_va + 4U, 4U) != 0) {
-        return -EFAULT;
-    }
-    ctx->gdt_tls_slots[slot] = ud.base_addr;
-    ctx->seg_base[I686_SEG_GS] = ud.base_addr;
-    ctx->seg_sel[I686_SEG_GS] = (uint32_t)(0x33 + 8 * slot);
-    {
-        extern int i686_sigtrace_on(void);
-        if (i686_sigtrace_on()) {
-            (void)fprintf(stderr, "TLSSET tid=%d entry=%u base=%08x\n",
-                          (int)syscall(SYS_gettid), ud.entry_number, ud.base_addr);
-        }
-    }
-    return (int)ctx->seg_sel[I686_SEG_GS];
+    return (int)i686_ldt_clone_settls(ctx, ud_va);
 }
 
 static int64_t r_clone(i686_ctx_t *ctx)
@@ -207,7 +177,13 @@ static int64_t r_clone(i686_ctx_t *ctx)
     child->host_tid = 0;
 
     if ((flags & I686_CLONE_SETTLS) != 0U && tls_va != 0U) {
-        (void)i686_tls_install(child, tls_va);
+        /* Kernel-faithful (RC7b T4c): a bad TLS descriptor fails the
+         * clone (-EINVAL/-EFAULT), it is not ignored. */
+        long terr = i686_tls_install(child, tls_va);
+        if (terr != 0) {
+            free(child); free(ca);
+            return terr;
+        }
     }
     {
         /* Thread-forensics (RC7b T4b): child state at hand-off. */

@@ -47,8 +47,10 @@ typedef struct i686_thread_start {
     int        (*entry)(struct i686_thread_start *);
 } i686_thread_start_t;
 
-/* Install a user_desc as the child's GS base (CLONE_SETTLS). Handles
- * entry_number == -1 auto-alloc. Returns selector or -errno. */
+/* CLONE_SETTLS: install the child's user_desc per kernel copy_thread
+ * semantics (entry_number 6..8 honored verbatim, per-thread tls_desc;
+ * implementation in src/os/ldt.c).  Returns 0 or -errno; the caller
+ * fails the clone on error. */
 int i686_tls_install(i686_ctx_t *ctx, uint32_t ud_va);
 
 /* Registered by the coordinator (src/os/clone.c). */

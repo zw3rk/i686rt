@@ -1001,3 +1001,126 @@ the boot survives; exit codes truncate NTSTATUS (c0000135 -> 53).
 ACCEPTANCE: NOT passed — `wine cmd /c "echo ok"` still exits 53 without
 printing ok.  Escalation filed with the evidence above (section D) after
 three full-chain attempts (vdso-fault, teb-fault, NULL-thread variants).
+
+## RC7b triage T4c record (2026-10-22) — assigned blocker root-caused and
+## fixed (sysroot zlib closure, not the loader); T4b's escalated TLS
+## blocker root-caused and fixed; boot reaches wineboot's deep registry
+## phase; one escalation filed
+
+Lane T4c (worktree `../i686rt-t4`, branch `lane/7b-t4`, master merged at
+a8bbd04).  Card: root-cause the `Call from 7B6F2C52 to unimplemented
+function user32.dll.CreateDialogParamW` abort (suspected PE
+import/export lookup mistranslation).
+
+### A. Assigned root cause — NOT the PE loader; sysroot zlib1.dll is not
+###    on wine's dll path — FIXED (setup-wine32.sh)
+
+Repro: arm64 alpine:3.20 container, staging = fresh /tmp copy of
+_build/i686rt + _sysroot/debian-wine32-i386, prefix on container-local
+disk.  WINEDEBUG=+loaddll pinned it: `err:module:import_dll Library
+zlib1.dll (which is needed by C:\windows\system32\user32.dll) not
+found` -> user32 load fails c0000135 -> kernel32's delayed
+CreateDialogParamW hits the DelayLoadFailureHook -> the abort.  The
+master sysroot has libz-mingw-w64's zlib1.dll only at
+usr/i686-w64-mingw32/lib/zlib1.dll, which wine never searches
+(WINEDLLPATH = usr/lib/i386-linux-gnu/wine/i386-windows).
+
+Debian's mechanism: libwine:i386.postinst ("copy zlib dlls from
+libz-mingw", fired by the dpkg trigger on /usr/i686-w64-mingw32/lib)
+writes wine/i386-windows/zlib1.dll = mingw dll with bytes 64..95
+replaced by "Wine builtin DLL" + 16 zero bytes; wine's builtin loader
+needs the marker (a plain copy is accepted by the early boot but
+breaks post-prefix resolution — observed).  The qemu-i386 oracle on
+the SAME staging failed IDENTICALLY before the file was placed
+(same 0x...2C52 abort, kernelbase+0x12C52) and prints `ok` rc=0 in
+29 s after it.  tools/setup-wine32.sh now replicates the postinst
+transform (both mingw arches) and stamps i386-windows/zlib1.dll as a
+key file.
+
+### B. T4b's escalated TLS blocker (eip=0 via gs:0x10) — root-caused and
+###    FIXED
+
+I686RT_SIGTRACE showed the same gs=0033/<wine TEB> `call *%gs:0x10`
+faults, and the STA/STAV1/TLSSET/CLN forensics pinned BOTH halves:
+
+1. The v1 syscalls.c set_thread_area stub was the LIVE 243 handler
+   (h_seg.c's lazy i686_syscalls_ldt_init consumed ldt.c's guard
+   before i686_syscalls_init_once re-registered v1 — the inverted
+   supersede T4b documented).  It wrote only the per-PROCESS bare-base
+   gdt_tls_slots[], never the per-thread ctx->tls_desc[3] that triage-6
+   added, so the GDT TLS lookup ran on the v1 fallback with shared-slot
+   semantics.  Fix: the v1 stub now DELEGATES to ldt.c's
+   i686_sys_set_thread_area, making the live implementation independent
+   of registration order (src/os/syscalls.c).
+2. clone.c's i686_tls_install misread the CLONE_SETTLS desc: it treated
+   entry_number as a 0..2 slot index (glibc passes 6..8 — the parent's
+   GS entry per glibc i386 TLS_DEFINE_INIT_TP, TLS_GET_GS()>>3), so any
+   guest value took the allocate branch; with all three per-process
+   slots busy it "recycled slot 0", wrote 6 back into the guest desc,
+   and the new thread's TCB landed in entry 6 — exactly where wine's
+   start_thread then overwrote it with the TEB (STA entry=6), leaving
+   libc's %gs resolving to the TEB.  Fix: i686_ldt_clone_settls in
+   ldt.c implements kernel copy_thread semantics (entry 6..8 honored
+   verbatim, full descriptor into the child's per-thread tls_desc[slot]
+   + gdt_tls_slots fallback + seg_base/seg_sel GS refresh, no
+   write-back, no segment-register load); r_clone now fails the clone
+   on a bad descriptor like the kernel (src/os/clone.c, src/os/ldt.c,
+   src/os/threads.h).
+
+One deliberate normalization: a GDT index is architecturally 13 bits;
+glibc's unmasked TLS_GET_GS read leaves undefined upper register bits
+in the desc entry (oracle sees 0x0007, our boot 0x42007), so the clone
+path masks entry to 0x1FFF before the kernel 6..8 validation.
+
+Post-fix SIGTRACE: the full dance is kernel-shaped — per process
+preloader -1 -> 6, ld.so TCB -1 -> 7, wine TEB explicit 6; every
+CLONE_SETTLS child gets its TCB at entry 7 (its parent's GS entry) with
+CLNCHILD gs_sel=003b matching; no SIG lines, no REJECTED lines; the
+eip=0 fault class is gone from every run.
+
+### C. Remaining blocker (ESCALATED, evidence)
+
+With both fixes the boot advances well past every previously documented
+blocker: ntdll/kernelbase/user32 PE modules load and run, wineboot
+grinds through the deep registry phase (the +server trace shows healthy
+SAPI/COM key creation for minutes), and the earlier "Call from ...
+unimplemented function" abort never reappears.  The chain still does
+not complete:
+
+- Deterministic stall: after wineboot's registry phase (FreeType
+  warnings visible), boot threads grind in retry loops that burn CPU
+  forever.  Sampled by gdb + ctx inspection (interp engine): a wine PE
+  thread spinning glibc's cancellation `__write` wrapper (libc
+  0x1236a0) through the vDSO gateway at millions of iterations/s
+  (I686RT_TRACE T-lines), other threads looping on ioctl -> -ENOTTY and
+  ntdll buffer-size retries.  The wineserver's own loop freezes at the
+  vDSO gateway `ret` with a non-executable return address on its stack.
+- On a long run (23 min) the wineserver dies of guest glibc heap
+  corruption ("corrupted double-linked list" from the guest's malloc)
+  and shorter runs eventually exit 53 (c0000135 truncated) without
+  printing ok.
+- Oracle parity: qemu-i386 on the SAME staging completes in 29 s, rc=0,
+  `ok` on stdout.  The divergence is therefore translator-side, in the
+  wineserver client/server pipe-socket exchange (reply loss/desync is
+  the unifying suspect: every sampled loop is a retry of a
+  request/reply primitive), or a wild write surfacing under long
+  exposure.  Per-process per-instruction T traces are the working tool;
+  the I686RT_TRACE S/T stream is several GB per attempt, so the hunt
+  needs bounded sampling.
+
+This is a third distinct blocker after two fixed layers; escalating per
+the card instead of patching the client loops ad hoc.
+
+### D. Regression checks (final binary, all rc=0 unless noted)
+
+    dash -c "echo dash-ok; exit 7"  -> dash-ok, rc=7 (exit passthrough)
+    sh -c exec sh -c echo reexec-ok -> reexec-ok, rc=0
+    wine --version                  -> wine-10.0 (debian 10.0~repack-12+b1)
+    tools/test_insn_tab.py          -> L1A OK
+    build                           -> zero new warnings (the emit_sse.c
+                                       sse_emit_prefetch warning pre-exists)
+
+ACCEPTANCE: NOT passed — `wine cmd /c "echo ok"` does not print ok
+(latest DBT run: silent exit 53 at 391 s; oracle: ok rc=0 in 29 s).
+Escalation filed with the evidence above (section C) after two full-chain
+attempts plus the staged closure/TLS fixes.

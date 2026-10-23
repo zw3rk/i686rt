@@ -11,8 +11,9 @@
  * kernel's -4095..-1 window that guest libcs probe with IS_ERR_VALUE().
  *
  * Implemented in Phase 1 (smoke set): read(3), write(4), exit(1),
- * exit_group(252), brk(45), mmap2(192), set_thread_area(243), uname(122),
- * getpid(20).  Phase 2 L2f adds fork(2)/vfork(190)/wait4(114)/waitpid(7)
+ * exit_group(252), brk(45), mmap2(192), uname(122), getpid(20);
+ * set_thread_area(243) delegates to src/os/ldt.c (RC7b T4c).  Phase 2
+ * L2f adds fork(2)/vfork(190)/wait4(114)/waitpid(7)
  * (rusage converted to the kernel i386 layout); the layout-neutral set
  * lives in src/os/sys_pass.c.  Every other number returns -ENOSYS in EAX.
  *
@@ -59,13 +60,7 @@ long syscall(long, ...);
 #define I686_UTS_FIELDS 6U
 #define I686_UTS_TOTAL  (I686_UTS_FIELD * I686_UTS_FIELDS)
 
-/* Guest memory is little-endian x86; decode exactly rather than casting. */
-static uint32_t guest_le32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
+/* Guest memory is little-endian x86; encode exactly rather than casting. */
 static void guest_store_le32(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)(v & 0xFFU);
@@ -149,65 +144,23 @@ static long sys_uname(i686_ctx_t *ctx, uint32_t buf_va)
 }
 
 /*
- * set_thread_area(243): install a GDT TLS descriptor for the flat-model
- * v1 runtime.  The guest hands us a 16-byte struct user_desc (u32
- * entry_number, u32 base_addr, u32 limit, u32 flags); entry_number == -1
- * asks for the lowest free TLS entry, which is handed back through the
- * same guest field.  Bookkeeping is single-thread-minimal:
- * ctx->gdt_tls_slots[i] holds the installed base of GDT entry 6+i and 0
- * means free (a legitimate base of exactly 0 would be re-allocatable —
- * fine for one thread; revisit together with clone()).
+ * set_thread_area(243): DELEGATES to the kernel-faithful per-thread
+ * implementation in src/os/ldt.c (i686_sys_set_thread_area: full desc
+ * into ctx->tls_desc[slot], kernel tls_array semantics, RC7b triage-6).
+ * The registration of 243 by either init path (the v1 list here, or the
+ * lazy i686_syscalls_ldt_init from h_seg.c) therefore cannot choose the
+ * implementation — both resolve to the same handler (RC7b T4c).
  */
 static long sys_set_thread_area(i686_ctx_t *ctx, uint32_t ud_va)
 {
     if (ud_va > UINT32_MAX - 15U) {
         return -EFAULT; /* user_desc would wrap the 32-bit guest space */
     }
-    uint8_t *ud    = (uint8_t *)i686_guest_ptr(ctx, ud_va);
-    uint32_t entry = guest_le32(ud);
-    uint32_t base  = guest_le32(ud + 4U);
-
-    uint32_t slot;
-    if (entry == 0xFFFFFFFFU) {
-        slot = I686_TLS_SLOTS;
-        for (uint32_t i = 0U; i < I686_TLS_SLOTS; i++) {
-            if (ctx->gdt_tls_slots[i] == 0U) {
-                slot = i;
-                break;
-            }
-        }
-        if (slot == I686_TLS_SLOTS) {
-            return -ESRCH; /* all three TLS entries are in use */
-        }
-    } else {
-        if (entry < I686_GDT_ENTRY_TLS_MIN ||
-            entry >= I686_GDT_ENTRY_TLS_MIN + I686_TLS_SLOTS) {
-            return -EINVAL;
-        }
-        slot = entry - I686_GDT_ENTRY_TLS_MIN;
-    }
-
-    /* Kernel-faithful (RC7b T4b): set_thread_area installs the
-     * DESCRIPTOR only — GDT slot 6+slot gets the base, segment
-     * registers are untouched (the guest loads GS/FS itself; glibc's
-     * TLS_SET_GS and wine's start_thread both issue the mov).  The
-     * previous auto-load of GS here hijacked the register: wine's
-     * start_thread installs its TEB descriptor in GDT entry 6 for %FS,
-     * and auto-loading it into %GS clobbered the glibc TCB that
-     * __errno_location reads ([gs:0] became the TEB's ExceptionList =
-     * 0 -> fault at 0xffffffcf in the boot child). */
-    ctx->gdt_tls_slots[slot] = base;
-    guest_store_le32(ud, I686_GDT_ENTRY_TLS_MIN + slot);
     {
-        /* Thread-forensics (RC7b T4b). */
-        extern int i686_sigtrace_on(void);
-        if (i686_sigtrace_on()) {
-            (void)fprintf(stderr,
-                          "STAV1 tid=%ld entry=%u base=%08x\n",
-                          syscall(SYS_gettid), entry, base);
-        }
+        extern long i686_sys_set_thread_area(i686_ctx_t *ctx, uint32_t ua);
+
+        return i686_sys_set_thread_area(ctx, ud_va);
     }
-    return 0;
 }
 
 /* Cross-module by-nr re-entry (clone.c uses fork). */

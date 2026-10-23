@@ -27,23 +27,26 @@
  * set_thread_area(243)/get_thread_area(244): 16-byte user_desc at EBX;
  * entry_number == -1 auto-allocates the first free GDT TLS slot (6..8,
  * kernel i386 GDT_ENTRY_TLS_MIN; -ESRCH when all three are in use).
- * Installation mirrors the kernel's set_thread_area: the descriptor goes
- * into the segstate TLS slot AND ctx->gdt_tls_slots (the Phase 4 clone/
- * lookup path keeps working); the entry number is written back through
- * the same guest field.  A seg_not_present write frees the slot.  As the
- * v1 handler did (kept deliberately: guests boot through it), the new
- * selector is auto-loaded into GS on success — the kernel leaves GS
- * alone, guests issue the mov themselves (test_p4 does exactly that).
+ * Installation mirrors the kernel's set_thread_area: the full descriptor
+ * goes into the PER-THREAD ctx->tls_desc[slot] (RC7b triage-6, kernel
+ * tls_array semantics) AND the v1 bare-base ctx->gdt_tls_slots (the
+ * Phase 4 lookup fallback keeps working); the entry number is written
+ * back through the same guest field.  A seg_not_present write frees the
+ * slot.  Segment registers are never touched — the kernel leaves GS/FS
+ * alone, guests issue the mov themselves (RC7b T4b).
  *
- * DISPATCH WIRING (coordinator at S7 merge — do not duplicate): add one
- * line to i686_syscalls_init_once (src/os/syscalls.c) after the existing
- * registrations:
- *     i686_syscalls_ldt_init();
- * Until then i686_syscalls_ldt_init() is invoked lazily from the Phase-7
- * interp registration (src/interp/h_seg.c i686_interp_seg_init).  The v1
- * syscalls.c init re-registers 243 at the first syscall, so it wins for
- * set_thread_area until the wiring moves here; 123/244 have no v1
- * handler and are served by this file either way.
+ * CLONE_SETTLS is served by i686_ldt_clone_settls below (kernel
+ * copy_thread semantics: the desc's entry_number names the entry 6..8,
+ * no -1, no write-back, no segment-register side effect).
+ *
+ * DISPATCH WIRING: i686_syscalls_ldt_init() is invoked both lazily from
+ * the Phase-7 interp registration (src/interp/h_seg.c) and from
+ * i686_syscalls_init_once (src/os/syscalls.c).  Registration is
+ * last-wins, so the v1 syscalls.c stub re-registering 243 in between
+ * used to shadow this file's handler depending on init order (RC7b
+ * T4b).  The v1 stub now DELEGATES to i686_sys_set_thread_area, making
+ * the live implementation order-independent; 123/244 have no v1
+ * competitor and are served by this file either way.
  */
 
 #include <errno.h>
@@ -336,6 +339,82 @@ long i686_sys_set_thread_area(i686_ctx_t *ctx, uint32_t ua)
                           "STA tid=%d entry=%u base=%08x present=%u\n",
                           (int)syscall(SYS_gettid), entry, d.base,
                           (unsigned)((d.flags & I686_DESC_PRESENT) != 0u));
+        }
+    }
+    return 0;
+}
+
+/* CLONE_SETTLS (clone.c r_clone): kernel copy_thread/arch/x86 tls
+ * semantics (RC7b T4c).  The child's user_desc at ua carries the
+ * entry_number to install — 6..8, NO -1 allocation, and the field is
+ * NOT written back; glibc's i386 convention passes TLS_GET_GS()>>3
+ * (the parent's current GS entry), and the child inherits that GS
+ * selector value, so descriptor and register name the same entry.  As
+ * with set_thread_area(243), no segment register is loaded by the
+ * kernel.  Returns 0 or a negative errno; the caller must fail the
+ * clone on error, like the kernel does. */
+long i686_ldt_clone_settls(i686_ctx_t *ctx, uint32_t ua)
+{
+    uint8_t ud[16];
+    uint32_t entry;
+    uint32_t slot;
+    i686_segstate_t *st;
+    i686_desc_t d;
+
+    if (i686_copy_from_guest(ctx, ud, ua, sizeof(ud)) != 0) {
+        return -EFAULT;
+    }
+    /* A GDT index is architecturally 13 bits (the segment-register index
+     * field); entries above 0x1FFF do not exist.  glibc's i386
+     * TLS_GET_GS feeds the raw (unmasked) %gs read into
+     * tls_fill_user_desc, relying on the undefined upper bits of its
+     * "=q" asm output — the qemu-i386 oracle gets 7 there, our boot
+     * leaves 0x0021 residue (0x42007).  Mask to the architectural index
+     * width so the kernel-faithful 6..8 validation sees the same entry
+     * the oracle's silicon produces (RC7b T4c). */
+    entry = le32(ud) & 0x1FFFu;
+    if (entry < (uint32_t)I686_GDT_TLS_FIRST ||
+        entry >= (uint32_t)(I686_GDT_TLS_FIRST + I686_GDT_TLS_SLOTS)) {
+        {
+            /* Thread-forensics (RC7b T4c): rejected clone TLS desc. */
+            extern int i686_sigtrace_on(void);
+            if (i686_sigtrace_on()) {
+                (void)fprintf(stderr,
+                              "TLSSET tid=%d ua=%08x desc=%08x %08x %08x "
+                              "%08x gs=%04x REJECTED\n",
+                              (int)syscall(SYS_gettid), ua, le32(ud),
+                              le32(ud + 4u), le32(ud + 8u), le32(ud + 12u),
+                              (unsigned)ctx->seg_sel[I686_SEG_GS]);
+            }
+        }
+        return -EINVAL;
+    }
+    slot = entry - (uint32_t)I686_GDT_TLS_FIRST;
+
+    desc_from_user_desc(ud, &d);
+    {
+        i686_desc_t *ts = (i686_desc_t *)(void *)ctx->tls_desc[slot];
+
+        *ts = d; /* per-thread; kernel tls_array */
+    }
+    st = ldt_state(ctx);
+    if (st != NULL) {
+        st->gen++;
+    }
+    ctx->gdt_tls_slots[slot] =
+        (d.flags & I686_DESC_PRESENT) != 0u ? d.base : 0u;
+    /* The child's GS carries the inherited parent selector value, which
+     * names this same entry; refresh the segstate cache so %gs accesses
+     * resolve through the child's new descriptor, not the parent's. */
+    ctx->seg_base[I686_SEG_GS] = d.base;
+    ctx->seg_sel[I686_SEG_GS] = (uint32_t)((entry << 3) | 3u);
+    {
+        /* Thread-forensics (RC7b T4b/T4c). */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            (void)fprintf(stderr,
+                          "TLSSET tid=%d entry=%u base=%08x\n",
+                          (int)syscall(SYS_gettid), entry, d.base);
         }
     }
     return 0;
