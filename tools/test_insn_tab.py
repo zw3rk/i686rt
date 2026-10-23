@@ -149,6 +149,12 @@ EXPECTED_IDS += [
     "FCOMIP", "FISTP_m64",
     # 0F map
     "EMMS", "FXSAVE", "FXRSTOR",
+    # RC7b T4b: FISTTP (SSE3 truncate-store; wine's ntdll.dll)
+    "FISTTP_m32", "FISTTP_m64", "FISTTP_m16",
+    # RC7b T4b: FNSAVE (DD /6); FRSTOR rides the FUCOM slot handler
+    "FNSAVE",
+    # RC7b T4b: DA mod=3 register compare forms
+    "FCOM_STi", "FUCOM_STi", "FCOMP_STi",
 ]
 
 # CALL_Ev/JMP_Ev/PUSH_Ev are named in two contract lists (G5 and
@@ -348,16 +354,17 @@ S_GROUPS = [
                  "FSUB_m32", "FSUBR_m32", "FDIV_m32", "FDIVR_m32"], 0x00),
     ((0, 0xD9), ["FLD_m32", "FXCH", "FST_m32", "FSTP_m32",
                  "FLDENV", "FLDCW", "FNSTENV", "FNSTCW"], 0x00),
-    ((0, 0xDA), ["INVALID"] * 5 + ["FUCOMPP"] + ["INVALID"] * 2, 0x00),
-    ((0, 0xDB), ["FILD_m32", "INVALID", "FIST_m32", "FISTP_m32",
+    ((0, 0xDA), ["FCOM_STi", "FUCOM_STi", "FCOMP_STi", "INVALID",
+                 "FUCOMPP", "INVALID", "INVALID", "INVALID"], 0x00),
+    ((0, 0xDB), ["FILD_m32", "FISTTP_m32", "FIST_m32", "FISTP_m32",
                  "FNINIT", "FLD_m80", "FCOMI", "FSTP_m80"], 0x00),
     ((0, 0xDC), ["FADD_m64", "FMUL_m64", "FCOM_m64", "FCOMP_m64",
                  "FSUB_m64", "FSUBR_m64", "FDIV_m64", "FDIVR_m64"], 0x00),
-    ((0, 0xDD), ["FLD_m64", "INVALID", "FST_m64", "FSTP_m64",
-                 "FUCOM", "FUCOMP", "INVALID", "FNSTSW_m16"], 0x00),
+    ((0, 0xDD), ["FLD_m64", "FISTTP_m64", "FST_m64", "FSTP_m64",
+                 "FUCOM", "FUCOMP", "FNSAVE", "FNSTSW_m16"], 0x00),
     ((0, 0xDE), ["FADDP", "FMULP", "INVALID", "INVALID",
                  "FSUBRP", "FSUBP", "FDIVRP", "FDIVP"], 0x00),
-    ((0, 0xDF), ["FILD_m16", "INVALID", "FIST_m16", "FISTP_m16",
+    ((0, 0xDF), ["FILD_m16", "FISTTP_m16", "FIST_m16", "FISTP_m16",
                  "FNSTSW_AX", "FILD_m64", "FCOMIP", "FISTP_m64"], 0x00),
     # Phase 5 shared spec: 0F AE /2 LDMXCSR, /3 STMXCSR join the L5c
     # FXSAVE/FXRSTOR group slots; RC7b T1 binds /7 SFENCE (/4-/6 stay

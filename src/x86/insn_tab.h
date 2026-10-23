@@ -41,10 +41,11 @@
  *  - I686_OP_LEA_GvM is not named in the phase-1 identifier list, but 8D
  *    is required for flat-mode code; added for coordinator ratification.
  *  - Left INVALID per the contract (decode -> I686_EXIT_UNDEF, D2):
- *    x87's declined forms (FBLD/FBSTP BCD, FISTTP, the FIADD-class m16/
+ *    x87's declined forms (FBLD/FBSTP BCD, the FIADD-class m16/
  *    m32 integer arithmetic and FICOM, and the DA/DE C8-FF undefined
  *    second bytes -- decoded-but-declined modrm forms return UNDEF from
- *    their handlers instead), SSE3+ and the SSE/SSE2 leftovers not in
+ *    their handlers instead; FISTTP joined via RC7b T4b, FNSAVE/FRSTOR
+ *    via RC7b T4b), SSE3+ and the SSE/SSE2 leftovers not in
  *    the Phase 5 or RC7b T1 rows (MIN/MAX 5D/5F, SQRT family 51-53,
  *    0F 2D, SHUFPS 0F C6, ...), BCD (27 2F 37 3F D4-D6),
  *    I/O (E4-E7 EC-EF 6C-6F), far transfers (9A EA CA CB),
@@ -224,10 +225,12 @@ typedef enum {
     I686_OP_FLD_m80, I686_OP_FCOMI, I686_OP_FSTP_m80, I686_OP_FUCOMPP,
     I686_OP_FILD_m16, I686_OP_FIST_m16, I686_OP_FISTP_m16, I686_OP_FNSTSW_AX,
     I686_OP_FILD_m64, I686_OP_FCOMIP, I686_OP_FISTP_m64, I686_OP_FXSAVE,
-    I686_OP_FXRSTOR, I686_OP_SFENCE,
+    I686_OP_FXRSTOR, I686_OP_SFENCE, I686_OP_FISTTP_m32, I686_OP_FISTTP_m64,
+    I686_OP_FISTTP_m16, I686_OP_FNSAVE, I686_OP_FCOM_STi, I686_OP_FUCOM_STi,
+    I686_OP_FCOMP_STi,
 } i686_op_t;
 
-#define I686_OP_COUNT 360u /* including I686_OP_INVALID */
+#define I686_OP_COUNT 367u /* including I686_OP_INVALID */
 
 /* Per-opcode descriptor (frozen in docs/lanes/phase-1.md). */
 typedef struct {
@@ -896,18 +899,18 @@ static const i686_group_t i686_group_tab[] = {
       { { 6u, 0u, 0u }, { 0u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u },
         { 6u, 0u, 0u }, { 5u, 0u, 0u }, { 6u, 0u, 0u }, { 5u, 0u, 0u } },
       0x00u },
-    /* x87 DA: only DA E9 FUCOMPP; FIADD-class m32 declined */
+    /* x87 DA: mod=3 FCOM/FUCOM/FCOMP ST(i) (RC7b T4b); DA E9 FUCOMPP; FIADD-class m32 declined */
     { 0u, 0xDAu,
-      { I686_OP_INVALID, I686_OP_INVALID, I686_OP_INVALID, I686_OP_INVALID,
-        I686_OP_INVALID, I686_OP_FUCOMPP, I686_OP_INVALID, I686_OP_INVALID },
+      { I686_OP_FCOM_STi, I686_OP_FUCOM_STi, I686_OP_FCOMP_STi, I686_OP_INVALID,
+        I686_OP_FUCOMPP, I686_OP_INVALID, I686_OP_INVALID, I686_OP_INVALID },
       { { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u },
         { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u } },
       0x00u },
-    /* x87 DB: FISTTP /1 declined; FNCLEX/FNINIT via /4 mod=3; FUCOMI rides FLD_m80 mod=3 */
+    /* x87 DB: FISTTP /1 (RC7b T4b, SSE3 truncate-store); FNCLEX/FNINIT via /4 mod=3; FUCOMI rides FLD_m80 mod=3 */
     { 0u, 0xDBu,
-      { I686_OP_FILD_m32, I686_OP_INVALID, I686_OP_FIST_m32, I686_OP_FISTP_m32,
+      { I686_OP_FILD_m32, I686_OP_FISTTP_m32, I686_OP_FIST_m32, I686_OP_FISTP_m32,
         I686_OP_FNINIT, I686_OP_FLD_m80, I686_OP_FCOMI, I686_OP_FSTP_m80 },
-      { { 6u, 0u, 0u }, { 0u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u },
+      { { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u },
         { 0u, 0u, 0u }, { 6u, 0u, 0u }, { 0u, 0u, 0u }, { 6u, 0u, 0u } },
       0x00u },
     /* x87 DC: ST(0) op= m64fp64 or ST(i),ST(0) reversed */
@@ -917,12 +920,12 @@ static const i686_group_t i686_group_tab[] = {
       { { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u },
         { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u } },
       0x00u },
-    /* x87 DD: FFREE rides FLD_m64 mod=3; FUCOM* mod=3 only */
+    /* x87 DD: FISTTP /1 and FNSAVE /6 m108 (RC7b T4b); FRSTOR rides FUCOM /4 memory form; FFREE rides FLD_m64 mod=3; FUCOM* mod=3 only */
     { 0u, 0xDDu,
-      { I686_OP_FLD_m64, I686_OP_INVALID, I686_OP_FST_m64, I686_OP_FSTP_m64,
-        I686_OP_FUCOM, I686_OP_FUCOMP, I686_OP_INVALID, I686_OP_FNSTSW_m16 },
-      { { 6u, 0u, 0u }, { 0u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u },
-        { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 5u, 0u, 0u } },
+      { I686_OP_FLD_m64, I686_OP_FISTTP_m64, I686_OP_FST_m64, I686_OP_FSTP_m64,
+        I686_OP_FUCOM, I686_OP_FUCOMP, I686_OP_FNSAVE, I686_OP_FNSTSW_m16 },
+      { { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u },
+        { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 6u, 0u, 0u }, { 5u, 0u, 0u } },
       0x00u },
     /* x87 DE: ST(i),ST(0) then pop; memory FIADD-class declined */
     { 0u, 0xDEu,
@@ -931,11 +934,11 @@ static const i686_group_t i686_group_tab[] = {
       { { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u },
         { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u } },
       0x00u },
-    /* x87 DF: FISTTP /1 declined, FBLD/FBSTP declined; FUCOMIP rides FILD_m64 mod=3 */
+    /* x87 DF: FISTTP /1 (RC7b T4b), FBLD/FBSTP declined; FUCOMIP rides FILD_m64 mod=3 */
     { 0u, 0xDFu,
-      { I686_OP_FILD_m16, I686_OP_INVALID, I686_OP_FIST_m16, I686_OP_FISTP_m16,
+      { I686_OP_FILD_m16, I686_OP_FISTTP_m16, I686_OP_FIST_m16, I686_OP_FISTP_m16,
         I686_OP_FNSTSW_AX, I686_OP_FILD_m64, I686_OP_FCOMIP, I686_OP_FISTP_m64 },
-      { { 5u, 0u, 0u }, { 0u, 0u, 0u }, { 5u, 0u, 0u }, { 5u, 0u, 0u },
+      { { 5u, 0u, 0u }, { 5u, 0u, 0u }, { 5u, 0u, 0u }, { 5u, 0u, 0u },
         { 0u, 0u, 0u }, { 6u, 0u, 0u }, { 0u, 0u, 0u }, { 6u, 0u, 0u } },
       0x00u },
     /* 0F AE: FXSAVE /0 and FXRSTOR /1 m512; LDMXCSR /2 and STMXCSR /3 m32 (Phase 5 shared spec); /4-/6 (XSAVE family, LFENCE/MFENCE) declined; SFENCE /7 (RC7b T1) */

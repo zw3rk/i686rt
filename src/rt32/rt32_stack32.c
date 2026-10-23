@@ -125,6 +125,16 @@ int rt32_stack_setup(i686_ctx_t *ctx, const rt32_elf_info_t *elf_info,
         at_sysinfo_ehdr = ctx->vdso_base;             /* set by i686_vdso_map */
         at_sysinfo      = i686_vdso_vsyscall_addr(ctx);
     }
+    {
+        /* RC7b T4b forensics: what the auxv carries for the vDSO pair. */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            (void)fprintf(stderr,
+                          "AUXV vdso_mapped=%08x ehdr=%08x sysinfo=%08x\n",
+                          vdso_mapped, at_sysinfo_ehdr, at_sysinfo);
+
+        }
+    }
 
     i686_auxv_i386_args_t aux_args;
     memset(&aux_args, 0, sizeof(aux_args));
@@ -144,6 +154,18 @@ int rt32_stack_setup(i686_ctx_t *ctx, const rt32_elf_info_t *elf_info,
                                             I686_AUXV_I386_MAX_WORDS);
     if (aux_idx == 0U) {
         return -1;
+    }
+    {
+        /* RC7b T4b forensics: the full auxv as the guest will see it. */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            size_t ai;
+
+            for (ai = 0U; ai + 1U < aux_idx; ai += 2U) {
+                (void)fprintf(stderr, "AX %08x %08x\n",
+                              auxv[ai], auxv[ai + 1U]);
+            }
+        }
     }
 
     /* Frame layout: argc, argv[0..argc-1], NULL, envp[0..envc-1], NULL, auxv[] (16B-aligned) */

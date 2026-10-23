@@ -840,3 +840,164 @@ b. A wine client thread livelocks INSIDE the translator: repeated
 
 ACCEPTANCE: NOT passed — `wine cmd /c "echo ok"` does not yet print
 ok; escalation filed with the evidence above (section C).
+
+## RC7b triage T4b record (2026-10-22) — spin root-caused and fixed; boot
+## reaches wine's kernel32 loader; one escalation filed
+
+Lane T4b (worktree `../i686rt-t4`, branch `lane/7b-t4`, master merged at
+b79dc4a).  Card: the boot "spins forever in glibc's float128 parser".
+
+### A. Assigned root cause — NOT float128; wine's fault handler on a
+###    clobbered glibc TCB — FIXED
+
+Repro: arm64 alpine:3.20 container, staging at /w, fresh prefix per run.
+I686RT_SYSTRACE run: five host processes; the spinner is a
+clone(01200011)-forked boot child whose LAST syscall is set_thread_area
+(243), then ~1M guest insn/s with zero syscalls.  I686RT_TRACE decodes
+the spin cycle (one interpreted pass per iteration): ntdll.so
+save_context (0x3a130: fs/gs restore from the ucontext,
+clear_alignment_flag, FP save via the 0x39290 function that calls
+NtCurrentTeb()) re-entered from the top every iteration.  I686RT_SIGTRACE
+(new, env-gated) pins the deliveries: first `sig=11 trapno=14
+eip=682e0183 cr2=ffffffcf` (call __errno_location; mov (%eax) with
+eax=0xffffffcf = 0 + (-0x31) — a glibc static-TLS read of the thread
+pointer), then endless `eip=682c566d cr2=000001dc` — the handler itself
+faulting on NtCurrentTeb() (0x54370 = pthread_getspecific(teb_key))
+returning NULL: `mov 0x1dc(%eax),%eax` with eax=0.
+
+Root cause: our v1 set_thread_area(243) handler installed the descriptor
+AND auto-loaded the selector into %GS ("v1-compat").  The kernel never
+touches segment registers there; guests load GS/FS themselves.  wine's
+start_thread installs its TEB descriptor into GDT entry 6 for %FS (the
+teb=0x7ff92000 TEB), the auto-load pointed %GS at it, and glibc's
+__errno_location ([GOT+0x98] + %gs:0x0, i.e. TCB.sysinfo + errno_off)
+then read the TEB's ExceptionList (0) and faulted at 0xffffffcf.  The
+spin site (libc 0xd9043, "float128/strtof" by neighboring symbols) is
+actually glibc's 64-bit-time_t calendar arithmetic reached through the
+tzset/localtime chain — the symbols near it were never the enclosing
+function.
+
+Fix (src/os/syscalls.c, src/os/ldt.c): set_thread_area installs the
+descriptor only (gdt_tls_slots[slot] = base); no segment-register side
+effects.  Both the v1 handler and ldt.c's full handler are corrected;
+glibc's TLS_SET_GS and wine's start_thread issue the mov themselves.
+Note (escalation, wiring): the documented S7 supersede is inverted —
+h_seg.c's lazy i686_syscalls_ldt_init() consumes ldt.c's `static int
+s_done`, so the first syscall's v1 registration overwrites ldt.c's 243
+and the v1 handler is the live one; 123/244 still come from ldt.c (they
+have no v1 competitor).  Coordinator may want to make the supersede real.
+
+Fix (src/os/signals_i386.c): handler double-fault force-kill.  With
+SA_ONSTACK the re-delivery rewinds to the altstack top, so the T5 frame
+guard never fires and the same signal's handler re-ran forever.  When a
+live un-sigreturned frame for the SAME signal is present (both frame
+layouts keep sig at +4) the build now refuses delivery; the caller's
+diag+stop path then terminates the process — kernel force_sigsegv
+semantics.  Nested different-signal handlers stay legal.  This is what
+turned the infinite spin into a visible one-shot failure.
+
+### B. Further translator gaps fixed (each verified by the boot advancing)
+
+1. DD /6 FNSAVE m108 (src/interp/h_x87.c + tables): wine's ntdll.dll
+   start path saves/restores the x87 state around thread setup.
+   Implemented FNSAVE (save in the i387 image format + FINIT reset) and
+   FRSTOR (DD /4 memory form riding the FUCOM slot handler, L5c
+   sub-dispatch convention), with the abridged-tag conversion mirroring
+   FXSAVE/FXRSTOR.
+2. FISTTP (DB /1 m32, DD /1 m64, DF /1 m16): SSE3 truncate-store; C99
+   (int) conversions in wine's ntdll.dll.  x87_get_int_trunc() in
+   src/interp/x87.c (CW RC ignored, truncation always) + handlers.
+3. DA mod=3 register compares (DA C0+i FCOM / D0+i FUCOM / D8+i FCOMP):
+   hit by win32u.so's float compare code.  Handlers mirror h_fucom's CC
+   logic; FCOMP pops.
+   Tables: tools/gen_insn_tab.py (ops appended, ids stable; contract
+   count 359 -> 366; DA/DB/DD/DF rows), regenerated src/x86/insn_tab.h,
+   tools/test_insn_tab.py spot rows — L1A OK.  DBT declines the new ids
+   to the D2 interpreter path as with CMPXCHG8B.
+4. Guest execve must close FD_CLOEXEC host fds (src/os/syscalls.c
+   exec_close_cloexec_fds, run AFTER rt32_elf_load consumed the image
+   fd).  There is no host exec, so wineserver fork/spawn children
+   previously inherited the server's whole fd table; the request/reply
+   pipes ended up with both ends in the wrong process and the boot
+   deadlocked with everyone asleep (clients blocked reading replies the
+   server never saw).
+5. Guest execve tears the guest window down (src/rt32/rt32_vm.c
+   rt32_vm_reset_for_exec now munmaps [I686_LOW_GUARD_SIZE,
+   RT32_WINDOW_SIZE) and clears ctx->vdso_base).  The stale COW content
+   of the wineserver-inherited window otherwise surfaced as foreign TCBs
+   and foreign code in the fresh image, and i686_vdso_map's idempotence
+   on ctx->vdso_base skipped the vDSO re-map in fork children.
+6. Guest execve flushes the DBT JIT cache (src/dbt/engine.c
+   i686_dbt_flush_all, called from guest_regions_teardown): fork
+   children inherit the parent's COW JIT blocks; a new image loaded at
+   the same EIPs must not run the previous image's stale translations.
+7. Env-gated forensics following the I686RT_TRACE/SYSTRACE precedent
+   (all no-ops without I686RT_SIGTRACE=1): SIG delivery lines
+   (sig/trapno/eip/cr2/esp/frame/gs/ret/sysinfo), CLN/CLNCHILD clone
+   lines, TLSSET/STA/STAV1 set_thread_area lines, AUXV dump at stack
+   setup, BYTES dump at undecodable exits (interp.c).
+
+### C. Staging environment gaps (qemu-i386 oracle-confirmed, NOT
+###    translator bugs)
+
+The RC7b staging sysroot is missing two runtime files that Debian
+wine32 needs; qemu-i386 with the same staging fails identically at the
+same sites:
+
+- zlib1.dll (user32.dll imports it; without it user32 fails c0000135
+  and kernel32's delayed CreateDialogParamW hits the delay-load failure
+  hook — the "Call from ... unimplemented function" abort).  Debian
+  ships it in libz-mingw-w64 (i686 variant).
+- libgcc_s.so.1 (glibc pthread_exit; the sysroot has no libgcc_s at
+  all).  Debian ships it in libgcc-s1:i386.
+
+Both were restored into the container-local staging copy (never the
+read-only repo sysroot) and the boot advanced past each.  The staging
+refresh should add both files.
+
+### D. Remaining blocker (ESCALATED, evidence)
+
+With all of the above, the deterministic end state (~5 min, every run):
+the spawned boot children (services/rpcss pair) die at
+`pthread_sigmask`'s i386 vdso call `call *%gs:0x10` (libc 0x9aea1) with
+gs pointing at the WINE TEB (0x7ff92000: ExceptionList=0xffffffff,
+StackBase=0x012d0000, StackLimit=0x010d2000 — a wine TEB, not a glibc
+TCB), so TCB.sysinfo at gs:0x10 reads 0 -> eip=0.  wine's SIGSEGV
+handler then hits NtCurrentTeb()==NULL (teb_key unset this early) and
+the same-signal force-kill ends the child; the master reports
+`could not load kernel32.dll, status c0000135` and exits 53
+(0xc0000135 & 0xff — our exit truncation, cosmetic).
+
+The conflict: glibc's ld.so installs the main TCB via
+set_thread_area(entry=-1 -> GDT entry 6, base=main TCB), and wine's
+ntdll installs its TEB via clone(CLONE_SETTLS)+set_thread_area with
+entry_number=6 EXPLICITLY — both under our per-process
+gdt_tls_slots[] emulation.  On a real kernel the two coexist (the slot
+allocator hands out 6/7/8 and the loaders coordinate the remaining
+entries); the exact real-kernel entry allocation/inheritance dance for
+this wine/glibc pair is the open question — coordinator-level, likely
+needs the LDT/TLS slot model (entry numbering preserved through
+set_thread_area(-1), per-thread GDT shadow semantics across
+fork+exec) reviewed against SPEC 7.1 rather than patched ad hoc.
+Evidence available in full: /root/rfin*.err traces in the lab
+container, plus every repro step above.
+
+### E. Regression checks (final binary, all rc=0 unless noted)
+
+    dash -c "echo dash-ok; exit 7"  -> dash-ok, rc=7 (exit passthrough)
+    sh -c exec sh -c echo reexec-ok -> reexec-ok, rc=0
+    wine --version                  -> wine-10.0 (debian 10.0~repack-12+b1)
+    tools/test_insn_tab.py          -> L1A OK
+    build                           -> zero new warnings (the emit_sse.c
+                                       sse_emit_prefetch warning pre-exists)
+
+Also observed (pre-existing, not addressed here): translator processes
+survive timeout's SIGTERM (guest SIGTERM delivery under DBT-only loops
+has no safe point) — hung runs must be killed explicitly; the
+readlink("/proc/<pid>") walk in the early boot printed a garbage-final-
+component probe (canonicalize reading past our returned target) that
+the boot survives; exit codes truncate NTSTATUS (c0000135 -> 53).
+
+ACCEPTANCE: NOT passed — `wine cmd /c "echo ok"` still exits 53 without
+printing ok.  Escalation filed with the evidence above (section D) after
+three full-chain attempts (vdso-fault, teb-fault, NULL-thread variants).

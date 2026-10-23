@@ -34,11 +34,14 @@
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+long syscall(long, ...);
 
 #include "i686rt.h"
 #include "os/syscalls_i386.h"
 #include "os/marshal.h"
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -184,10 +187,26 @@ static long sys_set_thread_area(i686_ctx_t *ctx, uint32_t ud_va)
         slot = entry - I686_GDT_ENTRY_TLS_MIN;
     }
 
-    ctx->gdt_tls_slots[slot]   = base;
-    ctx->seg_base[I686_SEG_GS] = base;
-    ctx->seg_sel[I686_SEG_GS]  = I686_TLS_SELECTOR(I686_GDT_ENTRY_TLS_MIN + slot);
+    /* Kernel-faithful (RC7b T4b): set_thread_area installs the
+     * DESCRIPTOR only — GDT slot 6+slot gets the base, segment
+     * registers are untouched (the guest loads GS/FS itself; glibc's
+     * TLS_SET_GS and wine's start_thread both issue the mov).  The
+     * previous auto-load of GS here hijacked the register: wine's
+     * start_thread installs its TEB descriptor in GDT entry 6 for %FS,
+     * and auto-loading it into %GS clobbered the glibc TCB that
+     * __errno_location reads ([gs:0] became the TEB's ExceptionList =
+     * 0 -> fault at 0xffffffcf in the boot child). */
+    ctx->gdt_tls_slots[slot] = base;
     guest_store_le32(ud, I686_GDT_ENTRY_TLS_MIN + slot);
+    {
+        /* Thread-forensics (RC7b T4b). */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            (void)fprintf(stderr,
+                          "STAV1 tid=%ld entry=%u base=%08x\n",
+                          syscall(SYS_gettid), entry, base);
+        }
+    }
     return 0;
 }
 
@@ -446,6 +465,51 @@ static void free_strv(char **v)
 static void guest_regions_teardown(i686_ctx_t *ctx)
 {
     rt32_vm_reset_for_exec(ctx);
+    {
+        /* Exec invalidates the translation cache too (RC7b T4b): fork
+         * children inherit the parent's COW JIT blocks, and a new image
+         * at the same EIPs must not run the previous image's code. */
+        extern void i686_dbt_flush_all(void);
+        i686_dbt_flush_all();
+    }
+}
+
+/* Kernel exec semantics (RC7b T4b): execve closes every fd >= 3 that
+ * carries FD_CLOEXEC.  There is no host exec in the translator, so the
+ * guest's execve must do it here — wineserver fork/spawn children
+ * otherwise inherit the server's whole fd table (pipes, sockets, the
+ * epoll), and request/reply routing deadlocks with both ends of a
+ * request pipe resident in the wrong process. */
+static void exec_close_cloexec_fds(void)
+{
+    DIR *d;
+    struct dirent *de;
+
+    d = opendir("/proc/self/fd");
+    if (d == NULL) {
+        return;
+    }
+    while ((de = readdir(d)) != NULL) {
+        const char *n = de->d_name;
+        int fd = 0;
+        int fl;
+
+        for (const char *p = n; *p != '\0'; p++) {
+            if (*p < '0' || *p > '9') {
+                fd = -1;
+                break;
+            }
+            fd = fd * 10 + (*p - '0');
+        }
+        if (fd <= 2) {
+            continue;
+        }
+        fl = fcntl(fd, F_GETFD);
+        if (fl >= 0 && (fl & FD_CLOEXEC) != 0) {
+            (void)close(fd);
+        }
+    }
+    (void)closedir(d);
 }
 
 /* sysroot-aware execve open (RC7b): guest absolute paths resolve under
@@ -638,6 +702,10 @@ static int64_t r_execve(i686_ctx_t *ctx)
         return -ENOEXEC;
     }
     (void)close(fd);
+    /* Kernel exec semantics (RC7b T4b): the image is loaded and its fd
+     * consumed — now close every CLOEXEC fd before the new program
+     * starts (no host exec happens here, so nothing else does it). */
+    exec_close_cloexec_fds();
 
     ctx->exec_path = path; /* fresh auxv AT_EXECFN source */
     if (rt32_stack_setup(ctx, &info, (int)argc, argv, envp, &sp) != 0) {
