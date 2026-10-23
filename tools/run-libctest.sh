@@ -12,8 +12,13 @@
 #
 # The libc-test tree and its build products are cached under _build/
 # (gitignored); H2_FORCE_BUILD=1 forces a rebuild, H2_FORCE_FETCH=1 a
-# re-clone.  All containers are named, resource-limited and
-# timeout-bounded and verified removed (repo test lifecycle rules).
+# re-clone.  H2_X87_80=1 runs i686rt with --x87-80 (the exact 80-bit x87
+# mode, SPEC decision D9) and writes the TAP log to
+# tests/hardening/results/libctest-x87_80.tap instead of libctest.tap
+# (the default-mode log is never overwritten); with the knob unset the
+# behavior is exactly the default run.  All containers are named,
+# resource-limited and timeout-bounded and verified removed (repo test
+# lifecycle rules).
 #
 # Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
@@ -29,12 +34,19 @@ BUILD_TIMEOUT=${H2_BUILD_TIMEOUT:-5400}  # make bound (s)
 IMAGE=${H2_IMAGE:-alpine:3.20}
 FORCE_FETCH=${H2_FORCE_FETCH:-0}
 FORCE_BUILD=${H2_FORCE_BUILD:-0}
+X87_80=${H2_X87_80:-0}                   # 1 = pass --x87-80 to i686rt (D9)
+[ "$X87_80" = 1 ] || X87_80=0            # normalize: unset/other -> default
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD=$ROOT/_build
 CT=$BUILD/libc-test
 RESULTS=$ROOT/tests/hardening/results
-TAP=$RESULTS/libctest.tap
+if [ "$X87_80" = 1 ]; then
+    TAP=$RESULTS/libctest-x87_80.tap     # never overwrite the default log
+else
+    TAP=$RESULTS/libctest.tap
+fi
+TAP_NAME=${TAP##*/}
 INNER_BUILD=$BUILD/.h2-libctest-build.sh
 INNER_RUN=$BUILD/.h2-libctest-run.sh
 
@@ -142,6 +154,9 @@ TAP=${TAP:?}
 : "${TEST_TIMEOUT:=30}"
 : "${GLOBAL_TIMEOUT:=5400}"
 : "${ENGINE:=interp}"
+: "${X87_80:=0}"
+rt_flags=""
+if [ "$X87_80" = 1 ]; then rt_flags="--x87-80"; fi
 export I686RT_ENGINE="$ENGINE"
 
 class_of() {
@@ -190,7 +205,7 @@ for suite in functional regression math; do
             continue
         fi
         cd /tmp
-        timeout -s KILL "$TEST_TIMEOUT" "$RT" -- "$bin" >/tmp/h2.out 2>/tmp/h2.err
+        timeout -s KILL "$TEST_TIMEOUT" "$RT" $rt_flags -- "$bin" >/tmp/h2.out 2>/tmp/h2.err
         rc=$?
         i=$((i + 1))
         if [ "$rc" -eq 0 ]; then
@@ -231,6 +246,9 @@ container_clean h2-libctest-run
     echo "# host: $(uname -sm)"
     echo "# i686rt: sha256=$(sha256_of "$BUILD/i686rt")"
     echo "# engine: $ENGINE   per-test-timeout: ${TEST_TIMEOUT}s   global-bound: ${GLOBAL_TIMEOUT}s"
+    if [ "$X87_80" = 1 ]; then
+        echo "# x87: 80-bit exact mode (--x87-80; SPEC D9 measurement, H2_X87_80=1)"
+    fi
     echo "# containers: runtime $IMAGE linux/arm64, build $IMAGE linux/386 (gcc oracle)"
     echo "# source: $CT_URL @ $CT_COMMIT"
     echo "# suites: functional, regression, math (static -static.exe binaries;"
@@ -240,8 +258,9 @@ rc=0
 docker run --rm --name h2-libctest-run --platform linux/arm64 \
         --memory 2g --cpus 2 \
         -v "$BUILD:/w" -v "$RESULTS:/res" \
-        -e TAP=/res/libctest.tap \
+        -e TAP="/res/$TAP_NAME" \
         -e TEST_TIMEOUT="$TEST_TIMEOUT" -e GLOBAL_TIMEOUT="$GLOBAL_TIMEOUT" \
+        -e X87_80="$X87_80" \
         "$IMAGE" sh /w/.h2-libctest-run.sh || rc=$?
 container_verify_gone h2-libctest-run
 [ "$rc" -eq 0 ] || die "run container exited rc=$rc"

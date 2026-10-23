@@ -89,6 +89,110 @@ result_line() { # <tap>
     grep '^# RESULT ' "$1" | tail -n 1
 }
 
+suite_field() { # <tap> <suite> <field> — field from the "# SUITE <suite>" row
+    awk -v s="$2" -v f="$3" '/^# SUITE / && $3 == s {
+        for (i = 4; i <= NF; i++) { split($i, kv, "="); if (kv[1] == f) print kv[2] }
+    }' "$1" | tail -n 1
+}
+
+suite_pt() { # <tap> <suite> — "pass/total (rate%)"
+    p=$(suite_field "$1" "$2" pass); t=$(suite_field "$1" "$2" total)
+    [ -n "$p" ] && [ -n "$t" ] || die "no # SUITE $2 row in $1"
+    r=$(awk -v p="$p" -v t="$t" 'BEGIN { printf "%.1f%%", 100.0 * p / t }')
+    printf '%s/%s (%s)' "$p" "$t" "$r"
+}
+
+suite_delta() { # <tap-default> <tap-80bit> <suite> — pass-rate delta in pp
+    pd=$(suite_field "$1" "$3" pass); td=$(suite_field "$1" "$3" total)
+    p8=$(suite_field "$2" "$3" pass); t8=$(suite_field "$2" "$3" total)
+    [ -n "$pd" ] && [ -n "$td" ] && [ -n "$p8" ] && [ -n "$t8" ] || die "no # SUITE $3 row for delta"
+    awk -v pd="$pd" -v td="$td" -v p8="$p8" -v t8="$t8" \
+        'BEGIN { printf "%+.1f pp", 100.0 * (p8 / t8 - pd / td) }'
+}
+
+api_compiled() { # <tap> — "compiled/of" from the "# API api-compile" row
+    sed -n 's/^# API api-compile compiled=\([0-9]*\) of=\([0-9]*\) .*$/\1\/\2/p' "$1" | tail -n 1
+}
+
+tap_source_commit() { # <tap> — libc-test commit recorded in the header
+    sed -n 's/^# source: .* @ //p' "$1" | tail -n 1
+}
+
+tap_names() { # <tap> <suite> — sorted test names recorded in the tap
+    awk -v s="$2" '
+        index($0, " - " s "/") > 0 && $0 ~ /^(not )?ok [0-9]+ - / {
+            line = $0
+            sub(/^.* - /, "", line)
+            sub(/[ \t].*$/, "", line)
+            sub("^" s "/", "", line)
+            print line
+        }' "$1" | LC_ALL=C sort
+}
+
+pass_names() { # <tap> <suite> — sorted names of passing (non-skip) rows
+    awk -v s="$2" '
+        index($0, " - " s "/") > 0 && $0 ~ /^ok [0-9]+ - / && $0 !~ /# SKIP/ {
+            line = $0
+            sub(/^.* - /, "", line)
+            sub(/[ \t].*$/, "", line)
+            sub("^" s "/", "", line)
+            print line
+        }' "$1" | LC_ALL=C sort
+}
+
+suite_flips() { # <tap-default> <tap-80bit> <suite> — "gained/lost" pass counts
+    pd=$(pass_names "$1" "$3"); p8=$(pass_names "$2" "$3")
+    g=$(diff_names "$p8" "$pd" | wc -l | tr -d ' ')
+    l=$(diff_names "$pd" "$p8" | wc -l | tr -d ' ')
+    printf '%s/%s' "$g" "$l"
+}
+
+diff_names() { # <names-a> <names-b> — lines of a absent from b
+    [ -n "$1" ] || return 0
+    printf '%s\n' "$1" | C11_EXCL=$2 awk '
+        BEGIN {
+            n = split(ENVIRON["C11_EXCL"], arr, "\n")
+            for (i = 1; i <= n; i++) if (arr[i] != "") excl[arr[i]] = 1
+        }
+        !($0 in excl) { print }'
+}
+
+suite_drift() { # <tap-default> <tap-80bit> — one "- suite: ..." line per
+                # suite whose test-name sets differ, "" when identical
+    out=""
+    for s in functional regression math; do
+        dn=$(tap_names "$1" "$s"); xn=$(tap_names "$2" "$s")
+        if [ "$dn" != "$xn" ]; then
+            added=$(diff_names "$xn" "$dn")
+            removed=$(diff_names "$dn" "$xn")
+            line="$s:"
+            if [ -n "$added" ]; then line="$line added-upstream: $(printf '%s ' $added)"; fi
+            if [ -n "$removed" ]; then line="$line absent-from-80bit: $(printf '%s ' $removed)"; fi
+            out="$out
+- ${line% }"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# two-mode table (C11: SPEC D9 measurement) — emitted only when the
+# optional 80-bit log exists; without it the report is byte-identical
+# to the pre-C11 generator output.
+two_mode_table() { # <tap-default> <tap-80bit>
+    for s in functional regression math; do
+        d=$(suite_delta "$1" "$2" "$s")
+        fl=$(suite_flips "$1" "$2" "$s")
+        if [ "$s" = math ]; then
+            # the highlighted row: 80-bit exactness is what the math vectors demand
+            printf '| **%s** | %s | %s | **%s** | %s |\n' "$s" "$(suite_pt "$1" "$s")" "$(suite_pt "$2" "$s")" "$d" "$fl"
+        else
+            printf '| %s | %s | %s | %s | %s |\n' "$s" "$(suite_pt "$1" "$s")" "$(suite_pt "$2" "$s")" "$d" "$fl"
+        fi
+    done
+    printf '| api (compile-time) | %s compiled | %s compiled | n/a (oracle-side) | n/a |\n' \
+        "$(api_compiled "$1")" "$(api_compiled "$2")"
+}
+
 wall_of() { # <tap>
     sed -n 's/^# WALL seconds=\([0-9]*\)$/\1/p' "$1" | tail -n 1
 }
@@ -149,7 +253,7 @@ render_classes() { # <tap> <side-label>
 }
 
 header_lines() { # <tap>
-    grep -E '^# (date|host|i686rt|engine|containers|source|suites):' "$1" | sed 's/^# //'
+    grep -E '^# (date|host|i686rt|engine|x87|containers|source|suites):' "$1" | sed 's/^# //'
 }
 
 lc_p=$(result_field "$RES/libctest.tap" pass); lc_t=$(result_field "$RES/libctest.tap" total)
@@ -189,6 +293,50 @@ rate_of() { # <tap>
     api_line=$(grep -E '^# API api-compile ' "$RES/libctest.tap" | tail -n 1)
     if [ -n "$api_line" ]; then
         echo "($api_line — the api suite is compile-time-only, see README.md; not part of the runtime totals.)"
+        echo ""
+    fi
+    if [ -f "$RES/libctest-x87_80.tap" ]; then
+        grep -q '^# RESULT libctest ' "$RES/libctest-x87_80.tap" \
+            || die "libctest-x87_80.tap has no RESULT line"
+        echo "## Two-mode measurement: default x87 (64-bit) vs --x87-80 (exact 80-bit)"
+        echo ""
+        echo "Campaign C11 measurement of SPEC decision D9's exact 80-bit x87 mode"
+        echo "(no fix obligation): same runner, same bounds; the only knob is"
+        echo "\`H2_X87_80=1\` (\`i686rt --x87-80\`).  Default numbers are cited"
+        echo "from the committed log \`results/libctest.tap\`; 80-bit numbers from"
+        echo "\`results/libctest-x87_80.tap\`.  Delta = 80-bit pass rate minus"
+        echo "default pass rate, in percentage points; flips count per-suite tests"
+        echo "passing in exactly one of the two logs (gained/lost by 80-bit)."
+        echo ""
+        echo "| suite | default pass/total (rate) | --x87-80 pass/total (rate) | delta | flips (80-bit gained/lost) |"
+        echo "|---|---|---|---|---|"
+        two_mode_table "$RES/libctest.tap" "$RES/libctest-x87_80.tap"
+        echo ""
+        echo "The **math** delta is the D9 signal: musl's math vectors demand exact"
+        echo "80-bit x87 results (and fenv flags); functional/regression do not use"
+        echo "x87 transcendentals and are recorded as measured, no threshold."
+        echo "The api suite is compile-time-only in the i386 oracle container and"
+        echo "is translator- and mode-independent (listed for provenance)."
+        echo ""
+        drift=$(suite_drift "$RES/libctest.tap" "$RES/libctest-x87_80.tap")
+        echo "Source-tree note: default log libc-test @ $(tap_source_commit "$RES/libctest.tap"),"
+        echo "80-bit log libc-test @ $(tap_source_commit "$RES/libctest-x87_80.tap")."
+        if [ -n "$drift" ]; then
+            echo "Test-name drift (rows present in one log only; those suites' deltas"
+            echo "mix tree drift with mode — math/regression carry the D9 signal):"
+            printf '%s\n' "$drift"
+        else
+            echo "Test-name sets are identical in both logs."
+        fi
+        echo ""
+        echo "80-bit run header:"
+        echo ""
+        echo '```'
+        header_lines "$RES/libctest-x87_80.tap"
+        echo "wall: $(wall_of "$RES/libctest-x87_80.tap") s (run loop, excludes fetch/build)"
+        echo '```'
+        echo ""
+        echo "Raw 80-bit log: \`tests/hardening/results/libctest-x87_80.tap\`."
         echo ""
     fi
     echo "## LTP 20240930 subset (static i386, oracle-built) — per directory"
