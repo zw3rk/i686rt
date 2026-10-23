@@ -299,3 +299,16 @@ Regression: busybox echo ok under both engines.  Known residual
 leak per SMC event); the DBT same-block SMC tail (generation counter
 at block exit) is covered by the fault path instead of a pre-emptive
 block-end, per the a32rt precedent measured here.
+
+## H4 record (2026-10-23) — PASSED
+
+`nix build .#packages.x86_64-linux.i686rt-x86_64` (musl64 stdenv via
+the external x86_64-linux builder) produces the interpreter-only
+static-PIE binary (-DI686RT_NO_DBT compiles out the DBT, trampoline.S
+and rt32_a64_emit; the x86 musl epoll_event is packed like the i386
+guest's, asserts + size retargeted).  Acceptance (docker
+--platform linux/amd64, x86_64 kernel — ia32_emulation irrelevant:
+i686rt IS the translator):
+  i686rt -- experiments/E03-rosetta-elf32/hello-i386 -> rc=42
+  i686rt -- busybox-i686 sh -c 'echo hello-from-x86_64-host'
+    -> hello-from-x86_64-host, rc=0
