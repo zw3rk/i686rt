@@ -182,3 +182,12 @@ test-p5-hl: busybox ## RC5 through hl: busybox sh -c 'echo ok' smoke (coordinato
 	tools/hl-smoke.sh "$(HL_BIN)" "$(I686RT_BIN)" "$(BUSYBOX_I686)"
 
 .PHONY: test-p1-hl test-p2-hl test-p3-hl test-p4-hl test-p5-hl
+
+## ------------------------------------------------------------------ ##
+##  Phase H — H2: musl libc-test + LTP subset runners (hardening)      ##
+## ------------------------------------------------------------------ ##
+
+h2-report: ## Assemble tests/hardening/h2-report.md from the committed runner logs (run tools/run-libctest.sh and tools/run-ltp.sh first)
+	tests/hardening/mkreport.sh
+
+.PHONY: h2-report
