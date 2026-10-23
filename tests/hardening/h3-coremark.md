@@ -9,9 +9,9 @@ bounded runs of ONE static i386 CoreMark v1.01 binary on this host.
 
 | engine | binary | iterations | CoreMark Iterations/Sec | precise iters/s (wall) | wall / rc | validation |
 |---|---|---|---|---|---|---|
-| interp | i686rt default engine | 30000 | 71 | 71.5 | 419:0 | ok |
-| dbt | i686rt I686RT_ENGINE=dbt | 9000 | 23 | 23.8 | 378:0 | ok |
-| oracle | native i386 in docker linux/386 | 300000 | 5000 | 5000.0 | 60:0 | ok |
+| interp | i686rt default engine | 30000 | 63 | 63.5 | 472:0 | ok |
+| dbt | i686rt I686RT_ENGINE=dbt | 9000 | 21 | 20.9 | 429:0 | ok |
+| oracle | native i386 in docker linux/386 | 300000 | 3658 | 3614.4 | 83:0 | ok |
 
 Score = CoreMark's own "Iterations/Sec" output line (integer arithmetic in
 this build; identical rounding on all three sides).  The engines run
@@ -27,7 +27,7 @@ workload.
 ## Environment
 
 - Host: Darwin arm64 (docker desktop)
-- Run date (UTC): 2026-10-23T11:34:10Z
+- Run date (UTC): 2026-10-23T15:31:17Z
 - Oracle: docker `--platform linux/386 alpine:3.20` (gcc: gcc (Alpine 13.2.1_git20240309) 13.2.1 20240309).
   NOTE (honest environment statement): this is NOT qemu TCG.  Docker
   Desktop on Apple Silicon runs linux/386 containers with user-space x86
@@ -37,9 +37,9 @@ workload.
   "oracle" column records what was actually measured; it is a strong
   (host-translation-class) reference, not a qemu TCG reference.
 - Engines: docker `--platform linux/arm64 alpine:3.20` running `_build/i686rt`
-  (/Users/angerman/Projects/zw3rk/i686rt-h3/_build/i686rt sha256=8c43655697e4f752944d32e16bde8457411cd6b710cf9b8d52d23a60c11b0dc1), engine interp (default) and I686RT_ENGINE=dbt, one process
+  (/Users/angerman/Projects/zw3rk/i686rt-c6b/_build/i686rt sha256=abf567b088cfebae50afca02549a4f0d1dbcfae859af67c2bc81c490f53d831b), engine interp (default) and I686RT_ENGINE=dbt, one process
   per run, --memory 2g --cpus 2, inner bound `timeout -s KILL 600`.
-- CoreMark source: /Users/angerman/Projects/zw3rk/i686rt-h3/_build/coremark-1.01.tar.gz sha256=99c5a6d63af85a281b4e4d6ccb522c446653c435dfec9455ad73ef9e71f28bde
+- CoreMark source: /Users/angerman/Projects/zw3rk/i686rt-c6b/_build/coremark-1.01.tar.gz sha256=99c5a6d63af85a281b4e4d6ccb522c446653c435dfec9455ad73ef9e71f28bde
 - Build: `make PORT_DIR=linux compile XCFLAGS="-march=i686 -static
   -DPERFORMANCE_RUN=1 -DHAS_FLOAT=0"` in the linux/386 container.
   -DHAS_FLOAT=0 changes only score PRINTING ("%f" -> "%d"; the "CoreMark
@@ -83,7 +83,7 @@ wired to any output)".  Recorded for the lanes that own that work.
    FUCOMPP"; the registered h_fucompp handler is unreachable.  The dbt
    path dies through the D2 interpret-one-then-resume exit at the same
    eip.  Escalated to the coordinator (DEFECTS.md is not lane-owned).
-2. dbt slower than interp on this workload: ~23 vs ~71
+2. dbt slower than interp on this workload: ~21 vs ~63
    Iterations/Sec (H3 card context: dead-flag elimination and block
    linking are the levers the DBT is expected to pull; these are the
    honest baseline numbers they have to beat).  No DBTFALL fallback
@@ -106,4 +106,61 @@ wired to any output)".  Recorded for the lanes that own that work.
     PATH=<cross-musl-bin>:$PATH make build CC=<aarch64-unknown-linux-musl-gcc>
     tools/run-coremark.sh && make h3-coremark
 
-H3: interp=71 dbt=23 oracle=5000
+H3: interp=63 dbt=21 oracle=3658
+
+## C6b addendum (2026-10-23, block linking via IBTC — fix campaign card L-C6b)
+
+Third full-chain invocation, after C6a (dead-flag elimination) and C6b
+(trampoline dispatch loop linking BRANCH exits through ctx->ibtc slots;
+trampoline bumps ibtc_hits on every linked transfer).  Same canonical
+invocation and bounds; all three runs validated ("Correct operation
+validated"); containers named h3-coremark-{build,oracle,interp,dbt},
+bounded, removal verified.
+
+    H3: interp=63 dbt=21 oracle=3658
+
+Verdict: the C6b acceptance gate (dbt strictly ABOVE interp) FAILED —
+dbt measured 21 vs interp 63 on this run (committed baseline before
+C6a/C6b: interp=71 dbt=23; today's interp repeat is 63, so the host is
+~11% slower than the H3 record day — dbt's 21 vs 23 is the same story).
+Per the card: STOP, no benchmark iteration; the measured counter
+evidence below is the re-scope input.
+
+Where the time goes (I686RT_STATS=1 / I686RT_DBTTRACE=1, 500- and
+20-iteration dev runs, bounded arm64 containers):
+
+- `blocks=16527778 syscalls=13 blocks_compiled=0 chain_hits=0
+  ibtc_hits=29759854 flags_elided=26361379` over 500 CoreMark
+  iterations.  Chaining WORKS: 29.76M of 46.29M block executions
+  (64.3%) enter through the trampoline IBTC link, not the C loop.
+  blocks_compiled/chain_hits are dead counters on master (known).
+- The C engine loop still dispatches 33k blocks per iteration
+  (16.53M/500).  Each dispatch pays `sigsetjmp(fj,1)` — musl's
+  savemask setjmp performs an rt_sigprocmask syscall — plus fault
+  arm/disarm, the D8 flat-CS guard, the hash lookup, and the 40-insn
+  trampoline prologue/epilogue.  386,766 B-lines over 20 iterations =
+  19.3k C-dispatches/iteration; at the observed 20.9 it/s that is
+  ~50 ms/iteration, i.e. the entire wall time is the C-dispatch path.
+  The interpreter arms its fault checkpoint ONCE per run (interp.c,
+  RC7b T4d note) and has no per-insn syscall, which is why interp
+  wins by ~3x despite interpreting every insn.
+- Dispatch mix: 1144 distinct hot block EIPs vs 1024 direct-mapped
+  IBTC slots.  A slot stolen during warmup is never healed: the card
+  fills the slot only on a fresh compile, and an s_ht hit (cached
+  block, live code) does not refill.  The hottest loser (0x0804b140)
+  C-dispatches 1584 times per iteration, forever.
+
+Re-scope options for the coordinator (C6b's frozen 3-item task list is
+exhausted; the two structural levers sit outside it):
+
+1. Arm the DBT fault checkpoint once per i686_dbt_run and re-arm only
+   after a fault longjmp (mirror interp.c's RC7b T4d structure),
+   keeping the C7 graveyard drain at the frozen loop-top site.
+   Removes one rt_sigprocmask per dispatch (in engine.c, C6b-owned,
+   but it restructures the H1 checkpoint design — not sanctioned by
+   the card).
+2. IBTC associativity or refill-on-s_ht-hit for collision losers
+   (frozen ABI in i686rt.h + trampoline slot math — coordinator +
+   i686rt.h owner).
+3. Cheap D8-guard/hash fast path in the C loop (in-file, smaller
+   win than 1).
