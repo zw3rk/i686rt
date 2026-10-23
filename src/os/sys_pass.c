@@ -85,6 +85,7 @@
 #include "os/proc.h"
 #include "os/threads.h"
 #include <sys/ioctl.h>
+#include <sys/mman.h> /* msync(2) */
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -110,9 +111,11 @@ int pipe2(int [2], int);
 #define NR_open           5U /* [5]   {"open"}         */
 #define NR_openat   295U /* [295] {"openat"} */
 #define NR_writev         146U /* [146] {"writev"}       */
+#define NR_readv          145U /* [145] {"readv"}        */
 #define NR_close          6U /* [6]   {"close"}        */
 #define NR_readlink      85U /* [85]  {"readlink"}     */
 #define NR_lseek         19U /* [19]  {"lseek"}        */
+#define NR__llseek      140U /* [140] {"_llseek"}      */
 #define NR_link           9U /* [9]   {"link"}         */
 #define NR_mkdir         39U /* [39]  {"mkdir"}        */
 #define NR_rmdir         40U /* [40]  {"rmdir"}        */
@@ -158,10 +161,12 @@ int pipe2(int [2], int);
 #define NR_pipe2       331U /* [331] {"pipe2"}        */
 #define NR_pread64     180U /* [180] {"pread64"}      */
 #define NR_pwrite64    181U /* [181] {"pwrite64"}     */
+#define NR_ftruncate64 194U /* [194] {"ftruncate64"}  */
 #define NR_ioctl        54U /* [54]  {"ioctl"}        */
 #define NR_munmap       91U /* [91]  {"munmap"}       */
 #define NR_mprotect    125U /* [125] {"mprotect"}     */
 #define NR_mremap      163U /* [163] {"mremap"}       */
+#define NR_msync       144U /* [144] {"msync"}        */
 #define NR_personality 136U /* [136] {"personality"}  */
 #define NR_prctl       172U /* [172] {"prctl"}        */
 #define NR_rt_sigaction  174U /* [174] {"rt_sigaction"}  */
@@ -258,6 +263,13 @@ int pipe2(int [2], int);
 #define FUTEX_PRIVATE_FLAG_    128u
 #define FUTEX_CLOCK_REALTIME_  256u
 #define FUTEX_CMD_MASK_        0x7Fu
+
+/* msync(2) flags (include/uapi/asm-generic/mman-common.h;
+ * arch-independent).  Literals because the macOS unit-test host spells
+ * MS_SYNC 0x10.  Linux accepts exactly these three bits. */
+#define I686_MS_ASYNC      1u
+#define I686_MS_INVALIDATE 2u
+#define I686_MS_SYNC       4u
 
 /* Linux resource limits / stack constants. */
 #define NGROUPS_MAX_ 65536u
@@ -1402,6 +1414,52 @@ static int64_t r_writev(i686_ctx_t *ctx)
     return total;
 }
 
+/* readv(145): (fd, iov*, iovcnt) in EBX/ECX/EDX — the read mirror of
+ * r_writev above: same guest iovec shape, same 512-byte staging chunks,
+ * same UIO_MAXIOV cap and partial-transfer/EFAULT conventions (bytes
+ * already transferred are returned; a failure before any byte is the
+ * negative errno).  A short host read stops the transfer, like the
+ * kernel leaving the remaining iovs untouched on EOF/short input. */
+static int64_t r_readv(i686_ctx_t *ctx)
+{
+    int fd = (int)ctx->gpr[I686_REG_EBX];
+    uint32_t iov_va = ctx->gpr[I686_REG_ECX];
+    uint32_t cnt = ctx->gpr[I686_REG_EDX];
+    int64_t total = 0;
+    uint32_t i;
+
+    if (cnt > 1024U) {
+        return -EINVAL; /* UIO_MAXIOV */
+    }
+    for (i = 0U; i < cnt; i++) {
+        struct i686_iov_local iov;
+        uint8_t stk[512];
+        uint32_t off;
+        if (i686_copy_from_guest(ctx, &iov, iov_va + 8U * i, sizeof(iov)) != 0) {
+            return (total > 0) ? total : -EFAULT;
+        }
+        for (off = 0U; off < iov.len; off += sizeof(stk)) {
+            uint32_t chunk = iov.len - off;
+            ssize_t n;
+            if (chunk > sizeof(stk)) {
+                chunk = (uint32_t)sizeof(stk);
+            }
+            n = read(fd, stk, chunk);
+            if (n < 0) {
+                return (total > 0) ? total : -(int64_t)errno;
+            }
+            if (i686_copy_to_guest(ctx, iov.base + off, stk, (size_t)n) != 0) {
+                return (total > 0) ? total : -EFAULT;
+            }
+            total += n;
+            if ((size_t)n < chunk) {
+                return total;
+            }
+        }
+    }
+    return total;
+}
+
 static int64_t r_open(i686_ctx_t *ctx)
 {
     return sys_open(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
@@ -1426,6 +1484,38 @@ static int64_t r_lseek(i686_ctx_t *ctx)
     return host_ret_(lseek((int)ctx->gpr[I686_REG_EBX],
                            (off_t)(int32_t)ctx->gpr[I686_REG_ECX],
                            (int)ctx->gpr[I686_REG_EDX]));
+}
+
+/* _llseek(140): (fd, off_hi, off_lo, result ptr, whence) in
+ * EBX/ECX/EDX/ESI/EDI.  The 64-bit offset is the unsigned merge
+ * (u64)high<<32 | low (fs/read_write.c compat sys_32_llseek); the host
+ * seek's NEW position is written through the guest result POINTER and
+ * 0 is returned — it is NOT returned in EDX:EAX.  Kernel order: the
+ * whence range check precedes the fd lookup, so a bad whence is -EINVAL
+ * even with a bad fd; a successful seek whose result cannot be stored
+ * leaves the position changed and returns -EFAULT. */
+static int64_t r_llseek(i686_ctx_t *ctx)
+{
+    uint64_t off = ((uint64_t)ctx->gpr[I686_REG_ECX] << 32) |
+                   (uint64_t)ctx->gpr[I686_REG_EDX];
+    uint32_t res_va = ctx->gpr[I686_REG_ESI];
+    uint32_t whence = ctx->gpr[I686_REG_EDI];
+    off_t pos;
+    uint64_t res64;
+
+    if (whence > 2U) {
+        return -EINVAL;
+    }
+    pos = lseek((int)ctx->gpr[I686_REG_EBX], (off_t)off, (int)whence);
+    if (pos < 0) {
+        return -(int64_t)errno;
+    }
+    res64 = (uint64_t)pos;
+    if (guest_ptr_bad(res_va) ||
+        i686_copy_to_guest(ctx, res_va, &res64, sizeof(res64)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
 }
 
 static int64_t r_unlink(i686_ctx_t *ctx)
@@ -1720,6 +1810,18 @@ static int64_t r_pwrite64(i686_ctx_t *ctx)
                         ctx->gpr[I686_REG_EDI]);
 }
 
+/* ftruncate64(194): (fd, len_lo, len_hi) in EBX/ECX/EDX; the i386
+ * 64-bit length is the unsigned merge (u64)hi<<32 | lo
+ * (fs/open.c compat x86_ftruncate64, low word first).  The host off_t
+ * is 64-bit, so the merged value passes through; a negative merge
+ * (bit 63 set) hits the host's length < 0 -EINVAL like the kernel. */
+static int64_t r_ftruncate64(i686_ctx_t *ctx)
+{
+    off_t len = (off_t)(((uint64_t)ctx->gpr[I686_REG_EDX] << 32) |
+                        (uint64_t)ctx->gpr[I686_REG_ECX]);
+    return host_ret_(ftruncate((int)ctx->gpr[I686_REG_EBX], len));
+}
+
 static int64_t r_ioctl(i686_ctx_t *ctx)
 {
     return sys_ioctl(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
@@ -1746,6 +1848,26 @@ static int64_t r_mremap(i686_ctx_t *ctx)
                                 ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
                                 ctx->gpr[I686_REG_EDI]);
     return (long)(int32_t)r;
+}
+
+/* msync(144): (addr, len, flags) in EBX/ECX/EDX.  The guest window is
+ * host-mapped 1:1 modulo guest_base (offset mode), so the guest range
+ * rides i686_guest_ptr straight to the host msync — no reverse-mapping
+ * bookkeeping.  Linux accepts exactly MS_ASYNC(1)/MS_INVALIDATE(2)/
+ * MS_SYNC(4); the kernel rejects any other bit with -EINVAL
+ * (mm/msync.c) and so do we (nothing masked silently).  Alignment and
+ * mapping errors come back from the host kernel itself: the guest null
+ * page is unmapped on the host, so a low address yields the same
+ * -ENOMEM a native kernel would produce. */
+static int64_t r_msync(i686_ctx_t *ctx)
+{
+    uint32_t flags = ctx->gpr[I686_REG_EDX];
+
+    if ((flags & ~(I686_MS_ASYNC | I686_MS_INVALIDATE | I686_MS_SYNC)) != 0U) {
+        return -EINVAL;
+    }
+    return host_ret_int(msync(i686_guest_ptr(ctx, ctx->gpr[I686_REG_EBX]),
+                              (size_t)ctx->gpr[I686_REG_ECX], (int)flags));
 }
 
 static int64_t r_rt_sigaction(i686_ctx_t *ctx)
@@ -1803,9 +1925,11 @@ void i686_syscalls_pass_init(void)
     i686_sys_register(NR_open, r_open);
     i686_sys_register(NR_openat, r_openat);
     i686_sys_register(NR_writev, r_writev);
+    i686_sys_register(NR_readv, r_readv);
     i686_sys_register(NR_close, r_close);
     i686_sys_register(NR_readlink, r_readlink);
     i686_sys_register(NR_lseek, r_lseek);
+    i686_sys_register(NR__llseek, r_llseek);
     i686_sys_register(NR_unlink, r_unlink);
     i686_sys_register(NR_rmdir, r_rmdir);
     i686_sys_register(NR_mkdir, r_mkdir);
@@ -1852,10 +1976,12 @@ void i686_syscalls_pass_init(void)
     i686_sys_register(NR_pipe2, r_pipe2);
     i686_sys_register(NR_pread64, r_pread64);
     i686_sys_register(NR_pwrite64, r_pwrite64);
+    i686_sys_register(NR_ftruncate64, r_ftruncate64);
     i686_sys_register(NR_ioctl, r_ioctl);
     i686_sys_register(NR_munmap, r_munmap);
     i686_sys_register(NR_mprotect, r_mprotect);
     i686_sys_register(NR_mremap, r_mremap);
+    i686_sys_register(NR_msync, r_msync);
     i686_sys_register(NR_rt_sigaction, r_rt_sigaction);
     i686_sys_register(NR_rt_sigprocmask, r_rt_sigprocmask);
     i686_sys_register(NR_rt_sigpending, r_rt_sigpending);
