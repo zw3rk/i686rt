@@ -169,7 +169,31 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
      * guest registered one — the kernel uses it too.  The embedded
      * on-stack retcode is only the no-restorer fallback: the window
      * stack is rw-, so executing it would fault (musl libc-test found
-     * this — every musl sigaction carries SA_RESTORER). */
+     * this — every musl sigaction carries SA_RESTORER).
+     *
+     * The blocked mask rides IN the frame (kernel semantics): the
+     * handler runs under sig_mask | sig | sa_mask and sigreturn
+     * restores it.  musl's SIGCANCEL handler depends on this — it
+     * edits uc_sigmask and re-raises itself so the signal stays masked
+     * until the next cancellation point; without the frame mask the
+     * pending re-raise delivered at a random pc. */
+    {
+        uint64_t blocked = ctx->sig_mask | (1ULL << (uint32_t)(sig - 1));
+
+        blocked |= ((uint64_t)ga->mask[1] << 32) | (uint64_t)ga->mask[0];
+        /* Block NOW (the kernel blocks sig | sa_mask before running
+         * the handler, not at sigreturn): a signal re-raised by the
+         * handler must stay pending, not re-deliver nested. */
+        ctx->sig_mask = blocked;
+        if (sa_siginfo) {
+            /* uc_sigmask: ucontext@frame+0x90, +0x14 mcontext(88) -> +0x6c */
+            uint8_t m[8];
+            memcpy(m, &blocked, sizeof(m));
+            memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 0x6c), m, sizeof(m));
+        } else {
+            sc.oldmask = (uint32_t)blocked;
+        }
+    }
     if (sa_siginfo) {
         /* rt frame: sc lives in ucontext at frame+0x90+20 */
         memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 20), &sc, sizeof(sc));
@@ -227,7 +251,9 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
             (void)fprintf(stderr,
                           "SIG tid=%ld sig=%d trapno=%u eip=%08x cr2=%08x "
                           "esp=%08x frame=%08x gs=%04x/%08x ret=%08x "
-                          "sys=%08x tcb=%08x %08x %08x %08x\n",
+                          "sys=%08x tcb=%08x %08x %08x %08x\n"
+                          "SIGGPR ax=%08x bx=%08x cx=%08x dx=%08x "
+                          "si=%08x di=%08x bp=%08x\n",
                           syscall(SYS_gettid), sig, sc.trapno, sc.eip,
                           sc.cr2, ctx->gpr[I686_REG_ESP], frame_va,
                           ctx->seg_sel[I686_SEG_GS],
@@ -235,7 +261,9 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
                           *(const uint32_t *)(const void *)(tcbdump + 0),
                           *(const uint32_t *)(const void *)(tcbdump + 4),
                           *(const uint32_t *)(const void *)(tcbdump + 8),
-                          *(const uint32_t *)(const void *)(tcbdump + 12));
+                          *(const uint32_t *)(const void *)(tcbdump + 12),
+                          sc.eax, sc.ebx, sc.ecx, sc.edx, sc.esi, sc.edi,
+                          sc.ebp);
         }
     }
     ctx->gpr[I686_REG_ESP] = frame_va;
@@ -269,14 +297,25 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
     }
     if (i686_sigtrace_on()) {
         (void)fprintf(stderr,
-                      "SIGRET rt=%d esp=%08x frame=%08x rec=%08x\n",
+                      "SIGRET rt=%d esp=%08x frame=%08x rec=%08x "
+                      "ax=%08x bp=%08x eip=%08x\n",
                       rt, ctx->gpr[I686_REG_ESP], frame,
-                      ctx->sig_last_frame_va);
+                      ctx->sig_last_frame_va, sc.eax, sc.ebp, sc.eip);
     }
     ctx->sig_last_frame_va = 0U;
     base = frame + (rt ? (0x90U + 20U) : 8U);
     if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
         return -1;
+    }
+    /* Restore the blocked mask from the frame (the delivery blocked
+     * sig | sa_mask; the handler may have edited uc_sigmask — musl's
+     * SIGCANCEL re-raise relies on the edit surviving). */
+    if (rt) {
+        uint8_t m[8];
+        memcpy(m, i686_guest_ptr(ctx, frame + 0x90U + 0x6cU), sizeof(m));
+        memcpy(&ctx->sig_mask, m, sizeof(ctx->sig_mask));
+    } else {
+        ctx->sig_mask = (uint64_t)sc.oldmask;
     }
     ctx->gpr[I686_REG_EDI] = sc.edi; ctx->gpr[I686_REG_ESI] = sc.esi;
     ctx->gpr[I686_REG_EBP] = sc.ebp; ctx->gpr[I686_REG_ESP] = sc.esp;
