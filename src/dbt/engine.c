@@ -36,6 +36,19 @@ static dbt_entry_t s_ht[DBT_HT_SIZE];
 static int s_trace_dbt;   /* S lines (I686RT_TRACE) */
 static int s_trace_blocks; /* B lines (I686RT_DBTTRACE, diagnostics) */
 
+/* C7: dead-marked blocks are never munmapped at the dead-mark site
+ * (mid-flight use-after-free is what H1 fixed); instead their mapping
+ * parks in this bounded graveyard until a safe point where no emitted
+ * block can still be on the host stack.  Drain happens ONLY at the top
+ * of the i686_dbt_run dispatch loop and in i686_dbt_flush_all.  When
+ * the graveyard is full the oldest entry is munmapped immediately, so
+ * a SMC storm parks at most 255 blocks between two safe points. */
+static struct {
+    uint8_t *code;
+    size_t cap;
+} s_graveyard[256];
+static size_t s_graveyard_n;
+
 /* D11 SMC (Phase H H1): guest pages the DBT translated from are
  * write-protected in the host window; a guest store faults, we drop
  * the page's blocks, restore RW, and the handler returns so the store
@@ -80,6 +93,37 @@ static void smc_protect(i686_ctx_t *ctx, uint32_t eip)
     }
 }
 
+/* Park a dead-marked block's mapping in the graveyard (oldest entry
+ * munmapped on overflow; munmap here is safe: on overflow the victim
+ * has been parked across at least 255 later dead-marks). */
+static void dbt_graveyard_push(uint8_t *code, size_t cap)
+{
+    size_t j;
+
+    if (s_graveyard_n == 256U) {
+        munmap(s_graveyard[0].code, s_graveyard[0].cap);
+        for (j = 1U; j < s_graveyard_n; j++) {
+            s_graveyard[j - 1U] = s_graveyard[j];
+        }
+        s_graveyard_n--;
+    }
+    s_graveyard[s_graveyard_n].code = code;
+    s_graveyard[s_graveyard_n].cap = cap;
+    s_graveyard_n++;
+}
+
+/* Munmap every parked dead block and reset the graveyard.  Safe point
+ * ONLY: no emitted block may be on the host stack here. */
+static void dbt_graveyard_drain(void)
+{
+    size_t i;
+
+    for (i = 0U; i < s_graveyard_n; i++) {
+        munmap(s_graveyard[i].code, s_graveyard[i].cap);
+    }
+    s_graveyard_n = 0U;
+}
+
 /* D11: drop every translated block with eip in [start,end), unprotect
  * the pages, and clear IBTC/RAS entries that may chain into the freed
  * code (use-after-free guard). */
@@ -101,9 +145,15 @@ void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start, uint32_t end)
             /* Dead-mark, never munmap mid-flight: the syscall that
              * triggered this invalidation exited from this very block
              * and the engine's post-syscall path may still reference
-             * its code (H1: instant SIGSEGV otherwise).  The
-             * direct-mapped eviction frees dead entries on reuse. */
+             * its code (H1: instant SIGSEGV otherwise).  C7: the
+             * mapping parks in the bounded graveyard instead of
+             * leaking until direct-mapped eviction. */
             s_ht[i].eip = 0xFFFFFFFFU;
+            dbt_graveyard_push(s_ht[i].code, s_ht[i].cap);
+            s_ht[i].code = NULL;
+            s_ht[i].cap = 0U;
+            s_ht[i].len = 0U; /* slot empty: eviction and flush_all
+                               * must not munmap the parked mapping */
         }
     }
     if (ctx != NULL) {
@@ -151,9 +201,16 @@ int i686_dbt_smc_write_fault(uint64_t host_addr)
                 s_ht[i].eip < end) {
                 /* Mark dead WITHOUT freeing: the faulting store may
                  * itself run inside this block (same-block SMC), and
-                 * the host PC must stay mapped until it exits.  The
-                 * direct-mapped eviction frees it on reuse. */
+                 * the host PC must stay mapped until it exits.  C7:
+                 * the mapping parks in the bounded graveyard instead
+                 * of leaking until direct-mapped eviction. */
                 s_ht[i].eip = 0xFFFFFFFFU;
+                dbt_graveyard_push(s_ht[i].code, s_ht[i].cap);
+                s_ht[i].code = NULL;
+                s_ht[i].cap = 0U;
+                s_ht[i].len = 0U; /* slot empty: eviction and
+                                   * flush_all must not munmap the
+                                   * parked mapping */
             }
         }
         if (s_run_ctx != NULL) {
@@ -198,6 +255,7 @@ void i686_dbt_flush_all(void)
     }
     memset(s_code_pages, 0, sizeof(s_code_pages)); /* pages die with the
         image (exec teardown munmaps the window anyway) */
+    dbt_graveyard_drain(); /* dead blocks from this image's SMC history */
 }
 
 static uint32_t dbt_hash(uint32_t eip)
@@ -266,6 +324,10 @@ int i686_dbt_run(i686_ctx_t *ctx)
     s_smc_window_base = ctx->guest_base;
     s_smc_window_end = ctx->guest_base + 0x100000000ULL;
     for (;;) {
+        /* C7 safe point (frozen call site): dispatch boundary — no
+         * emitted block is on the host stack, so dead-marked blocks
+         * can be reclaimed here. */
+        dbt_graveyard_drain();
         if (sigsetjmp(fj, 1) != 0) {
             uint64_t fa = i686_fault_addr();
             extern int i686_deliver_sync(i686_ctx_t *, int);
