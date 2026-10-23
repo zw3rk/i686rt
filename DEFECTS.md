@@ -1021,6 +1021,27 @@ UPSTREAM (owned outside this repo), MEASURE (measurement gap).
 Each entry lists the fix sites, a verification command, and lane
 suitability for the parallel fix campaign (GOAL-DEFECTS.md).
 
+Fix-campaign close-out (2026-10-24): every entry below now carries a
+`Close-out:` line with its terminal state.  Commits cited: freeze
+2061d1c, C5 f4336d0, C4 7e5d7a2+d5a3f45, C1b merge (lane/fix-c1b),
+C1a f24db6e, C7, C11 59da1ef, C6a, C6b, C6c, C2 merge, fix batch
+ba4e54f, LTP harness b316069.
+
+## C1. correctness/coverage — eight unimplemented syscalls (CLOSED: FIXED)
+
+Close-out: FIXED.  C1a (_llseek 140, readv 145, msync 144,
+ftruncate64 194, statx 383; f24db6e) and C1b (tkill 238, tgkill 270,
+sched_getaffinity 242, set/get_robust_list 311/312, plus set_tid_address
+258 superseded to return the caller tid and gettid 224; lane/fix-c1b)
+merged.  Verification: the C1a fd fixture passes under both engines;
+the C1b fixture prints its tkill/tgkill/affinity/robust PASS line;
+`tools/run-libctest.sh` = 135/343 (H2 floor 125/343, no regression);
+the LTP rerun after harness repair b316069 reaches test bodies:
+25 pass / 19 fail / 1 timeout / 72 skip (TCONF) / 117 — zero framework
+setup deaths; residual fails are body-level (fcntl lease family fails
+on overlayfs, fork stress under interpreter speed, fcntl31/32 ENOSYS
+class) and routed to SPEC §7.
+
 ## C1. correctness/coverage — eight unimplemented syscalls (OPEN, P0)
 
 Per-syscall detail (i386 numbers, kernel ABI, known consumers):
@@ -1056,105 +1077,142 @@ libctest count must not regress; fseek/ftello tests flip to pass.
 Lane-suitable: two parallel lanes (C1a: file-descriptor class — 140,
 145, 144, 194, 383; C1b: thread/sched class — 238, 242, 311, 312).
 
-## C2. correctness — pthread cancel/cond/robust/once timeouts (OPEN, P0)
+## C2. correctness — pthread cancel/cond/robust/once timeouts (CLOSED: PARTIALLY FIXED, remainder root-caused)
 
-19 libctest timeouts, all livelock/deadlock signatures.  Evidence
-cluster (H2 + T3/T4d records): PI relock EDEADLK path,
-FUTEX_WAIT_REQUEUE_PI, cancellation delivery (tkill — C1b),
-robust-list wake (C1b).  Likely a mix of missing syscalls and futex
-command semantics; T4d fixed the base WAIT/WAKE/REQUEUE/CMP_REQUEUE +
-WAIT_BITSET/WAKE_BITSET ABI, the PI family (FUTEX_LOCK_PI 6.. 9,
-WAIT_REQUEUE_PI 11+13) is unverified.  Root-cause first (one lane,
-tools/probe_strfuncs-style dual-oracle futex PI fixtures), then fix.
-Files: src/os/sys_pass.c (sys_futex), src/os/clone.c, threads.h.
-Verification: the 19 named tests move from timeout to pass/fail-with-
-output; a new unit test pins the PI semantics vs the host kernel.
+Close-out: the delivery/futex cluster is fixed and the cluster left the
+timeout class for 8 of 19 (lane/fix-c2 + fix batch ba4e54f): futex
+val2/requeue + PI re-encode (host-oracle-identical PI fixture), kernel
+pending-signal semantics, robust exit walk, blocked-target wake, dual
+cleartid wake (fixes the C10 join route), FPREM indefinite C2 (the 11
+math timeouts).  Rerun disposition: pass=8 fail=5 timeout=6.  Remaining,
+each root-caused: (1) fmodl/remainderl/remquo family completes with
+wrong quotient-bit state — the D73 fprem partial-remainder class, routed
+there; (2) functional/pthread_cancel, regression/pthread_once-deadlock,
+regression/raise-race — second-generation cancellation still restores a
+zeroed sigcontext (eip=0) after the teardown-race fix ba4e54f; the
+overlap evidence (docs/lanes/fix-c2-rt32-evidence.md) and the narrowed
+signature are committed; (3) clocale_mbfuncs/crypt pass unbounded
+(71s/42s) — the fixed 30s wall bound under host load, not a defect;
+(4) tls_get_new-dtv — the pre-existing dlopen DSO-not-built class.
 
-## C3. verification — wine chain under engine=dbt (VERIFY, P1)
 
-RC7b recorded the stall; H1 found the DBT engine never installed the
-host-fault handler (any window fault killed the process) and fixed
-it.  Never re-run: `I686RT_ENGINE=dbt wine cmd /c "echo ok"` with the
-RC7b environment.  If it passes, close; if it stalls, capture
-I686RT_SYSTRACE of the first retry loop and route to the coordinator.
-Files (if broken): src/dbt/engine.c, interp.c checkpoint.
+## C3. verification — wine chain under engine=dbt (CLOSED: VERIFIED with a documented residual)
 
-## C4. correctness — round_pack80 directed-rounding deep-tiny (OPEN, P2)
+Close-out: the RC7b-era stall is confirmed FIXED by H1's host-fault
+checkpoint (lane/fix-c3 record: full wine boot, prefix install
+completes under dbt).  The gate then exposed deterministic guest #DE
+misdeliveries — root-caused by lane/fix-c3f as stale-ctx->exit_arg
+classification in i686_deliver_sync (the DBT writes exit_arg=0 on
+every BRANCH exit, so plain page faults arrived as divide errors at
+stale block-start EIPs) — FIXED in ba4e54f.  Residual (open, SPEC §7):
+the gate now fails earlier, inside wine's dash wrapper discovery
+("unable to find wine executable") after an empty-path STATX probe
+sequence — a dash-under-dbt divergence isolated with SYSTRACE
+(docs/lanes/fix-c3-trace.md, _build/fix-c3-raw/).  The interp chain
+prints ok rc=0.  Full wine-on-dbt remains H5/H6-class DBT maturity
+work.
 
-src/interp/x87_80.c round_pack80's eff<0 branch returns signed zero
-under every RC; IEEE-correct toward -inf/+inf takes 1 ulp of the min
-subnormal for the matching sign.  Mirror the to_ieee_bits fix
-(e31dccc) — but keep the RC5 golden baseline stable (nearest-mode
-behavior must be bit-identical).  Verification: extend
-unit/x87_80 tests with directed-mode vectors below 2^-16446; golden
-re-run must show 0 diff.
+## C4. correctness — round_pack80 directed-rounding deep-tiny (CLOSED: FIXED)
 
-## C5. correctness/SSE — MOVDQA alignment #GP interpreter-only (OPEN, P2)
+Close-out: FIXED (merged 7e5d7a2).  round_pack80's eff<0 branch now
+rounds a nonzero tiny inexact value of matching sign to the minimum
+extended subnormal under toward-infinity; nearest, toward-zero, and
+opposite-sign keep the signed zero (mirrors e31dccc).  56 directed
+vectors below/around 2^-16446 added to test_l5d; the RC5 golden
+comparison reports 0 diff in both modes.  The lane's escalation also
+exposed a Makefile defect (test-p5-lima stripped X87ONLY from the
+golden side only, making the default compare unwinnable) — fixed in
+d5a3f45.
 
-h_sse raises #GP(0) on misaligned MOVDQA/MOVDQU stores; emit_sse.c
-emits unaligned-capable NEON moves (T1 record; same class as the
-ratified v1 MOVAPS deviation).  Either emit an explicit alignment
-check path in DBT or ratify the deviation in SPEC with a fixture that
-asserts the difference.  Files: src/dbt/emit_sse.c, SPEC.md if
-ratified.
+## C5. correctness/SSE — MOVDQA alignment #GP interpreter-only (CLOSED: RATIFIED)
 
-## C6. performance — DBT 3x slower than the interpreter (OPEN, P0-perf)
+Close-out: RATIFIED (f4336d0).  The whole aligned-SSE-move class
+(MOVAPS/MOVAPD/MOVDQA/MOVNTDQ/MOVNTQ) is defined to raise no #GP(0)
+on misaligned EAs in v1, identically in both engines; the
+interpreter-only checks were dropped, SPEC D10 records the rationale,
+and tests/probe_sse_align.c asserts the semantics (SSE-ALIGN-OK,
+exit 0, interp + dbt; a native i386 CPU faults where i686rt
+succeeds).
 
-CoreMark baseline (H3): interp=71, dbt=23, oracle=5000 iter/s.
-Named-but-unimplemented H3 work: dead-flag elimination across blocks
-(src/dbt/flags_dbt.c: materialise lazy descriptors only when a block
-exit reads them — the ctx counters flags_elided exists), and block
-linking (src/dbt/engine.c + trampoline.S: direct block-to-block
-chains via the IBTC slots).  Coordinator-design first (frozen
-contract), then lanes.  Acceptance: re-run
-`tools/run-coremark.sh` — dbt strictly above interp with CRCs intact;
-record new H3 line.
+## C6. performance — DBT 3x slower than the interpreter (CLOSED: RE-SCOPED, coordinator rationale)
 
-## C7. hygiene — SMC dead-mark reclamation (OPEN, P2)
+Close-out: RE-SCOPED with this written rationale.  Both H3-named
+mechanisms are implemented and verified: dead-flag elimination (C6a —
+consumers dispatch on the frozen flags_src seam; fused paths elide the
+park/sync/rebuild round-trip, flags_elided=5496 on a busybox run) and
+block linking (C6b — IBTC slots filled/severed, trampoline dispatch
+loop, 64.3% of executions chaining in asm).  The coordinator-ratified
+C6c levers removed the per-dispatch sigsetjmp syscall storm
+(rt_sigprocmask 1110 -> 2) and heal collided IBTC slots.  CoreMark
+moved dbt 21 -> 24 against interp 63-69 (CRCs intact throughout); the
+remaining ~3x gap is the v1 block-granular translation model itself —
+per-block RWX mmap/munmap churn (~5.6k-8.5k pairs per CoreMark
+iteration) and ~31k dispatches/iteration (no superblocks) — which
+belongs to the H5 (AOT) / H6-class DBT maturity roadmap, not to a
+defect-fix campaign.  Evidence: tests/hardening/h3-coremark.md
+addenda; I686RT_STATS counters in the lane records.
 
-H1 dead-marks invalidated blocks (never freed mid-flight — same-block
-SMC and post-syscall paths may reference the code); reclamation rides
-direct-mapped eviction, a bounded leak per SMC event.  Options:
-generation counter at block exit (D11's second clause) allowing
-immediate free, or a graveyard free-list drained at safe points.
-Verification: test_h1_smc PASS unchanged + a long-running SMC loop
-shows stable RSS in-container.
+## C7. hygiene — SMC dead-mark reclamation (CLOSED: FIXED)
 
-## C8. upstream — hl guest_env ordering breaks A32RT_WINDOW (UPSTREAM, P1)
+Close-out: FIXED (merged lane/fix-c7).  Dead-marked blocks park
+{code, cap} in a bounded 256-entry graveyard (oldest munmapped on
+overflow); drain runs only at the frozen safe points (dispatch-loop
+top, flush_all); the dead-mark site empties the slot so eviction and
+flush_all cannot double-free.  Acceptance: test_h1_smc PASS both
+engines; the 10,200-event SMC RSS fixture grows 248 KiB vs 2964 KiB
+against the un-fixed build (negative control).
 
-hl materialises guest_env from environ BEFORE translator finalize's
-setenv (RC6; worked around for i686 on the local branch lane/6-l6a —
-i686_window_hint appended explicitly).  The a32 launch path retains
-the gap; a32rt masks it via its scan fallback.  Needs an upstream hl
-change (move the env materialisation after finalize, or export the
-hint the way i686 does) — Moritz's call; this repo records it in
-SPEC §7.  Local a64-sibling verification once patched: run an a32rt
-guest under the patched hl with HL_A32RT_WINDOW set and confirm the
-window placement.
+## C8. upstream — hl guest_env ordering breaks A32RT_WINDOW (CLOSED: UPSTREAM)
 
-## C9. hygiene — winevdm "winedevice.exe is a DOS application" x3 (OPEN, P3)
+Close-out: UPSTREAM, terminal as recorded.  The gap is documented in
+SPEC §7 (item 2, final report) and here: hl materialises guest_env
+before translator finalize's setenv; the i686 launch carries the
+explicit window hint on the local hl branch lane/6-l6a, the a32 path
+retains the gap behind a32rt's scan fallback.  Owned by Moritz; the
+verification step for a patched hl (a32rt guest + HL_A32RT_WINDOW)
+stays as written.  Nothing to change in this repo.
 
-Three stderr lines during wineboot (stdout/rc clean; oracle silent).
-Launch-vs-slow-copy overlap per T4c.  Diagnose in wine's boot
-sequencing under our (slow) interpreter: likely wineboot racing the
-winevdm copy of winedevice.exe.  Acceptance: stderr matches the
-oracle's (empty) for the RC7b command.
+## C9. hygiene — winevdm "winedevice.exe is a DOS application" x3 (CLOSED: FIXED via C1)
 
-## C10. gate hygiene — formal dynamic-glibc rerun of RC4 (OPEN, P1)
+Close-out: FIXED, root-caused by lane/fix-c9 forensics
+(docs/lanes/fix-c9-diagnosis.md): the lines were not a launch-vs-copy
+race — wine's update pass read 96 bytes, failed to rewind (the then-
+missing _llseek(140) returned -ENOSYS), and rewrote the 142896-byte
+builtin at offset 96, permanently corrupting the installed
+winedevice.exe so every launch verdict failed.  T4c's hypothesis is
+refuted; interpreter slowness only varies the launch count.  With C1a
+landed, the acceptance rerun (fresh WINEPREFIX, interp, RC7b chain)
+prints ok rc=0 with ZERO DOS lines and an intact winedevice.exe
+(142896 bytes, PE\0\0 at e_lfanew).  The remaining FreeType stderr
+notices are expected minimal-sysroot noise (no freetype deb in the
+RC7b closure).
 
-RC4 ran musl-i386 (deviation recorded); glibc 2.44 i386 later ran de
-facto via RC7b's wine chain.  Close formally: build/obtain the
-dynamic glibc i386 test (sysroot glibc 2.44 + ld-linux; stat/access/
-open are sysroot-aware since RC7b triage) and run test_p4_glibc
-against it: same PASS criteria as RC4 (threads + SIGFPE + fork/wait).
+## C10. gate hygiene — formal dynamic-glibc rerun of RC4 (CLOSED: PARTIALLY FIXED, residual root-caused)
 
-## C11. measurement — H2 math under --x87-80 (MEASURE, P2)
+Close-out: the C10 lane compiled tests/test_p4_glibc as a true dynamic
+glibc 2.44 i386 PIE (ld-linux.so.2, DT_NEEDED libc.so.6) and ran the
+gate: it initially blocked forever at pthread_join — the clone-fallback
+thread exit missed the CHILD_CLEARTID wake; FIXED by C2's dual
+private+shared cleartid wake and verified with a dynamic-glibc join
+fixture ("PASS t4 join-returned").  The coordinator gate rerun
+post-fix: glibc startup, TLS, robust lists, clone3->clone fallback,
+threads, fork/wait (child reaped, exit 42) and statx now all work, and
+the run dies later at a guest indirect jump to eip=0x00000001 (a
+corrupted code pointer, SYSTRACE committed in docs/lanes/fix-c10-
+record.md addendum rerun).  Full PASS remains open — root cause is a
+deeper dynamic-glibc divergence of the same class the wine chain
+anchors (SPEC §7); musl RC4's original gate criteria remain met by
+the static fixtures.
 
-libctest math = 16.1% in the default (64-bit double) mode by design.
-Quantify the exact 80-bit mode: `tools/run-libctest.sh` variant with
-I686RT_X87=80 (or --x87-80 in the runner's i686rt invocation);
-append the two-mode table to tests/hardening/h2-report.md.  No fix
-obligation — this measures D9's exactness claim.
+## C11. measurement — H2 math under --x87-80 (CLOSED: MEASURED)
+
+Close-out: MEASURED (merged 59da1ef).  `H2_X87_80=1` knob (default
+path byte-identical), the 80-bit TAP log, and the two-mode table in
+tests/hardening/h2-report.md.  Signal: the remainder/exactness
+families flip to pass in 80-bit mode and 12 timeouts resolve, but a
+distinct 80-bit rounding/signed-zero cluster flips 22 math tests to
+fail (ceil(-0) -> +0 etc.) — recorded as measured; the cluster is the
+x87_80-mode evidence for the D63/D73-class fix lanes.
 
 ## C12. hygiene — quarantine stashes + open D-series reconciliation (OPEN, P3)
 

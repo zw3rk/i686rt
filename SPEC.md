@@ -243,32 +243,48 @@ Still open (not experiment-shaped):
 - hl a32rt integration (flake input, `src/a32.c`, `/dev/a32host`) not on public hl master `8048a96`; A32RT.md cites hl `d76cd75`, absent upstream. (Not an experiment: ask Moritz for the branch; Phase 6 blocked on it.)
 - RosettaLinux on ELFCLASS32 → E03: rejects pre-translation, exact behaviour recorded. i386 TASK_SIZE → E04: 0xFFFFE000 (+ADDR_LIMIT_3GB). `_fpstate` magic → E05: MAGIC1 0x46505853 in sw_reserved on every fxsr frame, MAGIC2 0x46505845 xsave-only, u16 magic 0x0000 never checked. nixpkgs i686 cross attrs → E06: `pkgsCross.musl32`/`gnu32`, never `pkgsi686Linux`. glibc SYSINFO offset + vDSO versions → E07: `%gs:0x10`, `LINUX_2.5`+`LINUX_2.6`. FEX/Box86 TSO policies → E08: static vs opt-in; D5 revised. Apple HW TSO under HVF → E01: settable, sticks. ia32_emulation=0 compat CS → E02: CS kept, entry blocked. Wine LDT usage → E09: func 0x11 + `set_thread_area(-1)` only. vm86 feasibility → E10: PASS, pure guest-state emulation, IRQ stubs.
 
-## 7. Open questions (final report, 2026-10-23)
+## 7. Open questions (refreshed by the C1–C12 fix campaign, 2026-10-24)
 
-All phase gates RC-E, RC0–RC8 (incl. RC6/RC7/RC7b) and H1–H4 passed
-once; docs/FINAL-REPORT.md is the campaign record.  Items left open:
+The original campaign gates RC-E, RC0–RC8 and H1–H4 all passed once
+(docs/FINAL-REPORT.md).  The 2026-10-23/24 fix campaign (DEFECTS.md
+§"Open campaign defects", docs/lanes/fix-campaign.md) closed C1–C12;
+the open questions below replace the 2026-10-23 list.
 
-1. x87_80 round_pack80 zeroes ext80 results below half the min
-   subnormal under ALL RC modes; IEEE-correct toward-infinity would
-   take 1 ulp for the matching sign (RC5; untested by any fixture).
+1. ~~round_pack80 deep-tiny~~ FIXED (C4, 7e5d7a2): directed-rounding
+   min-subnormal semantics + vectors; goldens 0-diff.
 2. hl materialises guest_env before translator finalize's setenv —
-   the same ordering gap breaks a32's A32RT_WINDOW hint upstream
-   (a32rt masks it with its scan fallback); RC6 worked around it in
-   the i686 launch branch (local hl branch lane/6-l6a).
-3. The wine chain stalls under I686RT_ENGINE=dbt (RC7b); H1 found the
-   DBT engine never installed the host-fault handler (window faults
-   killed the process) and fixed it — a re-run of the wine chain
-   under dbt is outstanding.
-4. winevdm prints three "winedevice.exe is a DOS application" stderr
-   lines during wineboot (stdout/rc clean; the oracle is silent) —
-   launch-vs-slow-copy overlap, not a syscall divergence.
-5. H2 triage: _llseek(140), readv(145), msync(144), ftruncate64(194),
-   tkill(238), sched_getaffinity(242), get_robust_list(312),
-   statx(383) unimplemented (the LTP framework dies in setup on the
-   first two); 19 pthread cancel/cond/robust timeouts
-   (deadlock/livelock class).
-6. H3 baseline: the DBT is ~3× slower than the -Os interpreter on
-   CoreMark (71 vs 23 iter/s; oracle 5000 ±25% Rosetta-class) — the
-   dead-flag-elimination and block-linking work named in H3.
-7. H1 residual: SMC-invalidated blocks are dead-marked (never freed
-   mid-flight); reclamation rides the direct-mapped eviction.
+   unchanged, UPSTREAM (Moritz's call; i686 is worked around on the
+   local branch lane/6-l6a).
+3. Wine-on-dbt: the RC7b stall (fixed by H1) and the #DE
+   misdeliveries (fixed by the campaign's delivery-classification
+   fix, ba4e54f) are closed; the gate now fails inside wine's dash
+   wrapper discovery after an empty-path STATX probe sequence — a
+   dash-under-dbt divergence documented in DEFECTS.md C3 with
+   SYSTRACE evidence.  Remains H5/H6-class DBT maturity work.
+4. ~~winevdm stderr~~ FIXED via C1 (root cause: missing _llseek
+   corrupted winedevice.exe; see DEFECTS.md C9).
+5. H2 residuals after the campaign (musl libc-test + LTP):
+   fmodl/remainderl/remquo miscompute FPREM quotient-bit state (the
+   D73 partial-remainder class — also the 11-math-timeout fix left
+   them failing-not-hanging); second-generation pthread cancellation
+   can restore a zeroed sigcontext (DEFECTS.md C2 evidence);
+   tls_get_new-dtv is the pre-existing dlopen DSO-not-built class;
+   LTP body-level residuals (fcntl leases fail on overlayfs,
+   fcntl31/32 ENOSYS class, fork stress under interpreter speed).
+   The LTP runner's relative-path bug (b316069) means every
+   pre-campaign LTP log was vacuous — H2's "0/117 framework deaths"
+   line should be read as "not measured"; the first real numbers are
+   the campaign's 25/117 with zero framework setup deaths.
+6. H3/DBT performance RE-SCOPED (C6): dead-flag elimination, block
+   linking, and the dispatch-cost levers are implemented; the
+   remaining ~3x CoreMark gap is the block-granular translation model
+   (per-block RWX mapping churn, no superblocks) — H5/H6-class work.
+7. ~~SMC dead-mark reclamation~~ FIXED (C7, bounded graveyard).
+8. Dynamic glibc 2.44: the RC4-shape gate now passes startup, TLS,
+   robust lists, threads, fork/wait and statx, then diverges at a
+   guest indirect jump to eip=1 (DEFECTS.md C10 addendum) — the same
+   deep-glibc divergence class the wine chain anchors.
+9. The 80-bit x87 mode flips a rounding/signed-zero cluster
+   (ceil/floor/rint/trunc/modf, e.g. ceil(-0) -> +0) that the default
+   mode does not exercise (C11 measurement; D63/D63-adjacent x87_80
+   paths).
