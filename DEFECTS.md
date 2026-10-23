@@ -1009,3 +1009,157 @@ The comment above `i686_oflags_g2h` said host-to-guest is the identity over the 
 `i686_oflags_g2h` itself only does `g & I686_O_KNOWN & ~I686_GO_LARGEFILE`. D47 is the separate finding that `i686_oflags_h2g` still does not translate host `O_DIRECTORY`. This entry is only the false identity sentence.
 The comment now says `g2h` keeps `I686_O_KNOWN`, drops `O_LARGEFILE`, and does not swap `DIRECTORY`, `DIRECT`, or `NOFOLLOW`, and that `h2g` rewrites host `DIRECT` and `NOFOLLOW` only. The functions were not changed.
 Second read: `blind/_raw/quote-i686-oflags-g2h.md`.
+
+---
+
+# Open campaign defects (final report inventory, 2026-10-23)
+
+Section owner: the implementation campaign (coordinator record), not the
+blind-audit protocol above — C-numbered to keep the D-series untouched.
+Status legend: OPEN (known-broken), VERIFY (fix in, evidence missing),
+UPSTREAM (owned outside this repo), MEASURE (measurement gap).
+Each entry lists the fix sites, a verification command, and lane
+suitability for the parallel fix campaign (GOAL-DEFECTS.md).
+
+## C1. correctness/coverage — eight unimplemented syscalls (OPEN, P0)
+
+Per-syscall detail (i386 numbers, kernel ABI, known consumers):
+
+- `_llseek` (140): fd, offset_hi:offset_lo (EDX:EAX), whence (ESI);
+  returns off64 in EDX:EAX. Breaks glibc stdio `fseeko/ftello` (H2:
+  `_llseek off_t at 0x7fffffff` failing case). Site: new handler in
+  src/os/sys_pass.c (host lseek64); guest 64-bit split/merge helpers
+  exist in the fcntl family.
+- `readv` (145): fd, iov, iovcnt — writev(146) exists; mirror it.
+  Consumers: coreutils, libc-test.
+- `msync` (144): addr, len, flags — trivial passthrough
+  (vm_invalidate_jit not required; window is host-mapped).
+- `ftruncate64` (194): fd, length_hi:length_lo (i386 two-register
+  split). LTP framework `SAFE_FTRUNCATE` dies here — the single
+  biggest LTP blocker.
+- `tkill` (238): tid, sig — needed by `raise()` and
+  `pthread_cancel` routing (see C2). Site: sys_pass.c signal family
+  (pending-bit + host tgkill of the owning pthread).
+- `sched_getaffinity` (242): pid, len, mask u32[] — return a single
+  CPU mask sized to the guest's view (LTP SAFE macro).  Optional
+  sibling: sched_setaffinity(241) -ENOSYS tolerated.
+- `set_robust_list` (311) / `get_robust_list` (312): head, len.
+  glibc/PI mutexes need at least acceptance-then-ENOSYS semantics;
+  full robust-list processing is C2 scope.
+- `statx` (383): dirfd, path, flags, mask, statx buf — glibc falls
+  back to fstatat64 today (works); implementing it removes the
+  fallback and the -38 noise.  Optional sibling: faccessat2 (439).
+
+Verification: `tools/run-libctest.sh && tools/run-ltp.sh && make
+h2-report` — LTP must reach test bodies (framework deaths = 0) and the
+libctest count must not regress; fseek/ftello tests flip to pass.
+Lane-suitable: two parallel lanes (C1a: file-descriptor class — 140,
+145, 144, 194, 383; C1b: thread/sched class — 238, 242, 311, 312).
+
+## C2. correctness — pthread cancel/cond/robust/once timeouts (OPEN, P0)
+
+19 libctest timeouts, all livelock/deadlock signatures.  Evidence
+cluster (H2 + T3/T4d records): PI relock EDEADLK path,
+FUTEX_WAIT_REQUEUE_PI, cancellation delivery (tkill — C1b),
+robust-list wake (C1b).  Likely a mix of missing syscalls and futex
+command semantics; T4d fixed the base WAIT/WAKE/REQUEUE/CMP_REQUEUE +
+WAIT_BITSET/WAKE_BITSET ABI, the PI family (FUTEX_LOCK_PI 6.. 9,
+WAIT_REQUEUE_PI 11+13) is unverified.  Root-cause first (one lane,
+tools/probe_strfuncs-style dual-oracle futex PI fixtures), then fix.
+Files: src/os/sys_pass.c (sys_futex), src/os/clone.c, threads.h.
+Verification: the 19 named tests move from timeout to pass/fail-with-
+output; a new unit test pins the PI semantics vs the host kernel.
+
+## C3. verification — wine chain under engine=dbt (VERIFY, P1)
+
+RC7b recorded the stall; H1 found the DBT engine never installed the
+host-fault handler (any window fault killed the process) and fixed
+it.  Never re-run: `I686RT_ENGINE=dbt wine cmd /c "echo ok"` with the
+RC7b environment.  If it passes, close; if it stalls, capture
+I686RT_SYSTRACE of the first retry loop and route to the coordinator.
+Files (if broken): src/dbt/engine.c, interp.c checkpoint.
+
+## C4. correctness — round_pack80 directed-rounding deep-tiny (OPEN, P2)
+
+src/interp/x87_80.c round_pack80's eff<0 branch returns signed zero
+under every RC; IEEE-correct toward -inf/+inf takes 1 ulp of the min
+subnormal for the matching sign.  Mirror the to_ieee_bits fix
+(e31dccc) — but keep the RC5 golden baseline stable (nearest-mode
+behavior must be bit-identical).  Verification: extend
+unit/x87_80 tests with directed-mode vectors below 2^-16446; golden
+re-run must show 0 diff.
+
+## C5. correctness/SSE — MOVDQA alignment #GP interpreter-only (OPEN, P2)
+
+h_sse raises #GP(0) on misaligned MOVDQA/MOVDQU stores; emit_sse.c
+emits unaligned-capable NEON moves (T1 record; same class as the
+ratified v1 MOVAPS deviation).  Either emit an explicit alignment
+check path in DBT or ratify the deviation in SPEC with a fixture that
+asserts the difference.  Files: src/dbt/emit_sse.c, SPEC.md if
+ratified.
+
+## C6. performance — DBT 3x slower than the interpreter (OPEN, P0-perf)
+
+CoreMark baseline (H3): interp=71, dbt=23, oracle=5000 iter/s.
+Named-but-unimplemented H3 work: dead-flag elimination across blocks
+(src/dbt/flags_dbt.c: materialise lazy descriptors only when a block
+exit reads them — the ctx counters flags_elided exists), and block
+linking (src/dbt/engine.c + trampoline.S: direct block-to-block
+chains via the IBTC slots).  Coordinator-design first (frozen
+contract), then lanes.  Acceptance: re-run
+`tools/run-coremark.sh` — dbt strictly above interp with CRCs intact;
+record new H3 line.
+
+## C7. hygiene — SMC dead-mark reclamation (OPEN, P2)
+
+H1 dead-marks invalidated blocks (never freed mid-flight — same-block
+SMC and post-syscall paths may reference the code); reclamation rides
+direct-mapped eviction, a bounded leak per SMC event.  Options:
+generation counter at block exit (D11's second clause) allowing
+immediate free, or a graveyard free-list drained at safe points.
+Verification: test_h1_smc PASS unchanged + a long-running SMC loop
+shows stable RSS in-container.
+
+## C8. upstream — hl guest_env ordering breaks A32RT_WINDOW (UPSTREAM, P1)
+
+hl materialises guest_env from environ BEFORE translator finalize's
+setenv (RC6; worked around for i686 on the local branch lane/6-l6a —
+i686_window_hint appended explicitly).  The a32 launch path retains
+the gap; a32rt masks it via its scan fallback.  Needs an upstream hl
+change (move the env materialisation after finalize, or export the
+hint the way i686 does) — Moritz's call; this repo records it in
+SPEC §7.  Local a64-sibling verification once patched: run an a32rt
+guest under the patched hl with HL_A32RT_WINDOW set and confirm the
+window placement.
+
+## C9. hygiene — winevdm "winedevice.exe is a DOS application" x3 (OPEN, P3)
+
+Three stderr lines during wineboot (stdout/rc clean; oracle silent).
+Launch-vs-slow-copy overlap per T4c.  Diagnose in wine's boot
+sequencing under our (slow) interpreter: likely wineboot racing the
+winevdm copy of winedevice.exe.  Acceptance: stderr matches the
+oracle's (empty) for the RC7b command.
+
+## C10. gate hygiene — formal dynamic-glibc rerun of RC4 (OPEN, P1)
+
+RC4 ran musl-i386 (deviation recorded); glibc 2.44 i386 later ran de
+facto via RC7b's wine chain.  Close formally: build/obtain the
+dynamic glibc i386 test (sysroot glibc 2.44 + ld-linux; stat/access/
+open are sysroot-aware since RC7b triage) and run test_p4_glibc
+against it: same PASS criteria as RC4 (threads + SIGFPE + fork/wait).
+
+## C11. measurement — H2 math under --x87-80 (MEASURE, P2)
+
+libctest math = 16.1% in the default (64-bit double) mode by design.
+Quantify the exact 80-bit mode: `tools/run-libctest.sh` variant with
+I686RT_X87=80 (or --x87-80 in the runner's i686rt invocation);
+append the two-mode table to tests/hardening/h2-report.md.  No fix
+obligation — this measures D9's exactness claim.
+
+## C12. hygiene — quarantine stashes + open D-series reconciliation (OPEN, P3)
+
+Two quarantine stashes from the Phase 5 lane leaks remain on master
+(`git stash list`); content largely superseded by committed fixes.
+Reconcile: drop or port anything still relevant, then re-read the
+open correctness entries of the D-series above and route still-live
+ones into this campaign's triage.
