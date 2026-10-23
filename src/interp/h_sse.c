@@ -39,11 +39,14 @@
  *    results and every conversion, but f64 arithmetic itself is
  *    host-nearest in v1 (documented gap).
  *
- * Other v1 notes: no alignment fault is raised for the Phase 5 aligned
- * forms (MOVAPS/MOVAPD on unaligned EAs simply load/store); the RC7b T1
- * aligned forms (66 0F 6F/7F MOVDQA, 0F E7 MOVNTDQ/MOVNTQ) DO check and
- * raise #GP(0) through the seg-fault channel with eip at the faulting
- * instruction.  MOVMSKPS/PD and LDMXCSR/STMXCSR reject the reserved
+ * Other v1 notes: no alignment fault is raised for any aligned-form SSE
+ * move (MOVAPS/MOVAPD from Phase 5; 66 0F 6F/7F MOVDQA and 0F E7
+ * MOVNTDQ/MOVNTQ from RC7b T1 — on misaligned EAs they simply
+ * load/store).  This is the ratified v1 deviation (SPEC D10, fix
+ * campaign C5): the engines must not diverge on it, a per-access
+ * alignment check would sit on the hot glibc SSE2 paths, and real
+ * guests select the MOVDQU variants wherever alignment is not
+ * guaranteed.  MOVMSKPS/PD and LDMXCSR/STMXCSR reject the reserved
  * mod=3 / memory forms as I686_EXIT_UNDEF (matching #UD); PAUSE (F3 90)
  * already decodes to NOP and needs nothing here; FXSAVE/XSAVE-family
  * rows were declined in the generator and never reach a handler.  MMX
@@ -1638,23 +1641,13 @@ static int h_pshufw(i686_ctx_t *ctx, const x86_insn_t *insn)
 /* RC7b T1: SSE2 data movement + integer rows (docs/lanes/phase-7.md)  */
 /* ------------------------------------------------------------------ */
 
-/* #GP(0) for the aligned forms (MOVDQA, MOVNTDQ/MOVNTQ): delivered via
- * the seg-fault channel (trapno 13 in exit_arg, error code 0 in
- * exit_dest, cr2 = the offending EA); eip stays at the instruction. */
-static int sse_aligned_fault(i686_ctx_t *ctx, const x86_insn_t *insn)
-{
-    ctx->exit_arg = 13u; /* #GP */
-    ctx->exit_dest = 0u;
-    ctx->fault_addr = sse_ea(ctx, insn);
-    return I686_EXIT_FAULT;
-}
-
 /* MOVDQA/MOVDQU + MMX MOVQ (0F 6F load row / 0F 7F store row, one id;
- * direction from opnd[0]): 66 = MOVDQA (#GP(0) on a misaligned 16-byte
- * EA), F3 = MOVDQU, plain = MMX MOVQ (8 bytes, m64/mm); F2 is undefined
- * x86.  MOVAPS keeps its documented v1 no-fault behavior -- only the
- * RC7b aligned forms check alignment.  RC7b T2 fix: the plain-form test
- * is (opsize == 0 && rep == 0); the old pfx_rep == 0 test also caught
+ * direction from opnd[0]): 66 = MOVDQA, F3 = MOVDQU, plain = MMX MOVQ
+ * (8 bytes, m64/mm); F2 is undefined x86.  MOVDQA raises no alignment
+ * fault in v1 — ratified deviation, same class as MOVAPS (SPEC D10,
+ * campaign C5); the DBT emitter never checked either, and the two
+ * engines must agree.  RC7b T2 fix: the plain-form test is
+ * (opsize == 0 && rep == 0); the old pfx_rep == 0 test also caught
  * the 66 prefix (which rides opsize, not rep), so every MOVDQA executed
  * as an 8-byte MMX MOVQ through the x87_st slot and left the XMM file
  * stale -- the exact wedge that made glibc's aligned-loop strchr return
@@ -1685,10 +1678,6 @@ static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
             }
         }
         return sse_done(ctx, insn);
-    }
-    if (insn->pfx_opsize != 0U && insn->modrm_mod != 3U &&
-        (sse_ea(ctx, insn) & 15U) != 0U) {
-        return sse_aligned_fault(ctx, insn); /* MOVDQA: #GP(0) */
     }
     if (load) {
         src128(ctx, insn, buf);
@@ -1745,20 +1734,16 @@ static int h_movq2dq(i686_ctx_t *ctx, const x86_insn_t *insn)
     return sse_done(ctx, insn);
 }
 
-/* MOVNTDQ/MOVNTQ (0F E7): 66 = m128 <- xmm (16-byte-aligned NT store),
- * plain = MOVNTQ m64 <- mm (8-byte-aligned); the register form and
- * F2/F3 are undefined x86.  Non-temporal semantics are plain stores at
- * this level (single-threaded TSO guest). */
+/* MOVNTDQ/MOVNTQ (0F E7): 66 = m128 <- xmm NT store, plain = MOVNTQ
+ * m64 <- mm (8 bytes); the register form and F2/F3 are undefined x86.
+ * Non-temporal semantics are plain stores at this level
+ * (single-threaded TSO guest), and no alignment fault is raised in v1
+ * — ratified deviation, same class as MOVAPS (SPEC D10, campaign C5);
+ * the DBT emitter never checked either. */
 static int h_movntdq(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    unsigned align;
-
     if (insn->pfx_rep != 0U || insn->modrm_mod == 3U) {
         return I686_EXIT_UNDEF;
-    }
-    align = (insn->pfx_opsize != 0U) ? 16U : 8U;
-    if ((sse_ea(ctx, insn) & (align - 1U)) != 0U) {
-        return sse_aligned_fault(ctx, insn); /* #GP(0) */
     }
     if (insn->pfx_opsize != 0U) {
         uint8_t buf[16];
