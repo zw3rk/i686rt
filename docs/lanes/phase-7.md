@@ -1242,3 +1242,37 @@ impact on this acceptance).
 
 ACCEPTANCE: PASSED — `wine cmd /c "echo ok"` prints ok, rc=0, within
 the 300 s bound (208 s worst observed on a cold pristine container).
+
+## RC7b record (2026-10-23) — PASSED
+
+Official gate run from merged master (T4d merge 9f2586c, build
+493160 bytes, arm64 docker alpine:3.20, staging /tmp/rc7b):
+  $ export HOME=/tmp/whome WINEPREFIX=/w/wprefix WINEDEBUG=-all \
+        WINEDLLPATH=/w/sysroot/usr/lib/i386-linux-gnu/wine
+  $ rm -rf /w/wprefix
+  $ timeout 300 /w/i686rt --sysroot /w/sysroot -- \
+        /w/sysroot/usr/bin/wine cmd /c "echo ok"
+  ok
+  RC7B rc=0
+Residuals (documented): 3 winevdm "winedevice.exe is a DOS
+application" stderr lines (stdout/rc clean; oracle silent — a
+launch-vs-slow-copy overlap, not a syscall divergence); run time
+~180-210 s vs the i386 oracle's ~29-45 s (interp engine; DBT engine
+stalls on this chain — H-phase material).  Sysroot notes:
+WINEDLLPATH is required (wine's BINDIR/LIBDIR build-time dotdot walk
+cannot handle sysroot-prefixed loader paths); zlib1.dll must carry
+Debian's postinst "Wine builtin DLL" marker; the sysroot refresh
+stamp skips non-forced reruns after closure changes (use --force).
+
+Triage path (six coordinator triages + lanes T1-T4d): SSE2 union
+extension (MOVDQA routing et al.), binfmt_script + readlink +
+/proc/pid/exe + sysroot-aware stat/access, faccessat legacy-ABI fix,
+TLS exec reset + posix_spawn clone newsp + per-thread GDT TLS
+descriptors + CLONE_SETTLS entry semantics + v1-stub delegation,
+SA_ONSTACK + sigframe guard + per-thread sigreturn anchor + double-
+fault force-kill, clone-child CLOEXEC/window/JIT teardown, x87
+FNSAVE/FRSTOR/FISTTP/FCOM forms, kernel-faithful i386 futex ABI (the
+377/377 EINVAL WAIT_BITSET spin), and the interp fault checkpoint
+armed once per run (was a host rt_sigprocmask per guest instruction,
+plus a cross-thread jmp buffer — the frozen-at-gateway-ret
+corruption).  Full evidence in the T1-T4d records above.
