@@ -355,7 +355,7 @@ S_GROUPS = [
     ((0, 0xD9), ["FLD_m32", "FXCH", "FST_m32", "FSTP_m32",
                  "FLDENV", "FLDCW", "FNSTENV", "FNSTCW"], 0x00),
     ((0, 0xDA), ["FCOM_STi", "FUCOM_STi", "FCOMP_STi", "INVALID",
-                 "FUCOMPP", "INVALID", "INVALID", "INVALID"], 0x00),
+                 "INVALID", "FUCOMPP", "INVALID", "INVALID"], 0x00),
     ((0, 0xDB), ["FILD_m32", "FISTTP_m32", "FIST_m32", "FISTP_m32",
                  "FNINIT", "FLD_m80", "FCOMI", "FSTP_m80"], 0x00),
     ((0, 0xDC), ["FADD_m64", "FMUL_m64", "FCOM_m64", "FCOMP_m64",

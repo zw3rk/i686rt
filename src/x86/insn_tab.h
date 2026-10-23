@@ -902,7 +902,7 @@ static const i686_group_t i686_group_tab[] = {
     /* x87 DA: mod=3 FCOM/FUCOM/FCOMP ST(i) (RC7b T4b); DA E9 FUCOMPP; FIADD-class m32 declined */
     { 0u, 0xDAu,
       { I686_OP_FCOM_STi, I686_OP_FUCOM_STi, I686_OP_FCOMP_STi, I686_OP_INVALID,
-        I686_OP_FUCOMPP, I686_OP_INVALID, I686_OP_INVALID, I686_OP_INVALID },
+        I686_OP_INVALID, I686_OP_FUCOMPP, I686_OP_INVALID, I686_OP_INVALID },
       { { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u },
         { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u } },
       0x00u },

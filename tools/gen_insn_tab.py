@@ -703,7 +703,7 @@ def build_groups():
                    "x87 D9: loads/stores, env, fixed forms via mod=3 rm"))
     g.append(Group(0, 0xDA,
                    ["FCOM_STi", "FUCOM_STi", "FCOMP_STi", "INVALID",
-                    "FUCOMPP", "INVALID", "INVALID", "INVALID"],
+                    "INVALID", "FUCOMPP", "INVALID", "INVALID"],
                    [non, non, non, non, non, non, non, non], 0,
                    "x87 DA: mod=3 FCOM/FUCOM/FCOMP ST(i) (RC7b T4b); "
                    "DA E9 FUCOMPP; FIADD-class m32 declined"))

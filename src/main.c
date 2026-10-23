@@ -376,10 +376,18 @@ int main(int argc, char **argv)
     if (st < 0) {
         return 1;
     }
-    if (ctx.stats_enabled) {
-        (void)fprintf(stderr, "i686rt: blocks=%llu syscalls=%llu\n",
+    if (ctx.stats_enabled ||
+        (getenv("I686RT_STATS") != NULL && strcmp(getenv("I686RT_STATS"), "0") != 0)) {
+        (void)fprintf(stderr,
+                      "i686rt: blocks=%llu syscalls=%llu "
+                      "blocks_compiled=%llu chain_hits=%llu "
+                      "ibtc_hits=%llu flags_elided=%llu\n",
                       (unsigned long long)ctx.blocks_executed,
-                      (unsigned long long)ctx.syscalls_executed);
+                      (unsigned long long)ctx.syscalls_executed,
+                      (unsigned long long)ctx.blocks_compiled,
+                      (unsigned long long)ctx.chain_hits,
+                      (unsigned long long)ctx.ibtc_hits,
+                      (unsigned long long)ctx.flags_elided);
     }
     return st;
 }
