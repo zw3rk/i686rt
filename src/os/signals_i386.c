@@ -178,20 +178,23 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
      * until the next cancellation point; without the frame mask the
      * pending re-raise delivered at a random pc. */
     {
-        uint64_t blocked = ctx->sig_mask | (1ULL << (uint32_t)(sig - 1));
+        /* The frame carries the PRE-DELIVERY mask (the kernel saves
+         * current->blocked unmodified; the sig | sa_mask blocking is
+         * live task state for the handler's duration and sigreturn
+         * restores the frame's copy — that is how a handler's own
+         * uc_sigmask edit (musl's SIGCANCEL re-raise) survives). */
+        uint64_t pre = ctx->sig_mask;
+        uint64_t blocked = pre | (1ULL << (uint32_t)(sig - 1));
 
         blocked |= ((uint64_t)ga->mask[1] << 32) | (uint64_t)ga->mask[0];
-        /* Block NOW (the kernel blocks sig | sa_mask before running
-         * the handler, not at sigreturn): a signal re-raised by the
-         * handler must stay pending, not re-deliver nested. */
         ctx->sig_mask = blocked;
         if (sa_siginfo) {
             /* uc_sigmask: ucontext@frame+0x90, +0x14 mcontext(88) -> +0x6c */
             uint8_t m[8];
-            memcpy(m, &blocked, sizeof(m));
+            memcpy(m, &pre, sizeof(m));
             memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 0x6c), m, sizeof(m));
         } else {
-            sc.oldmask = (uint32_t)blocked;
+            sc.oldmask = (uint32_t)pre;
         }
     }
     if (sa_siginfo) {
@@ -295,17 +298,17 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
     if (ctx->sig_last_frame_va != 0U && frame != ctx->sig_last_frame_va) {
         frame = ctx->sig_last_frame_va;
     }
+    ctx->sig_last_frame_va = 0U;
+    base = frame + (rt ? (0x90U + 20U) : 8U);
+    if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
+        return -1;
+    }
     if (i686_sigtrace_on()) {
         (void)fprintf(stderr,
                       "SIGRET rt=%d esp=%08x frame=%08x rec=%08x "
                       "ax=%08x bp=%08x eip=%08x\n",
                       rt, ctx->gpr[I686_REG_ESP], frame,
                       ctx->sig_last_frame_va, sc.eax, sc.ebp, sc.eip);
-    }
-    ctx->sig_last_frame_va = 0U;
-    base = frame + (rt ? (0x90U + 20U) : 8U);
-    if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
-        return -1;
     }
     /* Restore the blocked mask from the frame (the delivery blocked
      * sig | sa_mask; the handler may have edited uc_sigmask — musl's
