@@ -124,7 +124,14 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     fp.swd = ctx->fstat;
     fp.twd = ctx->ftag;
     fp.mxcsr = ctx->mxcsr;
-    memcpy(&fp.st_space, ctx->x87_st, sizeof(ctx->x87_st));
+    /* D34: st_space is 8 x 10-byte x87 registers (80 bytes); ctx->x87_st
+     * is 8 x 16-byte slots.  A bulk copy ran 48 bytes past st_space,
+     * clobbering __pad0/the FXSAVE header/mxcsr on every fpstate-bearing
+     * delivery — copy each register's 10 significant bytes instead. */
+    for (unsigned st_i = 0U; st_i < 8U; st_i++) {
+        memcpy((uint8_t *)fp.st_space + st_i * 10U, &ctx->x87_st[st_i][0],
+               10U);
+    }
     memcpy(&fp.xmm_space, ctx->xmm, sizeof(ctx->xmm));
     fp.sw_reserved[0] = 0x46505853U; /* FP_XSTATE_MAGIC1 */
     fp_va = push_bytes(ctx, &sp, &fp, sizeof(fp));

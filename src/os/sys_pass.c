@@ -68,8 +68,9 @@
  * coordinator's in-process exec at S2.
  *
  * futex(240): sys_futex calls host SYS_futex, so FUTEX_WAIT can block.
- * The timeout pointer is read from EBP (i386 arg6 / val3). ESI (i386
- * arg4) is the timespec register in the i386 ABI and is not read here.
+ * The timeout pointer is read from ESI (i386 arg4) — the timespec
+ * register in the futex ABI; EBP (i386 arg6 / val3) is not read here.
+ * (T4d re-encode; the pre-C2 text had the two registers swapped.)
  */
 
 #include <errno.h>
