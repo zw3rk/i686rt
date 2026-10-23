@@ -40,7 +40,8 @@
  *     ord via FCMEQ/FCMGT/FCMGE + AND/MVN; NaN = x86 unord semantics)
  *   MOVMSKPS/MOVMSKPD (SSHR+UMOV sign-bit extraction)
  *   COMISS/COMISD/UCOMISS/UCOMISD (FCMP; ZF=Z, PF=V, CF=!C|V, clear
- *     OF/SF/AF, lazy_op = NONE, pending lazy flags materialized first)
+ *     OF/SF/AF, lazy_op = NONE; pending lazy flags materialized first
+ *     unless the C6a flags_src proof makes that path a no-op)
  *   CVTPI2PS/PD, CVTSI2SS/SD (SCVTF; 2S->2D via SSHLL#0 + SCVTF),
  *     CVTTPS2PI, CVTTSS2SI/CVTTSD2SI (FCVTZS), CVTTPD2PI (FCVTZS.2D
  *     + XTN), CVTPS2PD (FCVTL), CVTPD2PS (FCVTN + zero upper),
@@ -1351,7 +1352,14 @@ static int sse_emit_movmsk(i686_emit_ctx_t *e, const x86_insn_t *insn)
 }
 
 /* COMISS/COMISD/UCOMISS/UCOMISD: FCMP + eflags {ZF=Z, PF=V,
- * CF=!C|V}, OF/SF/AF cleared, other bits kept, lazy_op = NONE. */
+ * CF=!C|V}, OF/SF/AF cleared, other bits kept, lazy_op = NONE.
+ *
+ * C6a seam: the park/blr/reload dance in sse_flags_sync is only
+ * needed on the DEAD path (no proof).  On NZCV/EFLAGS the kept
+ * ctx->eflags bits (everything outside CF|PF|AF|ZF|SF|OF) are current
+ * and the six cleared bits are exactly the bits a pending lazy
+ * materialize would write, so skipping the helper call is
+ * architecturally identical — comis overwrites all six either way. */
 static int sse_emit_comis(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
     a64_buf_t *b = &e->buf;
@@ -1362,9 +1370,22 @@ static int sse_emit_comis(i686_emit_ctx_t *e, const x86_insn_t *insn)
     }
     dbl = (insn->pfx_opsize != 0U) ? 1U : 0U;
 
-    /* Materialize pending lazy flags first; the helper call clobbers
-     * the caller-saved scratch, so EA + operands load after it. */
-    sse_flags_sync(e);
+    /* Frozen flags_src switch (emit.h): NZCV counts the elision,
+     * EFLAGS falls through silently, DEAD runs today's full sync.  The
+     * helper call clobbers the caller-saved scratch, so EA + operands
+     * load after it (the bump clobbers x11 only, fine before them). */
+    switch (e->flags_src) {
+    case I686_FLAGS_NZCV: {
+        extern void i686_dbt_emit_elide_bump(i686_emit_ctx_t *);
+        i686_dbt_emit_elide_bump(e);
+        break;
+    }
+    case I686_FLAGS_EFLAGS:
+        break;
+    default: /* I686_FLAGS_DEAD: conservative full sequence */
+        sse_flags_sync(e);
+        break;
+    }
     sse_xmm_file(e);
     sse_dst_load(e, insn);
     if (dbl != 0U) {
@@ -1397,6 +1418,10 @@ static int sse_emit_comis(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_emit_orr_reg_w(b, SSE_W13, SSE_W13, SSE_W11, A64_SHIFT_LSL, 0U);
     a64_emit_str_imm_w(b, SSE_W13, A64_XCTX, 36U);
     a64_emit_str_imm_w(b, 31U, A64_XCTX, 76U); /* lazy_op = NONE */
+    /* Eager-eflags producer now: NZCV holds the raw FCMP image (not
+     * the x86-natural polarity), so a following consumer must take the
+     * rebuild path, not the fused one. */
+    e->flags_src = I686_FLAGS_EFLAGS;
     return 0;
 }
 

@@ -23,6 +23,18 @@
  * therefore end after any insn and land in the same architectural state
  * as the interpreter; src/interp/flags.c materializes on demand.
  *
+ * flags_src maintenance (C6a dead-flag elimination seam, emit.h): the
+ * emitters here tell later same-block flag consumers what they may
+ * rely on:
+ *   - fused ops (binop ADD/SUB/CMP/AND/OR/XOR/TEST, NEG) leave the
+ *     architectural image live in A64 NZCV (natural SUBS polarity,
+ *     width-true via the shift trick) -> I686_FLAGS_NZCV;
+ *   - eager-eflags ops (IMUL, shift-by-imm) leave ctx->eflags current
+ *     (lazy_op = NONE) but clobber NZCV with internal compares ->
+ *     I686_FLAGS_EFLAGS;
+ *   - NOT and the cnt==0 shift write no flag state at all -> the
+ *     previous proof still holds, leave e->flags_src untouched.
+ *
  * Declined in v1 (returning -1 is always D2-safe; translate.c emits the
  * UNDEF fallback and the engine interpret-one): ADC/SBB and INC/DEC (both
  * need the materialize-old-flags helper ABI, coordinator-owned
@@ -378,6 +390,9 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
     } else {
         emit_lazy(e, I686_FOP_LOGIC, SCR_RES, 31U, 31U, width);
     }
+    /* Fused image live in NZCV (natural SUBS polarity): a later
+     * same-block consumer may fuse on it directly (emit.h seam). */
+    e->flags_src = I686_FLAGS_NZCV;
 
     e->insn_count++;
     return 0;
@@ -410,13 +425,16 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
         }
         emit_store_reg(b, SCR_RES, insn->modrm_rm, width);
         emit_lazy(e, I686_FOP_NEG, SCR_RES, SCR_A, 31U, width);
+        /* SUBS wzr-derived image is live in NZCV (natural polarity). */
+        e->flags_src = I686_FLAGS_NZCV;
     } else {
         a64_emit_orn_reg_w(b, SCR_RES, 31U, SCR_A, A64_SHIFT_LSL, 0U); /* mvn */
         if (sh != 0U) {
             emit_lsr_imm_w(b, SCR_RES, SCR_RES, sh);
         }
         emit_store_reg(b, SCR_RES, insn->modrm_rm, width);
-        /* NOT sets no flags: descriptor and eflags stay untouched. */
+        /* NOT sets no flags: descriptor, eflags and the previous
+         * flags_src proof all stay untouched. */
     }
     e->insn_count++;
     return 0;
@@ -478,6 +496,9 @@ static int emit_imul(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_emit_orr_reg_w(b, SCR_T0, SCR_T0, SCR_T3, A64_SHIFT_LSL, 0U);
     a64_emit_str_imm_w(b, SCR_T0, 19U, 36U);
     a64_emit_str_imm_w(b, 31U, 19U, 76U); /* lazy_op = NONE */
+    /* Eager-eflags producer: ctx->eflags is current (lazy_op NONE) but
+     * NZCV holds the internal overflow compare -> rebuild path only. */
+    e->flags_src = I686_FLAGS_EFLAGS;
 
     e->insn_count++;
     return 0;
@@ -507,7 +528,8 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
     }
     cnt &= 31U;                  /* i386 5-bit count mask */
     if (cnt == 0U) {
-        e->insn_count++;         /* full no-op: no write, no flags */
+        e->insn_count++;         /* full no-op: no write, no flags
+                                  * (previous flags_src proof stands) */
         return 0;
     }
 
@@ -582,6 +604,9 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
 
     a64_emit_str_imm_w(b, SCR_T0, 19U, 36U);
     a64_emit_str_imm_w(b, 31U, 19U, 76U); /* lazy_op = NONE */
+    /* Eager-eflags producer (h_shift.c shape): ctx->eflags current,
+     * NZCV holds the internal `cmp res, #0` -> rebuild path only. */
+    e->flags_src = I686_FLAGS_EFLAGS;
 
     emit_store_reg(b, SCR_RES, insn->modrm_rm, width);
     e->insn_count++;

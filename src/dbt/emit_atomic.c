@@ -55,7 +55,9 @@
  *   AND/OR/XOR: FOP_LOGIC {res=old OP src}  (CF=OF=0)
  *   CMPXCHG:  FOP_SUB  {res=acc-old, src1=acc, src2=old} (flags as CMP,
  *             ZF=1 exactly on CAS success)
- *   XCHG sets no flags (descriptor untouched)
+ *   XCHG sets no flags (descriptor untouched); the flag-writing classes
+ *   downgrade e->flags_src to I686_FLAGS_DEAD (C6a seam, emit.h) since
+ *   NZCV no longer holds the architectural image after them
  *
  * Declined in v1 (return -1 -> translate.c emits the UNDEF exit; the
  * engine interpret-one via the interpreter, always D2-safe):
@@ -394,6 +396,14 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn)
         mask_res(b, width);
         emit_lazy(e, I686_FOP_SUB, SCR_RES, SCR_ACC2, SCR_ACC, width);
         break;
+    }
+
+    /* C6a flags_src seam (emit.h): every RMW class except XCHG moves the
+     * x86 flag state into a pending lazy descriptor (the sequences emit
+     * no flag-setting A64, so NZCV keeps a PREVIOUS op's image).
+     * Consumers must not fuse on it — downgrade to the full sequence. */
+    if (kind != AT_XCHG) {
+        e->flags_src = I686_FLAGS_DEAD;
     }
 
     e->insn_count++;

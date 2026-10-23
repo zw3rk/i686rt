@@ -298,6 +298,13 @@ _Static_assert(offsetof(i686_ctx_t, blocks_executed) == 440, "blocks_executed mu
 _Static_assert(offsetof(i686_ctx_t, chain_hits) == 448, "chain_hits must be at offset 448");
 _Static_assert(offsetof(i686_ctx_t, last_exec_entry) == 456, "last_exec_entry must be at offset 456");
 _Static_assert(offsetof(i686_ctx_t, ibtc_hits) == 464, "ibtc_hits must be at offset 464");
+/* C-only tail pin (C6a dead-flag elimination): the DBT emitters bump
+ * flags_elided from generated code with a register-offset X-form
+ * load/store; the offset rides a MOVZ immediate (offset >> 3). */
+#define I686_CTX_FLAGS_ELIDED_OFFSET 76992U
+_Static_assert(offsetof(i686_ctx_t, flags_elided) ==
+                   I686_CTX_FLAGS_ELIDED_OFFSET,
+               "flags_elided must be at offset 76992 (emitted-code pinned)");
 _Static_assert(offsetof(i686_ctx_t, ras_hits) == 472, "ras_hits must be at offset 472");
 _Static_assert(offsetof(i686_ctx_t, ras_top) == 480, "ras_top must be at offset 480");
 _Static_assert(offsetof(i686_ctx_t, ras) == 488, "ras must be at offset 488 (0x1e8)");
