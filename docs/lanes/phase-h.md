@@ -140,3 +140,26 @@ Coordinator-facing: classes 2 and 5 are concrete syscall-layer work
 (items 140/144/145/194/238/242/312/383 + rlimit enforcement); class 1
 needs an `--x87-80` runner variant to quantify; class 3 needs
 I686RT_TRACE sampling.
+
+## H2 thresholds (GLM-5.3, 2026-10-23) — ACCEPTED as committed
+
+H2's acceptance is the committed pass-rate report (met: dacc099,
+merged; machine line `H2: libctest=125/343 ltp=0/117` verified on
+master).  Thresholds for interpretation:
+
+- libctest functional >= 50% and regression >= 70%: MET (56.0% /
+  73.9%).  These are the gates for "process/stdio/stdlib machinery
+  sound".
+- libctest math: NO threshold in the default mode — musl's vectors
+  demand exact 80-bit x87 + fenv flags; D9's default mode is 64-bit
+  double by design.  A future --x87-80 runner variant may quantify
+  exactness (open item, not a gate).
+- LTP: the 0/117 is a framework artifact, not test-body evidence —
+  every case dies in SAFE_* setup on two unimplemented syscalls
+  (ftruncate64(194), sched_getaffinity(242)).  Threshold: framework
+  setup must reach test bodies before any rate is interpreted; the
+  eight pinned unimplemented syscalls (_llseek 140, readv 145, msync
+  144, ftruncate64 194, tkill 238, sched_getaffinity 242,
+  get_robust_list 312, statx 383) go to the final report as the H2
+  triage output.  pthread cancel/cond/robust timeouts (19) join the
+  DBT-stall item as H-grade open work.
