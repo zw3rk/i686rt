@@ -220,6 +220,7 @@ write_stamp() {  # args: <pool-subdir>:<deb filename> ...
         usr/lib/i386-linux-gnu/wine/i386-windows/ntdll.dll \
         usr/lib/i386-linux-gnu/wine/i386-windows/kernel32.dll \
         usr/lib/i386-linux-gnu/wine/i386-windows/cmd.exe \
+        usr/lib/i386-linux-gnu/wine/i386-windows/zlib1.dll \
         usr/share/wine/wine.inf \
         usr/bin/dash \
         lib/ld-linux.so.2 \
@@ -345,6 +346,29 @@ Debian i386 glibc is i686-optimized in libc6 itself)"
         w_target=${w_alt#*:}
         ln -sfn "$w_target" "$sysroot/usr/bin/$w_link"
         info "alternatives replica: usr/bin/$w_link -> $w_target"
+    done
+
+    # libwine:i386.postinst replica ("copy zlib dlls from libz-mingw"):
+    # wine's PE loader only accepts builtin zlib1.dll from its
+    # i386-windows dll dir, and libz-mingw-w64 installs it under
+    # /usr/<triplet>-w64-mingw32/lib.  The postinst re-mangles the mingw
+    # dll with the "Wine builtin DLL" marker at offset 64 (replacing the
+    # PE header bytes 64..95); wine's find_builtin_dll rejects a plain
+    # copy (RC7b T4c, oracle-confirmed both ways).
+    for w_pair in i686:i386 x86_64:x86_64; do
+        w_mingw_arch=${w_pair%%:*}
+        w_wine_arch=${w_pair#*:}
+        for w_zlib in "$sysroot"/usr/"$w_mingw_arch"-w64-mingw32/lib/zlib*.dll; do
+            [ -f "$w_zlib" ] || continue
+            w_zout="$sysroot/usr/lib/i386-linux-gnu/wine/$w_wine_arch-windows/$(basename "$w_zlib")"
+            mkdir -p "$(dirname "$w_zout")"
+            { head -c 64 "$w_zlib"
+              printf 'Wine builtin DLL'
+              printf '\0\0\0\0\0\0\0\0'
+              printf '\0\0\0\0\0\0\0\0'
+              tail -c +97 "$w_zlib"; } > "$w_zout"
+            info "libwine postinst replica: $w_zout"
+        done
     done
 
     # shellcheck disable=SC2086
