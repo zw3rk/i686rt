@@ -759,6 +759,8 @@ void i686_syscalls_init_once(void)
     i686_syscalls_time_init();
     i686_syscalls_misc_init();
     i686_syscalls_pass_init();
+    i686_syscalls_thread_init(); /* tkill/tgkill/sched/robust-list class
+                                  * (src/os/sys_thread.c, C1b seam) */
     /* Phase 7/8 module registrations run LAST: registration is
      * last-wins, and ldt.c's full set_thread_area(243) supersedes the
      * flat-model v1 stub registered above (S7 wiring). */

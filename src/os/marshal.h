@@ -52,5 +52,6 @@ void i686_syscalls_ipc_init(void);
 void i686_syscalls_time_init(void);
 void i686_syscalls_misc_init(void);
 void i686_syscalls_pass_init(void);
+void i686_syscalls_thread_init(void);
 
 #endif /* I686RT_OS_MARSHAL_H */
