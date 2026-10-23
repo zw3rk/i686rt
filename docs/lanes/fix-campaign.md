@@ -538,3 +538,14 @@ Tasks:
 Acceptance check (run ONCE): the two disposition documents complete
 (every stash hunk and every D-entry classified), committed on your
 branch.  No docker needed except none — this is a reading card.
+
+## Coordinator log (fix campaign)
+
+- 2026-10-24 — C3f escalation item 1 REFUTED: the reported statx(383)
+  ENOENT on /etc/ld.so.cache is not a C1a regression. Probes on master:
+  statx resolves sysroot-only paths correctly (libc.so.6 -> 0);
+  /etc/ld.so.cache and /etc/hostname do not exist in the wine sysroot,
+  so ENOENT is the correct answer (identical to the pre-C1a fstatat64
+  fallback). The #DE misdelivery root cause (fix-c3f-diagnosis.md) is
+  the actionable C3 finding; its fix routes to a dedicated lane once
+  signals_i386.c (C2) and engine.c (C6c) free up.
