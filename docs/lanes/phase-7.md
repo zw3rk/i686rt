@@ -1124,3 +1124,121 @@ ACCEPTANCE: NOT passed — `wine cmd /c "echo ok"` does not print ok
 (latest DBT run: silent exit 53 at 391 s; oracle: ok rc=0 in 29 s).
 Escalation filed with the evidence above (section C) after two full-chain
 attempts plus the staged closure/TLS fixes.
+
+## RC7b triage T4d record (2026-10-22) — PASSED: wineserver client/server
+## divergence root-caused as two translator bugs (futex marshalling +
+## per-instruction sigsetjmp); chain prints ok rc=0 in 208 s
+
+Lane T4d (worktree `../i686rt-t4`, branch `lane/7b-t4`, master merged at
+fa39afc).  Card: LAST escalation — the wineserver client/server exchange
+diverges from the oracle (retry loops, vDSO-gateway ret corruption,
+glibc heap corruption in wineserver).
+
+### A. Assigned root cause 1 — futex(240) marshalling violated the i386
+###    ABI — FIXED
+
+I686RT_SYSTRACE (65 s of a fresh-prefix boot, sampled with a
+consecutive-identical-line loop detector) showed the only true spin:
+`futex(0x00dcfd60, op=0x109=FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME,
+val, NULL, ..., bitset) -> -22` at burst rates (377/377 calls, all
+-EINVAL).  The old sys_futex read the timeout pointer from EBP (i386
+arg6 = val3/bitset), never read ESI (arg4 = utime) or EDI (arg5 =
+uaddr2), always passed host val3 = 0, and re-encoded op as
+`(op & 0x7f) + 128` — which (a) made the kernel reject every
+FUTEX_WAIT_BITSET (`if (!bitset) return -EINVAL` in futex_wait; probed
+on the host kernel: WAIT_BITSET with bitset 0 -> -EINVAL, FUTEX_FD ->
+-ENOSYS) so glibc clockwait callers spin forever, and (b) silently
+dropped FUTEX_CLOCK_REALTIME from absolute waits.  The pre-fix run
+died of the old `corrupted double-linked list` in the wineserver at
+~75 s on a fresh prefix (abort-path syscalls visible: gettid -> -ENOSYS,
+tgkill -> -ENOSYS — separate gaps, unregistered, non-blocking here).
+
+Fix: full kernel-faithful 6-arg marshalling (EBX=uaddr, ECX=op, EDX=val,
+ESI=utime, EDI=uaddr2, EBP=val3), op/val3 pass through VERBATIM
+(private/shared and the realtime clock flag keep their kernel meanings —
+the window maps guest futex words 1:1), timeout read for exactly the
+kernel's timeout-taking commands {WAIT, LOCK_PI, WAIT_BITSET,
+WAIT_REQUEUE_PI} with compat_get_timespec semantics (s32 sec
+sign-extended, EFAULT on bad pointer), uaddr2 translated for
+{REQUEUE, CMP_REQUEUE, WAKE_OP, CMP_REQUEUE_PI} (src/os/sys_pass.c).
+
+### B. Root cause 2 (the T4c speed/stall mystery) — sigsetjmp armed
+###    once per GUEST INSTRUCTION — FIXED
+
+After the futex fix the failure mode changed: the boot ran to the end
+of the fake-dll install, but the `wine` loader's boot-event wait
+(WINEDEBUG=+server: `select({__wineboot_event, wineboot-process})`,
+timeout +300 s) TIMED OUT (`err:environ:run_wineboot boot event wait
+timed out`) and the chain exited 53 (c0000135) — wineboot's rundll32
+INF/dll-copy phase (773 files, ~480 MB through guest read/write) needed
+~350 s.  gdb stack samples of both burning processes (clean
+single-boot, orphans purged — earlier timings were contaminated by
+timeout-orphaned boots) landed in `__sigsetjmp_tail` under
+`i686_interp_run` on every sample: the interp loop armed
+`sigsetjmp(s_fault_jmp, 1)` per guest instruction — savemask=1 costs a
+host rt_sigprocmask syscall EACH time on musl.  The buffer was also
+file-static, so a fault in one guest thread could siglongjmp through
+whichever thread armed it last (resuming on a foreign stack — the
+mechanism behind T4c's "frozen at the vDSO gateway ret with a
+non-executable return address").
+
+Fix: the checkpoint arms ONCE per i686_interp_run call (savemask=1
+kept — the siglongjmp restores the loop-entry mask, unblocking the
+faulting signal), and the buffer is frame-local reached through a
+`__thread` pointer; the handler disarms it before jumping so a nested
+host fault exits loudly instead of re-jumping (src/interp/interp.c).
+Guest-fault delivery (i686_deliver_sync resume path) unchanged; the
+wine boot itself exercises the handler path heavily.
+
+Post-fix boot wall time: ~330 s (unfinished) -> 179/210/208 s across
+three full-chain runs.
+
+### C. Acceptance check (single chain, pristine container, 2026-10-22)
+
+Repro per the card (arm64 alpine:3.20, fresh /tmp staging of
+_build/i686rt + cp -R _sysroot/debian-wine32-i386, staged zlib1.dll
+postinst transform from T4c, named/timeout-bounded container verified
+removed):
+
+    export HOME=/tmp/whome WINEPREFIX=/w/wprefix WINEDEBUG=-all
+    export WINEDLLPATH=/w/sysroot/usr/lib/i386-linux-gnu/wine
+    rm -rf /w/wprefix
+    timeout 300 /w/i686rt --sysroot /w/sysroot -- \
+        /w/sysroot/usr/bin/wine cmd /c "echo ok"
+
+Verbatim stdout+rc:
+
+    ok
+    RC=0
+
+real 3m 27.98s (208 s; a second pristine-container run: 179 s), inside
+the 300 s bound; the same staging under the native i386 oracle (docker
+--platform linux/386 + the sysroot /lib,/usr,/usr/share; binfmt on this
+host needed the musl loader copied into the staged /lib) prints `ok`
+rc=0 in ~45 s (T4c saw 29 s on warmer caches).  Known residual stderr
+noise, stdout/rc-clean, translation-only: 3x `winevdm: winedevice.exe
+is a DOS application` (the oracle does not print it — winevdm launches
+while the slow fake-dll copy is still filling system32; no functional
+impact on this acceptance).
+
+### D. Regression checks (final binary, all rc=0 unless noted)
+
+    dash -c "echo dash-ok; exit 7"    -> dash-ok, rc=7 (exit passthrough)
+    sh -c exec sh -c echo reexec-ok   -> reexec-ok, rc=0
+    wine --version (WINEDLLPATH set)  -> wine-10.0 (debian 10.0~repack-12+b1)
+    tests/unit/test_l2f.c (aarch64
+    linux host build, real kernel)    -> L2F OK (futex expectations
+                                       rewritten for the kernel-faithful
+                                       semantics: mismatch->-EAGAIN,
+                                       zero timespec->-ETIMEDOUT,
+                                       WAIT_BITSET bitset=0->-EINVAL,
+                                       FUTEX_FD->-ENOSYS, WAKE_OP w/o
+                                       uaddr2->-EFAULT)
+    tools/test_insn_tab.py            -> L1A OK
+    make build                        -> zero new warnings
+    I686RT_ENGINE=dbt full chain      -> NOT viable yet (2 files copied
+                                       in 7 min; dbt stalls early on
+                                       this workload — separate report)
+
+ACCEPTANCE: PASSED — `wine cmd /c "echo ok"` prints ok, rc=0, within
+the 300 s bound (208 s worst observed on a cold pristine container).

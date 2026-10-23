@@ -22,8 +22,12 @@
 
 /* Host-fault -> guest-fault checkpoint (Phase 4).  The handler runs on
  * the faulting host thread; sigsetjmp/siglongjmp restores the interp
- * loop with the fault recorded. */
-static sigjmp_buf s_fault_jmp;
+ * loop with the fault recorded.  The jump target lives in the frame of
+ * the i686_interp_run call that armed it — one per host thread, via
+ * the __thread pointer below (the previous file-static buffer let a
+ * fault in one guest thread siglongjmp through whichever guest thread
+ * armed it last, resuming on a foreign stack: RC7b T4d). */
+static __thread sigjmp_buf *s_fault_jmp;
 static volatile sig_atomic_t s_in_run;
 static volatile uint64_t s_fault_addr;
 
@@ -32,10 +36,12 @@ static volatile sig_atomic_t s_fault_sig;
 static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
 {
     (void)uc_;
-    if (s_in_run) {
+    sigjmp_buf *jb = s_fault_jmp;
+    if (s_in_run && jb != NULL) {
+        s_fault_jmp = NULL; /* disarm: a nested fault must not re-jump */
         s_fault_addr = (uint64_t)(uintptr_t)si->si_addr;
         s_fault_sig = sig;
-        siglongjmp(s_fault_jmp, 1);
+        siglongjmp(*jb, 1);
     }
     _exit(128 + sig);
 }
@@ -174,36 +180,52 @@ int i686_interp_step(i686_ctx_t *ctx)
 int i686_interp_run(i686_ctx_t *ctx)
 {
     static int s_faults_installed;
+    sigjmp_buf fault_jmp;
+    int faulted;
+
     if (!s_faults_installed) {
         s_faults_installed = 1;
         host_faults_install();
     }
     s_in_run = 1;
-    for (;;) {
-        if (sigsetjmp(s_fault_jmp, 1) != 0) {
-            /* Host fault inside guest execution: map to a guest exit. */
-            uint64_t fa = (uint64_t)s_fault_addr;
-            s_in_run = 1;
-            if (fa >= ctx->guest_base &&
-                fa < ctx->guest_base + 0x100000000ULL) {
-                ctx->fault_addr = (uint32_t)(fa - ctx->guest_base);
-            } else {
-                ctx->fault_addr = (uint32_t)fa;
-            }
-            {
-                extern int i686_deliver_sync(i686_ctx_t *, int);
-                if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
-                    continue; /* guest handler installed; resume at it */
-                }
-                (void)fprintf(stderr,
-                              "i686rt: interp: guest fault (host) pid=%d at "
-                              "eip=0x%08x, fault_addr=0x%08x\n",
-                              (int)getpid(), ctx->eip, ctx->fault_addr);
-                diag("guest fault (host)", ctx, 0);
-                ctx->exit_reason = I686_EXIT_FAULT;
-                return I686_EXIT_FAULT;
-            }
+
+    /* Arm the host-fault checkpoint ONCE per run (RC7b T4d).  The
+     * previous per-instruction sigsetjmp saved the signal mask on
+     * every guest instruction — a host rt_sigprocmask syscall from
+     * musl's __sigsetjmp_tail each time — which dominated wall time
+     * on the wine boot (gdb stack samples landed in __sigsetjmp_tail
+     * repeatedly).  savemask=1 keeps the siglongjmp semantics: the
+     * faulting signal is unblocked again on resume.  The buffer is
+     * frame-local, so each host thread checkpoints its own stack. */
+    faulted = sigsetjmp(fault_jmp, 1);
+    s_fault_jmp = &fault_jmp;
+    if (faulted != 0) {
+        /* Host fault inside guest execution: map to a guest exit. */
+        uint64_t fa = (uint64_t)s_fault_addr;
+
+        s_in_run = 1;
+        if (fa >= ctx->guest_base &&
+            fa < ctx->guest_base + 0x100000000ULL) {
+            ctx->fault_addr = (uint32_t)(fa - ctx->guest_base);
+        } else {
+            ctx->fault_addr = (uint32_t)fa;
         }
+        {
+            extern int i686_deliver_sync(i686_ctx_t *, int);
+            if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
+                goto run_loop; /* guest handler installed; resume at it */
+            }
+            (void)fprintf(stderr,
+                          "i686rt: interp: guest fault (host) pid=%d at "
+                          "eip=0x%08x, fault_addr=0x%08x\n",
+                          (int)getpid(), ctx->eip, ctx->fault_addr);
+            diag("guest fault (host)", ctx, 0);
+            ctx->exit_reason = I686_EXIT_FAULT;
+            return I686_EXIT_FAULT;
+        }
+    }
+run_loop:
+    for (;;) {
         x86_insn_t insn;
         i686_interp_fn fn;
         int r;
