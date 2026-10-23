@@ -1,13 +1,13 @@
 # CoreMark run environment (tools/run-coremark.sh)
-# date: 2026-10-23T15:31:17Z
+# date: 2026-10-23T16:41:30Z
 # host: Darwin arm64 (docker desktop)
-# tarball: /Users/angerman/Projects/zw3rk/i686rt-c6b/_build/coremark-1.01.tar.gz sha256=99c5a6d63af85a281b4e4d6ccb522c446653c435dfec9455ad73ef9e71f28bde
-# i686rt: /Users/angerman/Projects/zw3rk/i686rt-c6b/_build/i686rt sha256=abf567b088cfebae50afca02549a4f0d1dbcfae859af67c2bc81c490f53d831b
+# tarball: /Users/angerman/Projects/zw3rk/i686rt-c6c/_build/coremark-1.01.tar.gz sha256=99c5a6d63af85a281b4e4d6ccb522c446653c435dfec9455ad73ef9e71f28bde
+# i686rt: /Users/angerman/Projects/zw3rk/i686rt-c6c/_build/i686rt sha256=45679802b405d81c830b445a5a76ce6b1061de721721b6f08146593b02d8b389
 # image: alpine:3.20 (linux/386 oracle, linux/arm64 run containers)
 # coremark flags: -O2 -march=i686 -static -DPERFORMANCE_RUN=1 -DHAS_FLOAT=0
 # invocation: coremark.exe 0x0 0x0 0x66 <iters> 7 1 2000
 # iterations: oracle=300000 interp=30000 dbt=9000
 # run bound: 600s per run (--memory 2g --cpus 2)
-# RUNRC oracle: wall_s:rc=83:0
-# RUNRC interp: wall_s:rc=472:0
-# RUNRC dbt: wall_s:rc=429:0
+# RUNRC oracle: wall_s:rc=71:0
+# RUNRC interp: wall_s:rc=431:0
+# RUNRC dbt: wall_s:rc=370:0
