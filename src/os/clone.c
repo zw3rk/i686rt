@@ -431,10 +431,20 @@ static void *thread_entry(void *arg)
         uint32_t zero = 0U;
         memcpy(i686_guest_ptr(ctx, ctx->clear_child_tid), &zero, 4U);
         {
-            long hcmd = 1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/;
+            /* Wake the joiner.  musl waits private (FUTEX_WAIT|PRIVATE)
+             * but glibc's joiner waits SHARED (observed C10:
+             * WAIT_BITSET|CLOCK_REALTIME without the private bit), and
+             * the two hash buckets do not overlap — the private-only
+             * wake left glibc's pthread_join blocked forever.  The
+             * kernel's mm_release cleartid wake is a shared wake, which
+             * is why both libcs work on real Linux. */
             (void)syscall(SYS_futex,
                           i686_guest_ptr(ctx, ctx->clear_child_tid),
-                          hcmd, 1, NULL, NULL, 0);
+                          1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/, 1,
+                          NULL, NULL, 0);
+            (void)syscall(SYS_futex,
+                          i686_guest_ptr(ctx, ctx->clear_child_tid),
+                          1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
         }
         ctx->clear_child_tid = 0U;
     }
