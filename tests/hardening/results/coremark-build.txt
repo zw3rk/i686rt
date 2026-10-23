@@ -1,0 +1,24 @@
+gcc -O2 -Ilinux -I. -DFLAGS_STR=\""-O2 -march=i686 -static -DPERFORMANCE_RUN=1 -DHAS_FLOAT=0  -lrt"\" -DITERATIONS=0 -march=i686 -static -DPERFORMANCE_RUN=1 -DHAS_FLOAT=0 core_list_join.c core_main.c core_matrix.c core_state.c core_util.c linux/core_portme.c -o ./coremark.exe -lrt
+core_main.c: In function 'main':
+core_main.c:287:41: warning: format '%lu' expects argument of type 'long unsigned int', but argument 2 has type 'unsigned int' [-Wformat=]
+  287 |         ee_printf("CoreMark Size    : %lu\n",(ee_u32)results[0].size);
+      |                                       ~~^    ~~~~~~~~~~~~~~~~~~~~~~~
+      |                                         |    |
+      |                                         |    unsigned int
+      |                                         long unsigned int
+      |                                       %u
+core_main.c:288:41: warning: format '%lu' expects argument of type 'long unsigned int', but argument 2 has type 'unsigned int' [-Wformat=]
+  288 |         ee_printf("Total ticks      : %lu\n",(ee_u32)total_time);
+      |                                       ~~^    ~~~~~~~~~~~~~~~~~~
+      |                                         |    |
+      |                                         |    unsigned int
+      |                                         long unsigned int
+      |                                       %u
+core_main.c:303:41: warning: format '%lu' expects argument of type 'long unsigned int', but argument 2 has type 'unsigned int' [-Wformat=]
+  303 |         ee_printf("Iterations       : %lu\n",(ee_u32)default_num_contexts*results[0].iterations);
+      |                                       ~~^    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      |                                         |                                |
+      |                                         long unsigned int                unsigned int
+      |                                       %u
+ 177   E   L   F
+gcc (Alpine 13.2.1_git20240309) 13.2.1 20240309

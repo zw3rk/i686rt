@@ -191,3 +191,12 @@ h2-report: ## Assemble tests/hardening/h2-report.md from the committed runner lo
 	tests/hardening/mkreport.sh
 
 .PHONY: h2-report
+
+## ------------------------------------------------------------------ ##
+##  Phase H — H3: CoreMark performance (interp vs dbt vs oracle)        ##
+## ------------------------------------------------------------------ ##
+
+h3-coremark: ## Assemble tests/hardening/h3-coremark.md from the committed CoreMark logs (run tools/run-coremark.sh first)
+	tools/run-coremark.sh report
+
+.PHONY: h3-coremark
