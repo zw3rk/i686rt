@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -121,6 +122,13 @@ int i686_tls_install(i686_ctx_t *ctx, uint32_t ud_va)
     ctx->gdt_tls_slots[slot] = ud.base_addr;
     ctx->seg_base[I686_SEG_GS] = ud.base_addr;
     ctx->seg_sel[I686_SEG_GS] = (uint32_t)(0x33 + 8 * slot);
+    {
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            (void)fprintf(stderr, "TLSSET tid=%d entry=%u base=%08x\n",
+                          (int)syscall(SYS_gettid), ud.entry_number, ud.base_addr);
+        }
+    }
     return (int)ctx->seg_sel[I686_SEG_GS];
 }
 
@@ -136,6 +144,19 @@ static int64_t r_clone(i686_ctx_t *ctx)
     pthread_t th;
     uint32_t r_val = 0U;
     uint32_t child_eip = ctx->eip; /* engine sets exit_dest at clone */
+
+    {
+        /* Thread-forensics (RC7b T4b): who clones what, and which TLS. */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            (void)fprintf(stderr,
+                          "CLN tid=%d flags=%08x newsp=%08x tls=%08x "
+                          "gs_sel=%04x gs_base=%08x eip=%08x\n",
+                          (int)syscall(SYS_gettid), flags, newsp, tls_va,
+                          ctx->seg_sel[I686_SEG_GS],
+                          ctx->seg_base[I686_SEG_GS], child_eip);
+        }
+    }
 
     if ((flags & I686_CLONE_VM) == 0U) {
         /* Process-style clone == fork semantics: the window is private
@@ -187,6 +208,25 @@ static int64_t r_clone(i686_ctx_t *ctx)
 
     if ((flags & I686_CLONE_SETTLS) != 0U && tls_va != 0U) {
         (void)i686_tls_install(child, tls_va);
+    }
+    {
+        /* Thread-forensics (RC7b T4b): child state at hand-off. */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            uint32_t p_sys = 0U;
+
+            if (ctx->seg_base[I686_SEG_GS] != 0U) {
+                memcpy(&p_sys,
+                       i686_guest_ptr(ctx, ctx->seg_base[I686_SEG_GS] + 0x10U),
+                       sizeof(p_sys));
+            }
+            (void)fprintf(stderr,
+                          "CLNCHILD gs_sel=%04x gs_base=%08x eip=%08x "
+                          "esp=%08x parent_sys=%08x\n",
+                          child->seg_sel[I686_SEG_GS],
+                          child->seg_base[I686_SEG_GS], child->eip,
+                          child->gpr[I686_REG_ESP], p_sys);
+        }
     }
     {
         /* small positive tids (i386 pid_t); the raw heap pointer

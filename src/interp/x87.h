@@ -49,6 +49,7 @@ void     mmx_set(i686_ctx_t *ctx, unsigned reg, uint64_t v);
 /* Integer push/pop for fild/fistp families. */
 void    x87_set_int(i686_ctx_t *ctx, int64_t v);
 int64_t x87_get_int(const i686_ctx_t *ctx, unsigned i); /* rounded per CW */
+int64_t x87_get_int_trunc(const i686_ctx_t *ctx, unsigned i); /* FISTTP */
 
 /* --- environment ---------------------------------------------------------- */
 /* CW field encodings (x86): RC = bits 10-11 (0=nearest-even,1=down,

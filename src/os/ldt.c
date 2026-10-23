@@ -48,8 +48,12 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+long syscall(long, ...);
 #include "i686rt.h"
 
 /* seg.h (frozen) re-spells its fault-code macro I686_SEG_SS (3) over
@@ -313,11 +317,22 @@ long i686_sys_set_thread_area(i686_ctx_t *ctx, uint32_t ua)
         return -EFAULT;
     }
 
-    /* v1-compat auto-load of GS (see file comment; kernel does not). */
-    if (st->gdt_used[slot]) {
-        sel = (uint16_t)((entry << 3) | 3u);
-        (void)i686_seg_load(ctx, I686_SEG_GS, sel);
+    /* RC7b T4b: kernel-faithful — set_thread_area installs the
+     * descriptor only and never touches segment registers.  The
+     * previous v1-compat GS auto-load broke wine, whose start_thread
+     * installs its TEB descriptor (entry 6) for %FS; loading it into
+     * %GS clobbered the glibc TCB and faulted __errno_location. */
+    {
+        /* Thread-forensics (RC7b T4b). */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            (void)fprintf(stderr,
+                          "STA tid=%d entry=%u base=%08x present=%u\n",
+                          (int)syscall(SYS_gettid), entry, d.base,
+                          (unsigned)(st->gdt_used[slot] != 0u));
+        }
     }
+    (void)sel;
     return 0;
 }
 

@@ -42,6 +42,20 @@ void i686_dbt_trace_enable(int on)
     s_trace_blocks = on && getenv("I686RT_DBTTRACE") != NULL;
 }
 
+/* Kernel exec semantics (RC7b T4b): a guest execve must invalidate the
+ * whole translation cache — fork-spawned children inherit the parent's
+ * COW cache, and a new image loaded at the same EIPs would otherwise
+ * execute the previous image's stale blocks. */
+void i686_dbt_flush_all(void)
+{
+    for (size_t i = 0U; i < DBT_HT_SIZE; i++) {
+        if (s_ht[i].len != 0U) {
+            munmap(s_ht[i].code, s_ht[i].cap);
+            s_ht[i].len = 0U;
+        }
+    }
+}
+
 static uint32_t dbt_hash(uint32_t eip)
 {
     return (eip >> 2U) & (DBT_HT_SIZE - 1U);

@@ -630,6 +630,27 @@ static void st_int(i686_ctx_t *ctx, uint32_t va, unsigned bytes)
     mem_wr(ctx, va, bytes, out);
 }
 
+/* DD /4 memory form (FRSTOR, defined in the state-image section). */
+static void op_frstor(i686_ctx_t *ctx, uint32_t va);
+
+/* FISTTP (SSE3, RC7b T4b): same width clamping as st_int but the
+ * conversion ALWAYS truncates toward zero (CW RC ignored). */
+static void st_int_trunc(i686_ctx_t *ctx, uint32_t va, unsigned bytes)
+{
+    int64_t v = x87_get_int_trunc(ctx, 0);
+    uint64_t out;
+
+    if (bytes == 2) {
+        out = (v < -32768 || v > 32767) ? 0x8000U : (uint64_t)v & 0xffffU;
+    } else if (bytes == 4) {
+        out = (v < -2147483648LL || v > 2147483647LL) ? 0x80000000U
+                                                      : (uint64_t)v & 0xffffffffU;
+    } else {
+        out = (uint64_t)v;
+    }
+    mem_wr(ctx, va, bytes, out);
+}
+
 /* ------------------------------------------------------------------ */
 /* Unary / transcendental ops (both modes)                             */
 /* ------------------------------------------------------------------ */
@@ -1675,7 +1696,9 @@ static int h_fucom(i686_ctx_t *ctx, const x86_insn_t *insn)
     int un;
 
     if (insn->modrm_mod != 3U) {
-        return undef_form(ctx, insn);
+        /* DD /4 memory form: FRSTOR m108 (RC7b T4b). */
+        op_frstor(ctx, x86_ea_compute(ctx, insn));
+        return done(ctx, insn);
     }
     if (!ctx->x87_80) {
         double a = x87_get_f64(ctx, 0);
@@ -1713,6 +1736,60 @@ static int h_fucomp(i686_ctx_t *ctx, const x86_insn_t *insn)
         x87_pop(ctx);
     }
     return r;
+}
+
+/* DA mod=3 register forms (RC7b T4b; glibc/i386 FP compare code uses
+ * them): DA C0+i FCOM ST,ST(i), DA D0+i FUCOM ST,ST(i), DA D8+i
+ * FCOMP ST,ST(i).  CC bits per FCOM; FCOMP pops once.  Memory forms of
+ * the DA row stay declined (FIADD-class, D2). */
+static int do_da_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
+{
+    int un;
+
+    if (insn->modrm_mod != 3U) {
+        return undef_form(ctx, insn);
+    }
+    if (!ctx->x87_80) {
+        double a = x87_get_f64(ctx, 0);
+        double b = x87_get_f64(ctx, insn->modrm_rm);
+
+        un = cc_of_cmp(a, b, ctx);
+        exc_ie_cmp(ctx, a, b, un, true);
+    } else {
+        uint8_t sa[10];
+        uint8_t sb[10];
+        unsigned c0 = 0;
+        unsigned c2 = 0;
+        unsigned c3 = 0;
+
+        x87_get_ext80(ctx, 0, sa);
+        x87_get_ext80(ctx, insn->modrm_rm, sb);
+        x87_80_fcom(sa, sb, true, &c3, &c2, &c0);
+        set_cc(ctx, c0, 0, c2, c3);
+        if ((c0 && c2 && c3) &&
+            (x87_80_is_snan(sa) || x87_80_is_snan(sb))) {
+            x87_set_exc(ctx, SW_IE);
+        }
+    }
+    if (pop != 0) {
+        x87_pop(ctx);
+    }
+    return done(ctx, insn);
+}
+
+static int h_fcom_sti(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return do_da_fcom(ctx, insn, 0);
+}
+
+static int h_fucom_sti(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return do_da_fcom(ctx, insn, 0);
+}
+
+static int h_fcomp_sti(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return do_da_fcom(ctx, insn, 1);
 }
 
 /* DD /7: FNSTSW m16 (mod=3 invalid). */
@@ -1776,6 +1853,40 @@ static int h_fistp_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
         x87_pop(ctx);
     }
     return r;
+}
+
+/* FISTTP: DB /1 m32, DD /1 m64, DF /1 m16 (RC7b T4b; wine's ntdll.dll
+ * uses it for C99 truncating conversions).  Truncates toward zero
+ * regardless of CW RC; NaN/inf/out-of-range store the integer
+ * indefinite silently (no #P/#I fault, SDM Vol.1 x87 FISTTP). */
+static int h_fisttp_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    if (insn->modrm_mod == 3U) {
+        return undef_form(ctx, insn);
+    }
+    st_int_trunc(ctx, x86_ea_compute(ctx, insn), 4);
+    x87_pop(ctx);
+    return done(ctx, insn);
+}
+
+static int h_fisttp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    if (insn->modrm_mod == 3U) {
+        return undef_form(ctx, insn);
+    }
+    st_int_trunc(ctx, x86_ea_compute(ctx, insn), 8);
+    x87_pop(ctx);
+    return done(ctx, insn);
+}
+
+static int h_fisttp_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    if (insn->modrm_mod == 3U) {
+        return undef_form(ctx, insn);
+    }
+    st_int_trunc(ctx, x86_ea_compute(ctx, insn), 2);
+    x87_pop(ctx);
+    return done(ctx, insn);
 }
 
 /* DB /4 mod=3: E2 FNCLEX, E3 FNINIT (no memory form). */
@@ -1945,6 +2056,83 @@ static int h_fxrstor(i686_ctx_t *ctx, const x86_insn_t *insn)
     return done(ctx, insn);
 }
 
+
+/* FNSAVE (DD /6 m108, RC7b T4b): store the x87 state in the i387
+ * (16-bit-era) image format, then reinitialize the FPU.  Image:
+ * FCW@0, FSW@2, abridged tag@4 (1 bit/register, 1 = empty, PHYSICAL
+ * order), FIP@8, FCS@12, FOP@14, FDP@16, FDS@20, R0..R7@28 (10 B
+ * each, physical order).  wine's ntdll.dll start path saves/restores
+ * the FPU state across thread setup. */
+static void op_fnsave(i686_ctx_t *ctx, uint32_t va)
+{
+    uint8_t *img = (uint8_t *)i686_guest_ptr(ctx, va);
+    uint16_t atw = 0;
+
+    memset(img, 0, 108);
+    img_wr16(img, 0, ctx->fctrl);
+    img_wr16(img, 2, ctx->fstat);
+    for (unsigned p = 0; p < 8; p++) {
+        if (((ctx->ftag >> (p * 2U)) & 3U) == 3U) {
+            atw |= (uint16_t)(1U << p);
+        }
+    }
+    img[4] = (uint8_t)atw;
+    img_wr32(img, 8, ctx->fpu_ip);
+    img_wr16(img, 12, ctx->seg_sel[I686_SEG_CS]);
+    img_wr16(img, 14, ctx->fop);
+    img_wr32(img, 16, ctx->fpu_dp);
+    img_wr16(img, 20, ctx->seg_sel[I686_SEG_DS]);
+    for (unsigned p = 0; p < 8; p++) {
+        uint8_t b[10];
+
+        x87_get_ext80(ctx, (p - ctx->x87_top) & 7U, b); /* ST(i)=Rp */
+        memcpy(&img[28 + 10 * p], b, 10);
+    }
+    /* FNSAVE reinitializes (FINIT semantics). */
+    ctx->fctrl = 0x037fU;
+    ctx->fstat = 0;
+    ctx->ftag = 0xffffU;
+    ctx->x87_top = 0;
+    ctx->fop = 0;
+    ctx->fpu_ip = 0;
+    ctx->fpu_dp = 0;
+}
+
+/* FRSTOR (DD /4 m108 memory form; the mod=3 form of the same slot is
+ * FUCOM and stays in h_fucom). */
+static void op_frstor(i686_ctx_t *ctx, uint32_t va)
+{
+    const uint8_t *img = (const uint8_t *)i686_guest_ptr(ctx, va);
+
+    ctx->fctrl = img_rd16(img, 0);
+    ctx->fstat = img_rd16(img, 2);
+    ctx->x87_top = (ctx->fstat >> 11) & 7U;
+    ctx->ftag = 0;
+    for (unsigned p = 0; p < 8; p++) {
+        if ((img[4] & (1U << p)) != 0U) {
+            ctx->ftag |= (uint16_t)(3U << (p * 2U)); /* empty */
+        }
+    }
+    ctx->fpu_ip = img_rd32(img, 8);
+    ctx->fop = img_rd16(img, 14);
+    ctx->fpu_dp = img_rd32(img, 16);
+    for (unsigned p = 0; p < 8; p++) {
+        uint8_t b[10];
+
+        memcpy(b, &img[28 + 10 * p], 10);
+        x87_set_ext80(ctx, (p - ctx->x87_top) & 7U, b);
+    }
+}
+
+static int h_fnsave(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    if (insn->modrm_mod == 3U) {
+        return undef_form(ctx, insn); /* DD /6 has no register form */
+    }
+    op_fnsave(ctx, x86_ea_compute(ctx, insn));
+    return done(ctx, insn);
+}
+
 /* ------------------------------------------------------------------ */
 /* FCOMI/FCOMIP/FUCOMI/FUCOMIP: EFLAGS ZF/PF/CF                        */
 /* ------------------------------------------------------------------ */
@@ -2046,6 +2234,7 @@ void i686_interp_x87_init(void)
     i686_interp_register(I686_OP_FUCOM, h_fucom);
     i686_interp_register(I686_OP_FUCOMP, h_fucomp);
     i686_interp_register(I686_OP_FNSTSW_m16, h_fnstsw_m16);
+    i686_interp_register(I686_OP_FNSAVE, h_fnsave); /* DD /6; /4 mem = FRSTOR */
     /* DB */
     i686_interp_register(I686_OP_FILD_m32, h_fild_m32);
     i686_interp_register(I686_OP_FIST_m32, h_fist_m32);
@@ -2056,6 +2245,10 @@ void i686_interp_x87_init(void)
     i686_interp_register(I686_OP_FSTP_m80, h_fstp_m80);
     /* DA */
     i686_interp_register(I686_OP_FUCOMPP, h_fucompp);
+    /* DA mod=3 register forms (RC7b T4b) */
+    i686_interp_register(I686_OP_FCOM_STi, h_fcom_sti);
+    i686_interp_register(I686_OP_FUCOM_STi, h_fucom_sti);
+    i686_interp_register(I686_OP_FCOMP_STi, h_fcomp_sti);
     /* DF */
     i686_interp_register(I686_OP_FILD_m16, h_fild_m16);
     i686_interp_register(I686_OP_FIST_m16, h_fist_m16);
@@ -2064,6 +2257,10 @@ void i686_interp_x87_init(void)
     i686_interp_register(I686_OP_FILD_m64, h_fild_m64);
     i686_interp_register(I686_OP_FCOMIP, h_fcomip);
     i686_interp_register(I686_OP_FISTP_m64, h_fistp_m64);
+    /* FISTTP (SSE3, RC7b T4b) */
+    i686_interp_register(I686_OP_FISTTP_m32, h_fisttp_m32);
+    i686_interp_register(I686_OP_FISTTP_m64, h_fisttp_m64);
+    i686_interp_register(I686_OP_FISTTP_m16, h_fisttp_m16);
     /* 0F map */
     i686_interp_register(I686_OP_EMMS, h_emms);
     i686_interp_register(I686_OP_FXSAVE, h_fxsave);

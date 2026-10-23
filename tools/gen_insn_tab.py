@@ -195,6 +195,17 @@ def contract_ids():
         # RC7b T1: 0F AE /7 joins the group (store fence; no-op in the
         # single-threaded TSO guest model).
         "SFENCE",
+        # RC7b triage T4b (docs/lanes/phase-7.md): FISTTP — SSE3
+        # truncate-store integer; ntdll.dll uses it for C99 (int)
+        # conversions.  Appended (ids are append-stable).
+        "FISTTP_m32", "FISTTP_m64", "FISTTP_m16",
+        # RC7b triage T4b: FNSAVE (DD /6 m108, save+reinit); FRSTOR
+        # (DD /4 memory form) rides the FUCOM slot handler like the
+        # other L5c fixed-form sub-dispatches.
+        "FNSAVE",
+        # RC7b triage T4b: DA mod=3 register compare forms (glibc/i386
+        # float code): DA C0+i FCOM, D0+i FUCOM, D8+i FCOMP.
+        "FCOM_STi", "FUCOM_STi", "FCOMP_STi",
     ]))
     return sections
 
@@ -691,35 +702,39 @@ def build_groups():
                    [rm32, non, rm32, rm32, rm32, rm16, rm32, rm16], 0,
                    "x87 D9: loads/stores, env, fixed forms via mod=3 rm"))
     g.append(Group(0, 0xDA,
-                   ["INVALID"] * 5 + ["FUCOMPP"] + ["INVALID"] * 2,
-                   n8, 0,
-                   "x87 DA: only DA E9 FUCOMPP; FIADD-class m32 declined"))
+                   ["FCOM_STi", "FUCOM_STi", "FCOMP_STi", "INVALID",
+                    "FUCOMPP", "INVALID", "INVALID", "INVALID"],
+                   [non, non, non, non, non, non, non, non], 0,
+                   "x87 DA: mod=3 FCOM/FUCOM/FCOMP ST(i) (RC7b T4b); "
+                   "DA E9 FUCOMPP; FIADD-class m32 declined"))
     g.append(Group(0, 0xDB,
-                   ["FILD_m32", "INVALID", "FIST_m32", "FISTP_m32",
+                   ["FILD_m32", "FISTTP_m32", "FIST_m32", "FISTP_m32",
                     "FNINIT", "FLD_m80", "FCOMI", "FSTP_m80"],
-                   [rm32, non, rm32, rm32, non, rm32, non, rm32], 0,
-                   "x87 DB: FISTTP /1 declined; FNCLEX/FNINIT via /4 mod=3; "
-                   "FUCOMI rides FLD_m80 mod=3"))
+                   [rm32, rm32, rm32, rm32, non, rm32, non, rm32], 0,
+                   "x87 DB: FISTTP /1 (RC7b T4b, SSE3 truncate-store); "
+                   "FNCLEX/FNINIT via /4 mod=3; FUCOMI rides FLD_m80 mod=3"))
     g.append(Group(0, 0xDC,
                    ["FADD_m64", "FMUL_m64", "FCOM_m64", "FCOMP_m64",
                     "FSUB_m64", "FSUBR_m64", "FDIV_m64", "FDIVR_m64"],
                    [rm32] * 8, 0,
                    "x87 DC: ST(0) op= m64fp64 or ST(i),ST(0) reversed"))
     g.append(Group(0, 0xDD,
-                   ["FLD_m64", "INVALID", "FST_m64", "FSTP_m64",
-                    "FUCOM", "FUCOMP", "INVALID", "FNSTSW_m16"],
-                   [rm32, non, rm32, rm32, non, non, non, rm16], 0,
-                   "x87 DD: FFREE rides FLD_m64 mod=3; FUCOM* mod=3 only"))
+                   ["FLD_m64", "FISTTP_m64", "FST_m64", "FSTP_m64",
+                    "FUCOM", "FUCOMP", "FNSAVE", "FNSTSW_m16"],
+                   [rm32, rm32, rm32, rm32, non, non, rm32, rm16], 0,
+                   "x87 DD: FISTTP /1 and FNSAVE /6 m108 (RC7b T4b); "
+                   "FRSTOR rides FUCOM /4 memory form; FFREE rides "
+                   "FLD_m64 mod=3; FUCOM* mod=3 only"))
     g.append(Group(0, 0xDE,
                    ["FADDP", "FMULP", "INVALID", "INVALID",
                     "FSUBRP", "FSUBP", "FDIVRP", "FDIVP"],
                    [non, non, non, non, non, non, non, non], 0,
                    "x87 DE: ST(i),ST(0) then pop; memory FIADD-class declined"))
     g.append(Group(0, 0xDF,
-                   ["FILD_m16", "INVALID", "FIST_m16", "FISTP_m16",
+                   ["FILD_m16", "FISTTP_m16", "FIST_m16", "FISTP_m16",
                     "FNSTSW_AX", "FILD_m64", "FCOMIP", "FISTP_m64"],
-                   [rm16, non, rm16, rm16, non, rm32, non, rm32], 0,
-                   "x87 DF: FISTTP /1 declined, FBLD/FBSTP declined; "
+                   [rm16, rm16, rm16, rm16, non, rm32, non, rm32], 0,
+                   "x87 DF: FISTTP /1 (RC7b T4b), FBLD/FBSTP declined; "
                    "FUCOMIP rides FILD_m64 mod=3"))
     g.append(Group(1, 0xAE,
                    ["FXSAVE", "FXRSTOR", "LDMXCSR", "STMXCSR"]
@@ -824,10 +839,11 @@ HEADER_NOTES = """\
  *  - I686_OP_LEA_GvM is not named in the phase-1 identifier list, but 8D
  *    is required for flat-mode code; added for coordinator ratification.
  *  - Left INVALID per the contract (decode -> I686_EXIT_UNDEF, D2):
- *    x87's declined forms (FBLD/FBSTP BCD, FISTTP, the FIADD-class m16/
+ *    x87's declined forms (FBLD/FBSTP BCD, the FIADD-class m16/
  *    m32 integer arithmetic and FICOM, and the DA/DE C8-FF undefined
  *    second bytes -- decoded-but-declined modrm forms return UNDEF from
- *    their handlers instead), SSE3+ and the SSE/SSE2 leftovers not in
+ *    their handlers instead; FISTTP joined via RC7b T4b, FNSAVE/FRSTOR
+ *    via RC7b T4b), SSE3+ and the SSE/SSE2 leftovers not in
  *    the Phase 5 or RC7b T1 rows (MIN/MAX 5D/5F, SQRT family 51-53,
  *    0F 2D, SHUFPS 0F C6, ...), BCD (27 2F 37 3F D4-D6),
  *    I/O (E4-E7 EC-EF 6C-6F), far transfers (9A EA CA CB),
@@ -883,10 +899,11 @@ def generate():
     if dups:
         raise SystemExit("duplicate contract ids: %r" % dups)
     ids = sorted(set(ids))
-    if len(ids) != 359:
-        raise SystemExit("expected 359 contract ids (+S1 IMUL +S4 RDTSC "
+    if len(ids) != 366:
+        raise SystemExit("expected 366 contract ids (+S1 IMUL +S4 RDTSC "
                          "+S5 x87 54 +S5 SSE 42 +RC7b T1 SSE2 movement 13 "
-                         "+RC7b T4 CMPXCHG8B), "
+                         "+RC7b T4 CMPXCHG8B +RC7b T4b FISTTP 3 +FNSAVE "
+                         "+DA mod3 FCOM/FUCOM/FCOMP 3), "
                          "got %d" % len(ids))
 
     oneb = build_oneb()

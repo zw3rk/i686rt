@@ -13,8 +13,13 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+long syscall(long, ...);
 #include "i686rt.h"
 #include "os/marshal.h"
 #include "os/sigframe_i386.h"
@@ -68,6 +73,23 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
 
     if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
         return -1; /* SIG_DFL: caller terminates */
+    }
+
+    /* Handler double-fault (RC7b T4b): when the same signal's handler is
+     * already running (a live, not-yet-sigreturned frame) and a fault
+     * re-enters delivery, the kernel's force_sigsegv() clears the handler
+     * and kills instead of recursing.  Before this check, wine's fault
+     * path re-entered save_context forever (SA_ONSTACK rewinds to the
+     * altstack top, so the guard never fired).  A DIFFERENT signal's
+     * handler may nest legitimately, so only the same-signal case is
+     * forced to the default action.  Both frame layouts keep sig at +4. */
+    if (ctx->sig_last_frame_va != 0U) {
+        int32_t live = 0;
+        memcpy(&live, i686_guest_ptr(ctx, ctx->sig_last_frame_va + 4U),
+               sizeof(live));
+        if (live == sig) {
+            return -1;
+        }
     }
 
     /* SA_ONSTACK delivery (RC7b): wine's fault handlers install an
@@ -176,6 +198,39 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
      * [esp]=pretcode is the handler return address, [esp+4]=sig,
      * [esp+8]=pinfo, [esp+0xc]=puc — the frame fields ARE the args. */
     (void)sp;
+    {
+        /* Delivery forensics (RC7b T4b): sig/trapno/eip/cr2 per
+         * delivery, env-gated like I686RT_TRACE. */
+        extern int i686_sigtrace_on(void);
+        if (i686_sigtrace_on()) {
+            uint32_t ret = 0U;
+            uint32_t sysinfo = 0U;
+            uint8_t tcbdump[16];
+            memset(tcbdump, 0, sizeof(tcbdump));
+
+            memcpy(&ret, i686_guest_ptr(ctx, ctx->gpr[I686_REG_ESP]),
+                   sizeof(ret));
+            if (ctx->seg_base[I686_SEG_GS] != 0U) {
+                memcpy(&sysinfo,
+                       i686_guest_ptr(ctx, ctx->seg_base[I686_SEG_GS] + 0x10U),
+                       sizeof(sysinfo));
+                memcpy(&tcbdump,
+                       i686_guest_ptr(ctx, ctx->seg_base[I686_SEG_GS]), 16U);
+            }
+            (void)fprintf(stderr,
+                          "SIG tid=%ld sig=%d trapno=%u eip=%08x cr2=%08x "
+                          "esp=%08x frame=%08x gs=%04x/%08x ret=%08x "
+                          "sys=%08x tcb=%08x %08x %08x %08x\n",
+                          syscall(SYS_gettid), sig, sc.trapno, sc.eip,
+                          sc.cr2, ctx->gpr[I686_REG_ESP], frame_va,
+                          ctx->seg_sel[I686_SEG_GS],
+                          ctx->seg_base[I686_SEG_GS], ret, sysinfo,
+                          *(const uint32_t *)(const void *)(tcbdump + 0),
+                          *(const uint32_t *)(const void *)(tcbdump + 4),
+                          *(const uint32_t *)(const void *)(tcbdump + 8),
+                          *(const uint32_t *)(const void *)(tcbdump + 12));
+        }
+    }
     ctx->gpr[I686_REG_ESP] = frame_va;
     ctx->sig_last_frame_va = frame_va;
     ctx->sig_last_frame_rt = (uint32_t)sa_siginfo;
@@ -246,6 +301,17 @@ void i686_signals_i386_init(void)
     /* Host-signal registration for async delivery lands with Phase 4
      * S4 integration (host_sig_handler + pending bit set); v1 delivers
      * sync exits (FAULT/FPE/TRAP) directly at the engine exit switch. */
+}
+
+/* Delivery/thread forensics gate (RC7b T4b). */
+int i686_sigtrace_on(void);
+int i686_sigtrace_on(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) {
+        s_on = getenv("I686RT_SIGTRACE") != NULL;
+    }
+    return s_on;
 }
 
 /* Sync-fault delivery hook for the engine exit switch.

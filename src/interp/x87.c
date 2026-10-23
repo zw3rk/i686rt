@@ -524,6 +524,24 @@ int64_t x87_get_int(const i686_ctx_t *ctx, unsigned i)
     }
 }
 
+int64_t x87_get_int_trunc(const i686_ctx_t *ctx, unsigned i)
+{
+    unsigned p = phys_of(ctx, i);
+
+    /* FISTTP (SSE3): always truncates toward zero, regardless of the
+     * CW rounding control. */
+    if (ctx->x87_80) {
+        return ext80_to_i64(&ctx->x87_st[p][0], 3U);
+    }
+    {
+        uint64_t bits = rd64(&ctx->x87_st[p][0]);
+        double d;
+
+        memcpy(&d, &bits, 8);
+        return f64_to_i64_rc(d, 3U);
+    }
+}
+
 /* --- environment --------------------------------------------------------- */
 
 unsigned x87_round_mode(const i686_ctx_t *ctx)

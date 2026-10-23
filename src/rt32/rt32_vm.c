@@ -509,13 +509,28 @@ void rt32_vm_reset_for_exec(i686_ctx_t *ctx)
     g_vm_region_count = w;
     g_vm_brk_base  = 0U;
     g_vm_brk_curr  = 0U;
-    g_vm_mmap_cursor = 0U;
+    g_vm_mmap_cursor = RT32_MMAP_BASE_32;
     vm_lock_release();
 
-    /* Mirror the cleared state into the caller's ctx. */
+    /* Kernel exec semantics (RC7b T4b): execve destroys ALL old address
+     * space.  Only the region bookkeeping was cleared above, so the
+     * stale host mappings of the previous image (in a posix_spawn fork
+     * child: the wineserver's whole COW-inherited address space) stayed
+     * resident in the window — later ld.so/NTDLL allocations then
+     * collided with foreign leftover data (foreign TCBs, foreign code),
+     * which killed the boot with NULL-call threads and "could not load
+     * kernel32.dll".  Tear the window down; the next stack setup re-maps
+     * the vDSO and the stack, and the new image loads fresh pages. */
+    (void)munmap((void *)(uintptr_t)I686_LOW_GUARD_SIZE,
+                 (size_t)(RT32_WINDOW_SIZE - (uint64_t)I686_LOW_GUARD_SIZE));
+
+    /* Mirror the cleared state into the caller's ctx.  vdso_base must
+     * clear too: i686_vdso_map is idempotent on it, and a fork child
+     * would otherwise skip the re-map and run without the vDSO page. */
     ctx->brk_base    = 0U;
     ctx->brk_curr    = 0U;
-    ctx->mmap_cursor = 0U;
+    ctx->mmap_cursor = RT32_MMAP_BASE_32;
+    ctx->vdso_base   = 0U;
     ctx->region_count = (w <= I686_MAX_REGIONS) ? w : I686_MAX_REGIONS;
     if (ctx->region_count > 0U) {
         memcpy(ctx->regions, g_vm_regions, ctx->region_count * sizeof(i686_region_t));

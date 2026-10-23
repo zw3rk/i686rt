@@ -129,9 +129,17 @@ int i686_interp_step(i686_ctx_t *ctx)
     int r;
 
     if (x86_decode(ctx, ctx->eip, &insn) != 0) {
+        uint32_t b;
         ctx->exit_reason = I686_EXIT_UNDEF;
         ctx->exit_arg = 0;
         diag("undecodable instruction", ctx, 0);
+        (void)fprintf(stderr, "BYTES %08x:", ctx->eip);
+        for (b = 0U; b < 16U; b++) {
+            (void)fprintf(stderr, " %02x",
+                          *(const volatile uint8_t *)i686_guest_ptr(ctx,
+                                                                    ctx->eip + b));
+        }
+        (void)fprintf(stderr, "\n");
         return I686_EXIT_UNDEF;
     }
     fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
@@ -201,9 +209,17 @@ int i686_interp_run(i686_ctx_t *ctx)
         int r;
 
         if (x86_decode(ctx, ctx->eip, &insn) != 0) {
+            uint32_t b;
             ctx->exit_reason = I686_EXIT_UNDEF;
             ctx->exit_arg = 0;
             diag("undecodable instruction", ctx, 0);
+            (void)fprintf(stderr, "BYTES %08x:", ctx->eip);
+            for (b = 0U; b < 16U; b++) {
+                (void)fprintf(stderr, " %02x",
+                              *(const volatile uint8_t *)i686_guest_ptr(ctx,
+                                                                        ctx->eip + b));
+            }
+            (void)fprintf(stderr, "\n");
             return I686_EXIT_UNDEF;
         }
         fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
