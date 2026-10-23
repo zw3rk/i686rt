@@ -10,7 +10,7 @@
  *
  *   statfs(99) fstatfs(100) getdents(141) stat64(195) lstat64(196)
  *   fstat64(197) getdents64(220) statfs64(268) fstatfs64(269)
- *   fstatat64(300)
+ *   fstatat64(300) statx(383)
  *
  * Host syscalls run against PLAIN HOST PATHS in Phase 2 — the rt32 sysroot
  * resolver arrives in a later phase and will be threaded through
@@ -134,6 +134,7 @@
 #define L2A_NR_statfs64   268U  /* syscalls_i386.h [268] statfs64   */
 #define L2A_NR_fstatfs64  269U  /* syscalls_i386.h [269] fstatfs64  */
 #define L2A_NR_fstatat64  300U  /* syscalls_i386.h [300] fstatat64  */
+#define L2A_NR_statx      383U  /* syscalls_i386.h [383] statx      */
 
 /* ---- host struct spelling shims (aarch64 Linux vs macOS test host) ----
  *
@@ -528,6 +529,83 @@ have_stat:;
     return i686_copy_to_guest(ctx, buf_va, &gs, sizeof(gs));
 }
 
+/* ---- statx(383): guest wire struct ---------------------------------------
+ *
+ * include/uapi/linux/stat.h struct statx (statx_timestamp is
+ * {s64 tv_sec; u32 tv_nsec; s32 __pad} = 16 B).  Every field is
+ * fixed-width and each u64 lands on an 8-byte offset on i386 as well
+ * (its 4-byte u64 alignment never binds here), so the layout is
+ * byte-identical on the aarch64 host and the host syscall's buffer
+ * transfers to the guest verbatim.  Total 0x100 = 256 bytes — the size
+ * every 4.11+ kernel copies to the user buffer (later kernels carved
+ * stx_mnt_id and the dio_align fields out of the spare tail without
+ * growing it). */
+
+typedef struct __attribute__((packed)) {
+    uint32_t stx_mask;             /* 0x000 what results were written  */
+    uint32_t stx_blksize;          /* 0x004 preferred I/O size         */
+    uint64_t stx_attributes;       /* 0x008 file attribute flags       */
+    uint32_t stx_nlink;            /* 0x010 hard links                 */
+    uint32_t stx_uid;              /* 0x014 owner uid                  */
+    uint32_t stx_gid;              /* 0x018 owner gid                  */
+    uint16_t stx_mode;             /* 0x01c file mode (type + perms)   */
+    uint16_t stx_spare0;           /* 0x01e                            */
+    uint64_t stx_ino;              /* 0x020 inode number               */
+    uint64_t stx_size;             /* 0x028 file size                  */
+    uint64_t stx_blocks;           /* 0x030 512-byte blocks allocated      */
+    uint64_t stx_attributes_mask;  /* 0x038 supported attribute bits   */
+    uint64_t stx_atime_sec;        /* 0x040 last access                */
+    uint32_t stx_atime_nsec;       /* 0x048                            */
+    uint32_t stx_atime_pad;        /* 0x04c                            */
+    uint64_t stx_btime_sec;        /* 0x050 creation                   */
+    uint32_t stx_btime_nsec;       /* 0x058                            */
+    uint32_t stx_btime_pad;        /* 0x05c                            */
+    uint64_t stx_ctime_sec;        /* 0x060 last status change         */
+    uint32_t stx_ctime_nsec;       /* 0x068                            */
+    uint32_t stx_ctime_pad;        /* 0x06c                            */
+    uint64_t stx_mtime_sec;        /* 0x070 last data modification     */
+    uint32_t stx_mtime_nsec;       /* 0x078                            */
+    uint32_t stx_mtime_pad;        /* 0x07c                            */
+    uint32_t stx_rdev_major;       /* 0x080 device id of special file  */
+    uint32_t stx_rdev_minor;       /* 0x084                            */
+    uint32_t stx_dev_major;        /* 0x088 device containing the file */
+    uint32_t stx_dev_minor;        /* 0x08c                            */
+    uint64_t stx_mnt_id;           /* 0x090 mount id (5.8+)            */
+    uint32_t stx_dio_mem_align;    /* 0x098 dio buffer alignment (6.9+) */
+    uint32_t stx_dio_offset_align; /* 0x09c dio offset alignment       */
+    uint64_t stx_spare1[12];       /* 0x0a0 kernel spare tail          */
+} i686_statx_t;
+
+_Static_assert(offsetof(i686_statx_t, stx_mask) == 0x000, "statx mask @0x000");
+_Static_assert(offsetof(i686_statx_t, stx_blksize) == 0x004, "statx blksize @0x004");
+_Static_assert(offsetof(i686_statx_t, stx_attributes) == 0x008, "statx attributes @0x008");
+_Static_assert(offsetof(i686_statx_t, stx_nlink) == 0x010, "statx nlink @0x010");
+_Static_assert(offsetof(i686_statx_t, stx_uid) == 0x014, "statx uid @0x014");
+_Static_assert(offsetof(i686_statx_t, stx_gid) == 0x018, "statx gid @0x018");
+_Static_assert(offsetof(i686_statx_t, stx_mode) == 0x01c, "statx mode @0x01c");
+_Static_assert(offsetof(i686_statx_t, stx_spare0) == 0x01e, "statx spare0 @0x01e");
+_Static_assert(offsetof(i686_statx_t, stx_ino) == 0x020, "statx ino @0x020");
+_Static_assert(offsetof(i686_statx_t, stx_size) == 0x028, "statx size @0x028");
+_Static_assert(offsetof(i686_statx_t, stx_blocks) == 0x030, "statx blocks @0x030");
+_Static_assert(offsetof(i686_statx_t, stx_attributes_mask) == 0x038, "statx attributes_mask @0x038");
+_Static_assert(offsetof(i686_statx_t, stx_atime_sec) == 0x040, "statx atime @0x040");
+_Static_assert(offsetof(i686_statx_t, stx_atime_nsec) == 0x048, "statx atime_nsec @0x048");
+_Static_assert(offsetof(i686_statx_t, stx_atime_pad) == 0x04c, "statx atime pad @0x04c");
+_Static_assert(offsetof(i686_statx_t, stx_btime_sec) == 0x050, "statx btime @0x050");
+_Static_assert(offsetof(i686_statx_t, stx_btime_nsec) == 0x058, "statx btime_nsec @0x058");
+_Static_assert(offsetof(i686_statx_t, stx_ctime_sec) == 0x060, "statx ctime @0x060");
+_Static_assert(offsetof(i686_statx_t, stx_ctime_nsec) == 0x068, "statx ctime_nsec @0x068");
+_Static_assert(offsetof(i686_statx_t, stx_mtime_sec) == 0x070, "statx mtime @0x070");
+_Static_assert(offsetof(i686_statx_t, stx_mtime_nsec) == 0x078, "statx mtime_nsec @0x078");
+_Static_assert(offsetof(i686_statx_t, stx_rdev_major) == 0x080, "statx rdev_major @0x080");
+_Static_assert(offsetof(i686_statx_t, stx_rdev_minor) == 0x084, "statx rdev_minor @0x084");
+_Static_assert(offsetof(i686_statx_t, stx_dev_major) == 0x088, "statx dev_major @0x088");
+_Static_assert(offsetof(i686_statx_t, stx_dev_minor) == 0x08c, "statx dev_minor @0x08c");
+_Static_assert(offsetof(i686_statx_t, stx_mnt_id) == 0x090, "statx mnt_id @0x090");
+_Static_assert(offsetof(i686_statx_t, stx_dio_mem_align) == 0x098, "statx dio_mem_align @0x098");
+_Static_assert(offsetof(i686_statx_t, stx_dio_offset_align) == 0x09c, "statx dio_offset_align @0x09c");
+_Static_assert(sizeof(i686_statx_t) == 0x100, "statx wire struct is 256 B");
+
 /* ---- handlers (args in EBX, ECX, EDX, ESI, EDI, EBP) -------------------- */
 
 static int64_t h_stat64(i686_ctx_t *ctx)
@@ -735,6 +813,71 @@ static int64_t h_getdents(i686_ctx_t *ctx)
     return ret;
 }
 
+/* statx(383): (dirfd, path, flags, mask, buf) in EBX..EDI.  The AT_*
+ * flag bits (AT_SYMLINK_NOFOLLOW 0x100, AT_NO_AUTOMOUNT 0x800,
+ * AT_EMPTY_PATH 0x1000, AT_STATX_SYNC_* 0x6000) and the STATX_* mask
+ * are arch-independent asm-generic values, so both pass through 1:1 and
+ * the host kernel decides what to fill — its stx_mask reports that,
+ * which is exactly the "honor the mask like the kernel" contract.  The
+ * host buffer is the kernel's 256-byte copy plus headroom in case a
+ * future kernel outgrows it; only the guest wire size is copied out.
+ * macOS (the host-native unit build) has no SYS_statx: the shim keeps
+ * the handler compiled and reports -ENOSYS there. */
+static int64_t h_statx(i686_ctx_t *ctx)
+{
+    char path[L2A_PATH_MAX];
+    _Alignas(8) uint8_t stx[512];
+    int dirfd = xlate_dirfd(ctx->gpr[I686_REG_EBX]);
+    uint32_t flags = ctx->gpr[I686_REG_EDX];
+    uint32_t mask = ctx->gpr[I686_REG_ESI];
+    uint32_t buf_va = ctx->gpr[I686_REG_EDI];
+
+    if (bad_ptr(ctx->gpr[I686_REG_ECX]) || bad_ptr(buf_va)) {
+        return -EFAULT;
+    }
+    int r = i686_fetch_cstr(ctx, ctx->gpr[I686_REG_ECX], path, sizeof(path));
+    if (r != 0) {
+        return r;
+    }
+    {
+        extern int i686_systrace_on(void);
+        if (i686_systrace_on()) {
+            (void)fprintf(stderr, "STATX %s\n", path);
+        }
+    }
+#if defined(__APPLE__) && defined(__MACH__)
+    (void)dirfd;
+    (void)flags;
+    (void)mask;
+    return -ENOSYS;
+#else
+    memset(stx, 0, sizeof(stx));
+    /* Absolute guest paths resolve under --sysroot first (stat_path
+     * model), AT_FDCWD only. */
+    if (path[0] == '/' && dirfd == AT_FDCWD && ctx->sysroot != NULL &&
+        ctx->sysroot[0] != '\0') {
+        char sp[L2A_PATH_MAX];
+        size_t sl = strlen(ctx->sysroot);
+
+        if (sl + strlen(path) < sizeof sp) {
+            memcpy(sp, ctx->sysroot, sl);
+            strcpy(sp + sl, path);
+            if (syscall(SYS_statx, dirfd, sp, (unsigned int)flags,
+                        (unsigned int)mask, stx) == 0) {
+                goto have_statx;
+            }
+        }
+    }
+    if (syscall(SYS_statx, dirfd, path, (unsigned int)flags,
+                (unsigned int)mask, stx) < 0) {
+        return err_neg();
+    }
+have_statx:;
+    return i686_copy_to_guest(ctx, buf_va, stx, sizeof(i686_statx_t));
+#endif
+}
+
+
 /* ---- registration -------------------------------------------------------- */
 
 void i686_syscalls_stat_init(void)
@@ -749,4 +892,5 @@ void i686_syscalls_stat_init(void)
     i686_sys_register((long)L2A_NR_fstatat64, h_fstatat64);
     i686_sys_register((long)L2A_NR_getdents, h_getdents);
     i686_sys_register((long)L2A_NR_getdents64, h_getdents64);
+    i686_sys_register((long)L2A_NR_statx, h_statx);
 }
