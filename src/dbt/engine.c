@@ -12,7 +12,8 @@
  * per-ctx IBTC (filled here on install) without returning to C; every
  * path that frees or dead-marks a block severs its IBTC entry first.
  * C6c: the host-fault checkpoint arms once per run (re-armed only in
- * the fault path, interp.c style).
+ * the fault path, interp.c style) and a cache hit heals a collided
+ * IBTC slot.
  */
 
 #include <setjmp.h>
@@ -330,6 +331,22 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
 
     if (e->len != 0U) {
         if (e->eip == eip) {
+            /* C6c: heal a collided IBTC slot on a cache hit.  Hot EIPs
+             * outnumber the 1024 direct-mapped slots; a slot stolen by
+             * a colliding key used to stay lost forever (slots were
+             * refilled only on a fresh compile), so the victim
+             * C-dispatched on every execution.  Refill here — a
+             * between-blocks safe point, with a live mapping — and the
+             * trampoline links this block again; the clobbered
+             * colliding key merely falls back to this loop on its next
+             * branch (the eviction-path contract). */
+            i686_ibtc_entry_t *slot = &ctx->ibtc[i686_ibtc_hash(eip)];
+            if (slot->key != eip) {
+                slot->key = eip;
+                slot->epoch = 1U;
+                slot->host_code = e->code;
+                slot->entry = e->code;
+            }
             return e;
         }
         dbt_ibtc_sever(ctx, e->eip); /* before the munmap: the victim's
