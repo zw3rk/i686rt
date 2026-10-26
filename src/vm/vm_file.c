@@ -358,7 +358,11 @@ size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len)
             uint64_t r_start = (f > o_start) ? f : o_start;
             uint64_t r_end = (f + 0x1000ULL < o_end) ? f + 0x1000ULL : o_end;
             uint8_t *dst;
-            if (s_state[idx] != 1u) {
+            /* CLEAN (1) pages refresh from the file; A2 staged shared
+             * mappings (kind 2) publish state 0 yet still mirror file
+             * bytes, so they refresh too. Other states have diverged. */
+            if (s_state[idx] != 1u &&
+                (s_maps[i].kind != 2u || s_state[idx] != 0u)) {
                 continue;
             }
             dst = (uint8_t *)(uintptr_t)(s_arena_base + (uint64_t)gva);
