@@ -131,59 +131,41 @@ static uint32_t mem_atomic_load_u(void *p, unsigned width)
     return __atomic_load_n((const uint32_t *)p, __ATOMIC_SEQ_CST);
 }
 
-static uint32_t mem_atomic_fetch_add(void *p, unsigned width, uint32_t v)
+/* Unified fetch-op for the aligned LOCK path (every caller holds the
+ * lane split lock; the hardware op stays atomic against DBT CASAL peers
+ * while the lock orders interpreter peers). */
+static uint32_t mem_atomic_fetch_op(void *p, unsigned width, uint32_t v,
+                                    alu_kind_t op)
 {
     if (width == 8U) {
-        return __atomic_fetch_add((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+        uint8_t *q = (uint8_t *)p;
+        uint8_t vv = (uint8_t)v;
+        switch (op) {
+        case ALU_SUB: return __atomic_fetch_sub(q, vv, __ATOMIC_SEQ_CST);
+        case ALU_AND: return __atomic_fetch_and(q, vv, __ATOMIC_SEQ_CST);
+        case ALU_OR:  return __atomic_fetch_or(q, vv, __ATOMIC_SEQ_CST);
+        case ALU_XOR: return __atomic_fetch_xor(q, vv, __ATOMIC_SEQ_CST);
+        default:      return __atomic_fetch_add(q, vv, __ATOMIC_SEQ_CST);
+        }
     }
     if (width == 16U) {
-        return __atomic_fetch_add((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+        uint16_t *q = (uint16_t *)p;
+        uint16_t vv = (uint16_t)v;
+        switch (op) {
+        case ALU_SUB: return __atomic_fetch_sub(q, vv, __ATOMIC_SEQ_CST);
+        case ALU_AND: return __atomic_fetch_and(q, vv, __ATOMIC_SEQ_CST);
+        case ALU_OR:  return __atomic_fetch_or(q, vv, __ATOMIC_SEQ_CST);
+        case ALU_XOR: return __atomic_fetch_xor(q, vv, __ATOMIC_SEQ_CST);
+        default:      return __atomic_fetch_add(q, vv, __ATOMIC_SEQ_CST);
+        }
     }
-    return __atomic_fetch_add((uint32_t *)p, v, __ATOMIC_SEQ_CST);
-}
-
-static uint32_t mem_atomic_fetch_sub(void *p, unsigned width, uint32_t v)
-{
-    if (width == 8U) {
-        return __atomic_fetch_sub((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    switch (op) {
+    case ALU_SUB: return __atomic_fetch_sub((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+    case ALU_AND: return __atomic_fetch_and((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+    case ALU_OR:  return __atomic_fetch_or((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+    case ALU_XOR: return __atomic_fetch_xor((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+    default:      return __atomic_fetch_add((uint32_t *)p, v, __ATOMIC_SEQ_CST);
     }
-    if (width == 16U) {
-        return __atomic_fetch_sub((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
-    }
-    return __atomic_fetch_sub((uint32_t *)p, v, __ATOMIC_SEQ_CST);
-}
-
-static uint32_t mem_atomic_fetch_and(void *p, unsigned width, uint32_t v)
-{
-    if (width == 8U) {
-        return __atomic_fetch_and((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
-    }
-    if (width == 16U) {
-        return __atomic_fetch_and((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
-    }
-    return __atomic_fetch_and((uint32_t *)p, v, __ATOMIC_SEQ_CST);
-}
-
-static uint32_t mem_atomic_fetch_or(void *p, unsigned width, uint32_t v)
-{
-    if (width == 8U) {
-        return __atomic_fetch_or((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
-    }
-    if (width == 16U) {
-        return __atomic_fetch_or((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
-    }
-    return __atomic_fetch_or((uint32_t *)p, v, __ATOMIC_SEQ_CST);
-}
-
-static uint32_t mem_atomic_fetch_xor(void *p, unsigned width, uint32_t v)
-{
-    if (width == 8U) {
-        return __atomic_fetch_xor((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
-    }
-    if (width == 16U) {
-        return __atomic_fetch_xor((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
-    }
-    return __atomic_fetch_xor((uint32_t *)p, v, __ATOMIC_SEQ_CST);
 }
 
 static uint32_t mem_atomic_exchange_u(void *p, unsigned width, uint32_t v)
@@ -197,10 +179,9 @@ static uint32_t mem_atomic_exchange_u(void *p, unsigned width, uint32_t v)
     return __atomic_exchange_n((uint32_t *)p, v, __ATOMIC_SEQ_CST);
 }
 
-/* RC-U3 unaligned entry: 0 = aligned (__atomic_* path), 1 = unaligned
- * with the split lock held (plain byte path, then alu_lock_leave), 2 =
- * unaligned with an invalid span (plain path unlocked: the genuine
- * fault fires with no lock held). */
+/* RC-U3-r2 unified LOCK entry: every LOCK RMW holds the split lock (0 =
+ * aligned __atomic_*, 1 = unaligned valid plain bytes, 2 = invalid span
+ * plain unlocked); faults with the lock held release it in the catches. */
 static unsigned alu_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
                                unsigned width)
 {
@@ -208,6 +189,7 @@ static unsigned alu_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
 
     i686_seg_check_data(ctx, x86_ea_seg(insn), ea, width / 8U);
     if (!i686_mem_is_unaligned(i686_guest_ptr(ctx, ea), width)) {
+        i686_split_lock_acquire(); /* unified: aligned no longer bypasses */
         return 0U;
     }
     if (i686_span_mapped_writable(ctx, ea, width / 8U)) {
@@ -217,10 +199,10 @@ static unsigned alu_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
     return 2U;
 }
 
-/* Release the split lock when alu_lock_enter held it (how == 1). */
+/* Release the split lock when alu_lock_enter held it (how == 0 or 1). */
 static void alu_lock_leave(unsigned how)
 {
-    if (how == 1U) {
+    if (how != 2U) {
         i686_split_lock_release();
     }
 }
@@ -282,7 +264,7 @@ static int alu_exec_locked(i686_ctx_t *ctx, const x86_insn_t *insn,
     hva = alu_locked_hva(ctx, insn, width);
     switch (kind) {
     case ALU_ADD:
-        old = mem_atomic_fetch_add(hva, width, b);
+        old = mem_atomic_fetch_op(hva, width, b, ALU_ADD);
         res = (old + b) & mask;
         i686_flags_add(ctx, old & mask, b, width);
         break;
@@ -299,17 +281,17 @@ static int alu_exec_locked(i686_ctx_t *ctx, const x86_insn_t *insn,
         break;
     }
     case ALU_AND:
-        old = mem_atomic_fetch_and(hva, width, b);
+        old = mem_atomic_fetch_op(hva, width, b, ALU_AND);
         res = (old & b) & mask;
         i686_flags_logic(ctx, res, width);
         break;
     case ALU_OR:
-        old = mem_atomic_fetch_or(hva, width, b);
+        old = mem_atomic_fetch_op(hva, width, b, ALU_OR);
         res = (old | b) & mask;
         i686_flags_logic(ctx, res, width);
         break;
     case ALU_XOR:
-        old = mem_atomic_fetch_xor(hva, width, b);
+        old = mem_atomic_fetch_op(hva, width, b, ALU_XOR);
         res = (old ^ b) & mask;
         i686_flags_logic(ctx, res, width);
         break;
@@ -338,7 +320,7 @@ static int alu_exec_locked(i686_ctx_t *ctx, const x86_insn_t *insn,
             i686_flags_sub(ctx, old, b, width);
             return step(ctx, insn);
         }
-        old = mem_atomic_fetch_sub(hva, width, b);
+        old = mem_atomic_fetch_op(hva, width, b, ALU_SUB);
         res = (old - b) & mask;
         i686_flags_sub(ctx, old & mask, b, width);
         break;
@@ -353,7 +335,7 @@ static int alu_exec(i686_ctx_t *ctx, const x86_insn_t *insn, alu_kind_t kind,
                     alu_form_t form)
 {
     unsigned width;
-    unsigned how = 0U;
+    unsigned how = 2U;
     switch (form) {
     case FORM_EbGb:
     case FORM_GbEb:
@@ -373,7 +355,9 @@ static int alu_exec(i686_ctx_t *ctx, const x86_insn_t *insn, alu_kind_t kind,
         insn->modrm_mod != 3U && insn->ea_has != 0U) {
         how = alu_lock_enter(ctx, insn, width);
         if (how == 0U) {
-            return alu_exec_locked(ctx, insn, kind, form);
+            int locked_rc = alu_exec_locked(ctx, insn, kind, form);
+            alu_lock_leave(how);
+            return locked_rc;
         }
     }
     uint32_t mask = width_mask(width);
@@ -560,7 +544,7 @@ static int h_TEST_EvIz(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int not_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
-    unsigned how = 0U;
+    unsigned how = 2U;
     if (alu_locked_mem(insn, true)) {
         how = alu_lock_enter(ctx, insn, width);
         if (how == 0U) {
@@ -571,6 +555,7 @@ static int not_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
                     break;
                 }
             }
+            alu_lock_leave(how);
             return step(ctx, insn);
         }
     }
@@ -585,7 +570,7 @@ static int not_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 static int neg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
-    unsigned how = 0U;
+    unsigned how = 2U;
     if (alu_locked_mem(insn, true)) {
         how = alu_lock_enter(ctx, insn, width);
         if (how == 0U) {
@@ -597,6 +582,7 @@ static int neg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
                     break;
                 }
             }
+            alu_lock_leave(how);
             return step(ctx, insn);
         }
     }
@@ -616,7 +602,7 @@ static int incdec_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width,
                        bool is_inc)
 {
     uint32_t mask = width_mask(width);
-    unsigned how = 0U;
+    unsigned how = 2U;
     (void)i686_flags_read(ctx);
     if (!opnd0_is_reg(insn) && alu_locked_mem(insn, true)) {
         how = alu_lock_enter(ctx, insn, width);
@@ -634,6 +620,7 @@ static int incdec_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width,
                     break;
                 }
             }
+            alu_lock_leave(how);
             return step(ctx, insn);
         }
     }
@@ -703,7 +690,7 @@ static int h_DEC_Ev(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int xchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
-    unsigned how = 0U;
+    unsigned how = 2U;
     if (alu_mem_operand(insn)) {
         how = alu_lock_enter(ctx, insn, width);
         if (how == 0U) {
@@ -712,6 +699,7 @@ static int xchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
             uint32_t b = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
             uint32_t t = mem_atomic_exchange_u(hva, width, b) & mask;
             x86_reg_write(ctx, insn->modrm_reg, width, t);
+            alu_lock_leave(how);
             return step(ctx, insn);
         }
     }
@@ -754,7 +742,7 @@ static int cmpxchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
     uint32_t acc = x86_reg_read(ctx, I686_REG_EAX, width) & mask;
-    unsigned how = 0U;
+    unsigned how = 2U;
     if (alu_mem_operand(insn)) {
         how = alu_lock_enter(ctx, insn, width);
         if (how == 0U) {
@@ -772,6 +760,7 @@ static int cmpxchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
                     break;
                 }
             }
+            alu_lock_leave(how);
             return step(ctx, insn);
         }
     }
@@ -804,15 +793,16 @@ static int xadd_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
     uint32_t src = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
-    unsigned how = 0U;
+    unsigned how = 2U;
     if (alu_mem_operand(insn)) {
         how = alu_lock_enter(ctx, insn, width);
         if (how == 0U) {
             /* Implicitly locked: fetch-add returns old value atomically. */
             void *hva = alu_locked_hva(ctx, insn, width);
-            uint32_t old_rm = mem_atomic_fetch_add(hva, width, src) & mask;
+            uint32_t old_rm = mem_atomic_fetch_op(hva, width, src, ALU_ADD) & mask;
             i686_flags_add(ctx, old_rm, src, width);
             x86_reg_write(ctx, insn->modrm_reg, width, old_rm);
+            alu_lock_leave(how);
             return step(ctx, insn);
         }
     }

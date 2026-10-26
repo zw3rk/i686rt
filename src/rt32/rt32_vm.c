@@ -64,12 +64,121 @@ static uint64_t page_align_up(uint64_t v)
 
 static int vm_reserve_prot_none(i686_ctx_t *ctx, uint32_t start, uint32_t len)
 {
-    void *res = mmap(i686_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (res == MAP_FAILED) {
-        return -errno;
+    /* RC-U3-r2 P1 #1: on Regime A2 (host page > 4 KiB) a 4 KiB-granular
+     * PROT_NONE reserve can neither mmap nor mprotect without
+     * disturbing sub-page neighbours, so skip the host op. The region
+     * removal + prot-table sync + union re-protect in the callers own
+     * inaccessibility (A2 access is enforced by the software TLB tags
+     * driven by those tables, not by the host protection). */
+    if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
+        return 0;
+    }
+    {
+        void *res = mmap(i686_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (res == MAP_FAILED) {
+            return -errno;
+        }
     }
     return 0;
+}
+
+static void vm_union_protect_a2(i686_ctx_t *ctx, uint32_t start,
+                                uint32_t end);
+
+/* RC-U3-r2 P1 #1: true when an A2 (host page > 4 KiB) mapping must avoid
+ * raw mmap(MAP_FIXED): the guest addr/len is 4 KiB-aligned but not
+ * host-page-aligned, or a file offset is 4 KiB-aligned but not
+ * host-page-aligned. The kernel requires host-granule alignment, and a
+ * rounded raw map would clobber sub-page neighbours sharing the host
+ * page. Anonymous maps ignore the file offset. */
+static bool vm_a2_staged_needed(const i686_ctx_t *ctx, uint32_t va,
+                                uint64_t len, uint32_t flags,
+                                uint64_t file_off)
+{
+    uint64_t h;
+    if (ctx->vm_regime != I686_VM_REGIME_A2 || ctx->vm_host_page <= 4096u) {
+        return false;
+    }
+    h = (uint64_t)ctx->vm_host_page;
+    if ((((uint64_t)va & (h - 1u)) != 0u) || ((len & (h - 1u)) != 0u)) {
+        return true;
+    }
+    return (flags & RT32_MAP_ANONYMOUS) == 0U &&
+           ((file_off & (h - 1u)) != 0u);
+}
+
+/* Bounded pread staging for MAP_SHARED maps that cannot go through raw
+ * mmap on A2: copy file bytes in place and zero-fill the tail past EOF
+ * (same short-read rule as i686_vm_file_map_private). The storage stays
+ * anonymous-state while the map stays tracked as shared for the
+ * pwrite/ftruncate hooks. */
+static int vm_stage_shared_copy(i686_ctx_t *ctx, uint32_t va, size_t len,
+                                int fd, uint64_t file_off)
+{
+    uint8_t *dst = (uint8_t *)i686_guest_ptr(ctx, va);
+    size_t got = 0u;
+    while (got < len) {
+        ssize_t n = pread(fd, dst + got, len - got,
+                          (off_t)(file_off + (uint64_t)got));
+        if (n < 0) {
+            int e = errno;
+            if (e == EINTR) {
+                continue;
+            }
+            memset(dst, 0, len);
+            return -e;
+        }
+        if (n == 0) {
+            break;
+        }
+        got += (size_t)n;
+    }
+    if (got < len) {
+        memset(dst + got, 0, len - got);
+    }
+    return 0;
+}
+
+/* Stage an A2 misaligned range in place inside the arena (which the
+ * window reservation already owns): widen the host-page cover to RW,
+ * then zero (anonymous), pread-populate (MAP_PRIVATE file), or
+ * staging-copy (MAP_SHARED file). The caller records the region,
+ * tracks the file map, and union-protects afterwards. Returns 0 on
+ * success, -errno on failure (the cover is re-unioned from the
+ * still-current tables so a failure leaves no stray RW behind). */
+static int vm_mmap2_staged_a2_locked(i686_ctx_t *ctx, uint32_t target_va,
+                                     uint32_t len, int fd, uint64_t file_off,
+                                     bool is_anon, bool is_shared)
+{
+    uint64_t h = (uint64_t)ctx->vm_host_page;
+    uint64_t end = (uint64_t)target_va + (uint64_t)len;
+    uint64_t cover_lo = (uint64_t)target_va & ~(h - 1u);
+    uint64_t cover_hi = (end + h - 1u) & ~(h - 1u);
+    void *cover = (void *)(uintptr_t)(ctx->guest_base + cover_lo);
+    size_t cover_len = (size_t)(cover_hi - cover_lo);
+    int rc;
+    if (mprotect(cover, cover_len, PROT_READ | PROT_WRITE) != 0) {
+        return -errno;
+    }
+    if (is_anon) {
+        memset(i686_guest_ptr(ctx, target_va), 0, len);
+        i686_vm_file_set_state(target_va, len, 0u); /* I686_PAGE_ANON */
+        return 0;
+    }
+    if (!is_shared) {
+        rc = i686_vm_file_map_private(ctx->guest_base, target_va, len,
+                                      fd, file_off);
+    } else {
+        rc = vm_stage_shared_copy(ctx, target_va, len, fd, file_off);
+        if (rc == 0) {
+            i686_vm_file_set_state(target_va, len, 0u);
+        }
+    }
+    if (rc != 0) {
+        vm_union_protect_a2(ctx, target_va, (uint32_t)end);
+    }
+    return rc;
 }
 
 /* Translation-cache invalidation on guest mm ops (D11 SMC): real since
@@ -633,14 +742,27 @@ uint32_t rt32_vm_brk(i686_ctx_t *ctx, uint32_t new_brk)
             return curr;
         }
         uint32_t len = new_page - old_page;
-        void *host_addr = i686_guest_ptr(ctx, old_page);
-        void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (res == MAP_FAILED) {
-            uint32_t curr = g_vm_brk_curr;
-            vm_sync_brk_to_ctx(ctx);
-            vm_lock_release();
-            return curr;
+        /* RC-U3-r2 P1 #1: same A2 rule as mmap2 — a host-misaligned brk
+         * extension stages (zeroes) in place instead of raw MAP_FIXED. */
+        if (vm_a2_staged_needed(ctx, old_page, len, RT32_MAP_ANONYMOUS,
+                                0u)) {
+            if (vm_mmap2_staged_a2_locked(ctx, old_page, len, -1, 0u,
+                                          true, false) != 0) {
+                uint32_t curr = g_vm_brk_curr;
+                vm_sync_brk_to_ctx(ctx);
+                vm_lock_release();
+                return curr;
+            }
+        } else {
+            void *host_addr = i686_guest_ptr(ctx, old_page);
+            void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (res == MAP_FAILED) {
+                uint32_t curr = g_vm_brk_curr;
+                vm_sync_brk_to_ctx(ctx);
+                vm_lock_release();
+                return curr;
+            }
         }
         (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
@@ -721,14 +843,35 @@ static uint32_t vm_mmap2_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len, ui
         }
     }
 
-    int   host_prot   = i686_host_prot(ctx, prot);
-    void *host_target = i686_guest_ptr(ctx, target_va);
-    off_t host_off    = (off_t)pgoffset * (off_t)I686_PAGE_SIZE;
-    void *res = mmap(host_target, (size_t)aligned_len, host_prot,
-                     host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
-                     (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
-    if (res == MAP_FAILED) {
-        return (uint32_t)(-errno);
+    int      host_prot = i686_host_prot(ctx, prot);
+    bool     is_anon   = (flags & RT32_MAP_ANONYMOUS) != 0U;
+    bool     is_shared = (flags & 0x01U) != 0U;
+    uint64_t file_off  = (uint64_t)pgoffset * (uint64_t)I686_PAGE_SIZE;
+
+    /* RC-U3-r2 P1 #1: a 4 KiB-aligned addr/len/offset that is not
+     * host-page-aligned cannot go through raw mmap(MAP_FIXED) on
+     * Regime A2; stage the range in place instead and never issue the
+     * raw MAP_FIXED on that path. */
+    if (vm_a2_staged_needed(ctx, target_va, aligned_len, flags, file_off)) {
+        int rc;
+        if (!is_anon && fd < 0) {
+            return (uint32_t)(-EBADF);
+        }
+        rc = vm_mmap2_staged_a2_locked(ctx, target_va,
+                                      (uint32_t)aligned_len, fd, file_off,
+                                      is_anon, is_shared);
+        if (rc != 0) {
+            return (uint32_t)rc;
+        }
+    } else {
+        void *host_target = i686_guest_ptr(ctx, target_va);
+        off_t host_off    = (off_t)file_off;
+        void *res = mmap(host_target, (size_t)aligned_len, host_prot,
+                         host_flags | MAP_FIXED, is_anon ? -1 : fd,
+                         is_anon ? 0 : host_off);
+        if (res == MAP_FAILED) {
+            return (uint32_t)(-errno);
+        }
     }
 
     if (update_cursor) {
@@ -852,6 +995,9 @@ static int vm_munmap_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len)
     /* RC-U3: drop file-map tracking and sync the prot tables. */
     i686_vm_file_untrack_map(start, (size_t)aligned_len);
     vm_file_sync_prot_locked(start, end);
+    /* RC-U3-r2 P1 #1: re-union the host cover from the updated tables so
+     * a removed A2 sub-page stops contributing stale permissions. */
+    vm_union_protect_a2(ctx, start, end);
     if (g_vm_mmap_cursor == end && start >= RT32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
     }

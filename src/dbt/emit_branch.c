@@ -402,8 +402,11 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
         /* push return EIP: ESP wraps in 32 bits (w4 arithmetic) */
         seq = (uint32_t)((uint64_t)b->count * 4u);
         a64_emit_sub_imm_w(b, false, I686_REG_ESP, I686_REG_ESP, bytes, 0U);
-        mem = (uint32_t)((uint64_t)b->count * 4u);
         a64_emit_mov_imm32(b, L3C_W11, next);
+        /* RC-U3-r2 P1 #2: host_insn_offset must identify the faulting
+         * store (the STR below), recorded after the MOVZ/MOVK pair, so
+         * the engine's exact-offset recovery matches CALL faults. */
+        mem = (uint32_t)((uint64_t)b->count * 4u);
         if (bytes == 2U) {
             a64_emit_guest_strh_w(b, L3C_W11, I686_REG_ESP);
         } else {

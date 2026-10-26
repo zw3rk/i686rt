@@ -17,7 +17,9 @@
  */
 
 #include <setjmp.h>
+#include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +95,10 @@ static uint64_t s_smc_window_base;
 static uint64_t s_smc_window_end;
 static __thread i686_ctx_t *s_run_ctx; /* for IBTC/RAS clears in the
                                         * signal-unsafe fault path */
+/* RC-U3-r2 P1 #4: last guest address remapped-and-redispatched by the
+ * catch below; a fault at the same address twice in a row is not
+ * healing, so it is delivered. Reset on delivery. */
+static __thread uint64_t s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
 
 static int smc_page_marked(uint32_t guest_page)
 {
@@ -563,7 +569,15 @@ int i686_dbt_run(i686_ctx_t *ctx)
     if (sigsetjmp(fj, 1) != 0) {
         uint64_t fa = i686_fault_addr();
         extern int i686_deliver_sync(i686_ctx_t *, int);
+        extern int i686_fault_sig(void);
+        extern int i686_fault_code(void);
+        extern int i686_fault_region_prot(const i686_ctx_t *, uint32_t,
+                                          uint32_t *, uint32_t *);
 
+        /* RC-U3-r2 P1 #4: a fault after a split-lock acquisition (the
+         * DBT interpret-one fallback runs LOCK RMWs inline) must not
+         * strand the lock; release it when this thread holds it. */
+        i686_split_lock_release_if_held();
         i686_fault_arm(&fj); /* re-arm: nested faults disarm */
         if (fa >= ctx->guest_base &&
             fa < ctx->guest_base + 0x100000000ULL) {
@@ -574,6 +588,27 @@ int i686_dbt_run(i686_ctx_t *ctx)
         /* RC-U3 P1: recover the faulting guest PC and ESP from the
          * block's stack-site table (undoes pre-commit SP adjustments). */
         i686_dbt_recover_fault(ctx, i686_fault_host_pc());
+        /* RC-U3-r2 P1 #4: validate-then-map. A SEGV_MAPERR inside a
+         * mapped region means the host mapping went stale, so
+         * re-assert the table-driven union protection and redispatch
+         * once. A backing-file SIGBUS is excluded and delivered, as is
+         * every fault outside all regions. */
+        if (i686_fault_sig() == SIGSEGV &&
+            i686_fault_code() == SEGV_MAPERR &&
+            fa >= ctx->guest_base &&
+            fa < ctx->guest_base + 0x100000000ULL) {
+            extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t,
+                                            uint32_t);
+            uint32_t rga = (uint32_t)(fa - ctx->guest_base);
+            if (rga != (uint32_t)s_last_remap_ga &&
+                i686_fault_region_prot(ctx, rga, NULL, NULL) != 0 &&
+                i686_vm32_union_prot(ctx, rga & ~0xFFFU,
+                                     (rga & ~0xFFFU) + 0x1000U) == 0) {
+                s_last_remap_ga = (uint64_t)rga;
+                goto dispatch; /* mapping re-asserted; retry */
+            }
+        }
+        s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
         if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
             goto dispatch; /* guest handler installed; resume at it */
         }
