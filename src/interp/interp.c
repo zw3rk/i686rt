@@ -56,8 +56,13 @@ static volatile uint64_t s_fault_host_pc;
  * mutate them mid-instruction, so restoring on fault is exact. */
 static __thread uint32_t s_saved_esp;
 static __thread uint32_t s_saved_ebp;
+/* Last guest address remapped-and-resumed by the #4 path below: a fault
+ * at the same address twice in a row is not healing, so deliver it.
+ * The delivery path resets it to "none", so a later transient may heal. */
+static __thread uint64_t s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
 
 static volatile sig_atomic_t s_fault_sig;
+static volatile sig_atomic_t s_fault_code;
 
 static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
 {
@@ -86,6 +91,7 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
         s_fault_jmp = NULL; /* disarm: a nested fault must not re-jump */
         s_fault_addr = (uint64_t)(uintptr_t)si->si_addr;
         s_fault_sig = sig;
+        s_fault_code = (sig_atomic_t)si->si_code;
         siglongjmp(*jb, 1);
     }
     _exit(128 + sig);
@@ -132,6 +138,38 @@ uint64_t i686_fault_addr(void)
 int i686_fault_sig(void)
 {
     return (int)s_fault_sig;
+}
+
+/* Host siginfo code of the checkpointed fault (SEGV_MAPERR vs
+ * SEGV_ACCERR selects remap-and-resume vs deliver in the catches). */
+int i686_fault_code(void)
+{
+    return (int)s_fault_code;
+}
+
+/* Validate a faulting guest address against the region mirror: returns
+ * 1 with the covering region's prot/flags when mapped, 0 when the
+ * address falls in no region (genuine unmapped fault). */
+int i686_fault_region_prot(const i686_ctx_t *ctx, uint32_t ga,
+                            uint32_t *out_prot, uint32_t *out_flags)
+{
+    size_t i;
+    if (ctx == NULL) {
+        return 0;
+    }
+    for (i = 0U; i < ctx->region_count; i++) {
+        const i686_region_t *r = &ctx->regions[i];
+        if (r->start <= ga && ga < r->end) {
+            if (out_prot != NULL) {
+                *out_prot = r->prot;
+            }
+            if (out_flags != NULL) {
+                *out_flags = r->flags;
+            }
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Faulting host PC (DBT site recovery in engine.c; 0 when unknown). */
@@ -330,6 +368,33 @@ int i686_interp_run(i686_ctx_t *ctx)
         } else {
             ctx->fault_addr = (uint32_t)fa;
         }
+        /* RC-U3-r2 P1 #4: validate-then-map. A SEGV_MAPERR inside a
+         * mapped region means the host mapping (not the guest tables)
+         * went stale — a racing mm op or a disturbed A2 union — so
+         * re-assert the table-driven union protection and retry the
+         * instruction once. A backing-file SIGBUS (truncation beyond
+         * EOF) is excluded from the remap and delivered, as is every
+         * fault outside all regions. The s_last_remap_ga guard bounds
+         * a non-healing fault to a single retry. */
+        if (i686_fault_sig() == SIGSEGV &&
+            i686_fault_code() == SEGV_MAPERR &&
+            fa >= ctx->guest_base &&
+            fa < ctx->guest_base + 0x100000000ULL) {
+            extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t,
+                                            uint32_t);
+            uint32_t rga = (uint32_t)(fa - ctx->guest_base);
+            if (rga != (uint32_t)s_last_remap_ga &&
+                i686_fault_region_prot(ctx, rga, NULL, NULL) != 0 &&
+                i686_vm32_union_prot(ctx, rga & ~0xFFFU,
+                                     (rga & ~0xFFFU) + 0x1000U) == 0) {
+                s_last_remap_ga = (uint64_t)rga;
+                i686_fault_arm(&fault_jmp); /* re-arm: the retry may fault */
+                goto run_loop; /* mapping re-asserted; retry */
+            }
+        }
+        /* A fault that reaches delivery clears the remap guard, so a
+         * later transient at an old address may heal again. */
+        s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
         {
             extern int i686_deliver_sync(i686_ctx_t *, int);
             if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
@@ -490,13 +555,22 @@ int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
     alo = ctx->gpr[I686_REG_EAX];
     ahi = ctx->gpr[I686_REG_EDX];
     if ((((uintptr_t)q) & 7u) == 0u) {
-        uint64_t expected =
-            ((uint64_t)ahi << 32) | (uint64_t)alo;
-        uint64_t desired = ((uint64_t)ctx->gpr[I686_REG_ECX] << 32) |
-                           (uint64_t)ctx->gpr[I686_REG_EBX];
-        bool ok = __atomic_compare_exchange_n(q, &expected, desired, false,
-                                              __ATOMIC_SEQ_CST,
-                                              __ATOMIC_SEQ_CST);
+        uint64_t expected;
+        uint64_t desired;
+        bool ok;
+        /* RC-U3-r2 P1 #5: the aligned word-CAS also serializes under the
+         * lane split lock, so overlapping aligned and unaligned LOCK
+         * RMWs are mutually atomic (the hardware CAS stays atomic
+         * against DBT CASAL peers; the lock orders interpreter peers).
+         * A fault inside still releases the lock in the run-loop
+         * catch above. */
+        i686_split_lock_acquire();
+        expected = ((uint64_t)ahi << 32) | (uint64_t)alo;
+        desired = ((uint64_t)ctx->gpr[I686_REG_ECX] << 32) |
+                  (uint64_t)ctx->gpr[I686_REG_EBX];
+        ok = __atomic_compare_exchange_n(q, &expected, desired, false,
+                                         __ATOMIC_SEQ_CST,
+                                         __ATOMIC_SEQ_CST);
         if (ok) {
             fl = i686_flags_read(ctx) | I686_EF_ZF;
         } else {
@@ -505,6 +579,7 @@ int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
             fl = i686_flags_read(ctx) & ~I686_EF_ZF;
         }
         ctx->eflags = fl;
+        i686_split_lock_release();
         ctx->eip += insn->len;
         return I686_INTERP_CONTINUE;
     }

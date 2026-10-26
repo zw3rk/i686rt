@@ -58,9 +58,12 @@ extern bool i686_mem_is_unaligned(const void *p, unsigned width);
 extern bool i686_span_mapped_writable(const i686_ctx_t *ctx, uint32_t ea,
                                       unsigned bytes);
 
-/* RC-U3 unaligned entry: NULL = run the __atomic_* CAS path; otherwise
- * the split lock is held (0/1 encoded in *held) and the caller runs the
- * byte-wise plain path, then calls sh_lock_leave. */
+/* RC-U3-r2 unified LOCK entry: every LOCK RMW holds the split lock while
+ * *held is set. Aligned returns the HVA for the __atomic_* CAS loop;
+ * unaligned returns NULL for the plain byte path (lock held only when
+ * the span validates as mapped+writable; a fault with the lock held
+ * releases it in the run-loop/DBT catches, and an invalid span faults
+ * with no lock held). */
 static void *sh_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
                            unsigned w, int *held)
 {
@@ -71,6 +74,8 @@ static void *sh_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
     i686_seg_check_data(ctx, x86_ea_seg(insn), ea, w / 8U);
     hva = i686_guest_ptr(ctx, ea);
     if (!i686_mem_is_unaligned(hva, w)) {
+        i686_split_lock_acquire(); /* unified: aligned no longer bypasses */
+        *held = 1;
         return hva;
     }
     if (i686_span_mapped_writable(ctx, ea, w / 8U)) {
