@@ -20,6 +20,14 @@
  * to [x20, w4, uxtw] (seg_base[SS] is 0 in the v1 flat contract; Phase
  * 7 lifts that with the LDT work).
  *
+ * Wave U3 (lane u3-i686, UNIFICATION-PLAN 4.3.3): every PUSH/POP records
+ * a 24-byte relative dbt_mem_site_t (dbt/aot/aot.h) with sp_rollback_delta
+ * so the shared fault landing pad (i686_emit_fault_landing below) can undo
+ * the pre-store ESP decrement before the guest signal is raised
+ * (No-Double-Side-Effect rule). CALL/RET sites use the same record shape
+ * and landing pad; their emitters live in emit_branch.c (owning lane fills
+ * npc_delta / NPC_STATIC_TARGET there).
+ *
  * Declined forms (return -1; translate.c ends the block with UNDEF and
  * the engine interprets one insn, D2 — declining is always safe):
  * PUSHA/POPA/ENTER/LEAVE in v1, XCHG with a memory operand, segment
@@ -27,9 +35,52 @@
  * PUSH_Ev/POP_Ev (r/m stack forms).
  */
 
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
+#include "dbt/aot/aot.h"
 #include "dbt/emit.h"
+
+/* ctx->dbt_fault_nzcv must be reachable via MOVZ (off>>3) + ADD LSL#3,
+ * the same far-tail shape as the flags_elided bump (flags_dbt.c). */
+_Static_assert((offsetof(i686_ctx_t, dbt_fault_nzcv) & 7U) == 0U,
+               "dbt_fault_nzcv must be 8-aligned for the LSL #3 form");
+_Static_assert((offsetof(i686_ctx_t, dbt_fault_nzcv) >> 3) <= 0xFFFFU,
+               "dbt_fault_nzcv offset must fit the MOVZ imm16");
+_Static_assert(offsetof(i686_ctx_t, dbt_fault_w21) ==
+                   offsetof(i686_ctx_t, dbt_fault_nzcv) + 4U,
+               "dbt_fault_w21 must follow dbt_fault_nzcv");
+
+/* STP Wt1, Wt2, [Xn, #imm7*4] (same shape as the exit epilogue). */
+static void emit_stp_w(a64_buf_t *b, unsigned rt1, unsigned rt2,
+                       unsigned rn_x, unsigned imm7)
+{
+    a64_emit(b, 0x29000000U | ((imm7 & 0x7FU) << 15) | ((rt2 & 31U) << 10) |
+                     ((rn_x & 31U) << 5) | (rt1 & 31U));
+}
+
+/* Shared fault landing pad: flush the cached guest GPRs w0..w7, the
+ * faulting EA scratch w21, and live NZCV into ctx before the C slow path
+ * (vm_tlb_miss_helper / interp_step) inspects state. Clobbers w8/w11/x12,
+ * which are scratch under D7; w0..w7 are restored from ctx on resume.
+ * x18 is never touched. */
+void i686_emit_fault_landing(i686_emit_ctx_t *e)
+{
+    a64_buf_t *b = &e->buf;
+    size_t fault_off = offsetof(i686_ctx_t, dbt_fault_nzcv);
+
+    emit_stp_w(b, 0U, 1U, 19U, 0U); /* w0..w7 -> ctx->gpr[0..7] */
+    emit_stp_w(b, 2U, 3U, 19U, 2U);
+    emit_stp_w(b, 4U, 5U, 19U, 4U);
+    emit_stp_w(b, 6U, 7U, 19U, 6U);
+    a64_emit_mrs_nzcv(b, 8U); /* X8 = NZCV */
+    /* X12 = &ctx->dbt_fault_nzcv. */
+    a64_emit_movz_w(b, 11U, (uint16_t)(fault_off >> 3), 0U);
+    a64_emit(b, 0x8B0B0E6CU); /* ADD X12, X19, X11, LSL #3 */
+    a64_emit_str_imm_w(b, 8U, 12U, 0U);  /* ctx->dbt_fault_nzcv = NZCV */
+    a64_emit_str_imm_w(b, 21U, 12U, 4U); /* ctx->dbt_fault_w21 = w21 */
+}
 
 /* Free scratch registers inside one emitted insn (D7: x21+ is scratch;
  * w8/w9 sit below the guest map and above the trampoline-reserved set,
@@ -386,15 +437,41 @@ static int em_xchg_rmi(i686_emit_ctx_t *e, const x86_insn_t *insn,
 /* ------------------------------------------------------------------ */
 
 /* Decrement ESP and store wsrc at the new ESP: sub w4,w4,#bytes;
- * str/strh wsrc, [x20, w4, uxtw]. */
-static void emit_push_store(a64_buf_t *b, unsigned wsrc, unsigned bytes)
+ * str/strh wsrc, [x20, w4, uxtw]. Records the Wave U3 site: ESP moves
+ * BEFORE the store, so a fault between the two must roll ESP back by
+ * +bytes (sp_rollback_delta = -bytes, undone by the landing pad). */
+static void emit_push_store(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                            unsigned wsrc, unsigned bytes)
 {
+    a64_buf_t *b = &e->buf;
+    dbt_mem_site_t site;
+    uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+    uint32_t mem;
+    uint32_t cont;
+
     a64_emit_sub_imm_w(b, false, 4U, 4U, (uint16_t)bytes, 0U);
+    mem = (uint32_t)((uint64_t)b->count * 4u);
     if (bytes == 4U) {
         a64_emit_guest_str_w(b, wsrc, 4U);
     } else {
         a64_emit_guest_strh_w(b, wsrc, 4U);
     }
+    cont = (uint32_t)((uint64_t)b->count * 4u);
+
+    memset(&site, 0, sizeof(site));
+    site.seq_start_offset = (uint16_t)seq;
+    site.host_insn_offset = (uint16_t)mem;
+    site.cont_insn_offset = (uint16_t)cont;
+    site.guest_pc_delta = I686_SITE_PC_UNKNOWN; /* patched by translate lane */
+    site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                     ((uint32_t)insn->pfx_lock << 16);
+    site.sp_rollback_delta = (int16_t)(-(int32_t)bytes);
+    site.npc_mode = (uint8_t)I686_NPC_SEQUENTIAL;
+    site.width = (uint8_t)bytes;
+    site.flags = (uint8_t)(I686_SITE_STORE | I686_SITE_PRE_COMMITTED_SP);
+    site.val_or_dst_reg = (uint8_t)wsrc;
+    site.addr_base_reg = 4U; /* ESP */
+    (void)i686_aot_note_stack_site(&site);
 }
 
 /* 50+r: PUSH r(v).  PUSH ESP stores the PRE-decrement value. */
@@ -405,9 +482,9 @@ static int em_push_gv(i686_emit_ctx_t *e, const x86_insn_t *insn)
 
     if (r == 4U) {
         a64_emit_mov_w(b, SCR0, 4U); /* old ESP */
-        emit_push_store(b, SCR0, v_bytes(insn));
+        emit_push_store(e, insn, SCR0, v_bytes(insn));
     } else {
-        emit_push_store(b, r, v_bytes(insn));
+        emit_push_store(e, insn, r, v_bytes(insn));
     }
     return 0;
 }
@@ -418,7 +495,7 @@ static int em_push_iz(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_buf_t *b = &e->buf;
 
     a64_emit_mov_imm32(b, SCR0, insn->imm); /* 16-bit Iz: low half used */
-    emit_push_store(b, SCR0, v_bytes(insn));
+    emit_push_store(e, insn, SCR0, v_bytes(insn));
     return 0;
 }
 
@@ -429,7 +506,7 @@ static int em_push_ib(i686_emit_ctx_t *e, const x86_insn_t *insn)
 
     a64_emit_movz_w(b, SCR0, (uint16_t)(insn->imm & 0xFFU), 0U);
     emit_sbfx_w(b, SCR0, SCR0, 0U, 8U); /* sext8 -> 32; strh takes low 16 */
-    emit_push_store(b, SCR0, v_bytes(insn));
+    emit_push_store(e, insn, SCR0, v_bytes(insn));
     return 0;
 }
 
@@ -440,8 +517,16 @@ static int em_pop_gv(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
     a64_buf_t *b = &e->buf;
     unsigned r = i686_w(insn->modrm_reg);
+    dbt_mem_site_t site;
+    uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+    uint32_t cont;
+    unsigned bytes = v_bytes(insn);
 
-    if (v_bytes(insn) == 4U) {
+    /* The load faults BEFORE the ESP bump, so ESP needs no rollback
+     * (sp_rollback_delta = 0); the site still identifies the access width
+     * and destination for the shared landing pad. The single-word load is
+     * both the sequence start and the faulting instruction. */
+    if (bytes == 4U) {
         if (r == 4U) {
             a64_emit_guest_ldr_w(b, SCR0, 4U);
             a64_emit_mov_w(b, 4U, SCR0);
@@ -454,6 +539,22 @@ static int em_pop_gv(i686_emit_ctx_t *e, const x86_insn_t *insn)
         a64_emit_add_imm_w(b, false, 4U, 4U, 2U, 0U);
         emit_write_w16(b, r, SCR0);
     }
+    cont = (uint32_t)((uint64_t)b->count * 4u);
+
+    memset(&site, 0, sizeof(site));
+    site.seq_start_offset = (uint16_t)seq;
+    site.host_insn_offset = (uint16_t)seq;
+    site.cont_insn_offset = (uint16_t)cont;
+    site.guest_pc_delta = I686_SITE_PC_UNKNOWN; /* patched by translate lane */
+    site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                     ((uint32_t)insn->pfx_lock << 16);
+    site.sp_rollback_delta = 0;
+    site.npc_mode = (uint8_t)I686_NPC_SEQUENTIAL;
+    site.width = (uint8_t)bytes;
+    site.flags = 0u; /* load, SP intact on fault */
+    site.val_or_dst_reg = (uint8_t)r;
+    site.addr_base_reg = 4U; /* ESP */
+    (void)i686_aot_note_stack_site(&site);
     return 0;
 }
 

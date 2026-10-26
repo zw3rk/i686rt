@@ -34,15 +34,68 @@
  *    MSB(result) ^ CF, RCR: two MSBs of the result); the other flags are
  *    preserved as for ROL/ROR.
  *
- * LOCK is irrelevant here (plain read-modify-write of the r/m operand).
+ * LOCK on a memory operand selects a true C11 atomic RMW on the HVA
+ * (Wave U3, UNIFICATION-PLAN 4.4): a SEQ_CST load / strong-CAS retry loop
+ * around the same pure result function, so concurrent LOCK peers on
+ * sibling threads (DBT or interpreter) never lose an update.
  * Handlers never modify ctx->eip; the interpreter loop owns control flow.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "i686rt.h"
 #include "interp/flags.h"
 #include "interp/interp.h"
+
+extern uint8_t x86_ea_seg(const x86_insn_t *insn);
+extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                                unsigned bytes);
+
+static bool sh_locked_mem(const x86_insn_t *insn)
+{
+    return insn->pfx_lock != 0U && insn->modrm_mod != 3U && insn->ea_has != 0U;
+}
+
+static void *sh_locked_hva(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
+{
+    uint32_t ea = x86_ea_compute(ctx, insn);
+    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, w / 8U);
+    return i686_guest_ptr(ctx, ea);
+}
+
+static uint32_t sh_atomic_load_u(void *p, unsigned w)
+{
+    if (w == 8U) {
+        return __atomic_load_n((const uint8_t *)p, __ATOMIC_SEQ_CST);
+    }
+    if (w == 16U) {
+        return __atomic_load_n((const uint16_t *)p, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_load_n((const uint32_t *)p, __ATOMIC_SEQ_CST);
+}
+
+static bool sh_atomic_cas_u(void *p, unsigned w, uint32_t expected,
+                            uint32_t desired)
+{
+    if (w == 8U) {
+        uint8_t e = (uint8_t)expected;
+        return __atomic_compare_exchange_n((uint8_t *)p, &e, (uint8_t)desired,
+                                           false, __ATOMIC_SEQ_CST,
+                                           __ATOMIC_SEQ_CST);
+    }
+    if (w == 16U) {
+        uint16_t e = (uint16_t)expected;
+        return __atomic_compare_exchange_n((uint16_t *)p, &e,
+                                           (uint16_t)desired, false,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    {
+        uint32_t e = expected;
+        return __atomic_compare_exchange_n((uint32_t *)p, &e, desired, false,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+}
 
 static unsigned sh_width(const x86_insn_t *insn)
 {
@@ -119,14 +172,26 @@ static int h_shl(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned w = sh_width(insn);
     uint32_t cnt = sh_count(ctx, insn);
     uint32_t val, res;
+    void *lp;
     unsigned cf;
 
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; } /* no write, no flags */
     }
-    val = x86_rm_read(ctx, insn, w);
-    res = (uint32_t)(((uint64_t)val << cnt) & sh_mask(w));
-    x86_rm_write(ctx, insn, w, res);
+    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    if (lp == NULL) {
+        val = x86_rm_read(ctx, insn, w);
+        res = (uint32_t)(((uint64_t)val << cnt) & sh_mask(w));
+        x86_rm_write(ctx, insn, w, res);
+    } else {
+        for (;;) {
+            val = sh_atomic_load_u(lp, w);
+            res = (uint32_t)(((uint64_t)val << cnt) & sh_mask(w));
+            if (sh_atomic_cas_u(lp, w, val, res)) {
+                break;
+            }
+        }
+    }
     /* Z/S/P from the result; CF=OF=0 (OF patched below); AF undefined. */
     i686_flags_logiczx(ctx, res, w);
     cf = (cnt <= w) ? ((val >> (w - cnt)) & 1U) : 0U;
@@ -143,13 +208,25 @@ static int h_shr(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned w = sh_width(insn);
     uint32_t cnt = sh_count(ctx, insn);
     uint32_t val, res;
+    void *lp;
 
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    val = x86_rm_read(ctx, insn, w);
-    res = (val >> cnt) & sh_mask(w); /* val is zero-extended: logical */
-    x86_rm_write(ctx, insn, w, res);
+    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    if (lp == NULL) {
+        val = x86_rm_read(ctx, insn, w);
+        res = (val >> cnt) & sh_mask(w); /* val is zero-extended: logical */
+        x86_rm_write(ctx, insn, w, res);
+    } else {
+        for (;;) {
+            val = sh_atomic_load_u(lp, w);
+            res = (val >> cnt) & sh_mask(w);
+            if (sh_atomic_cas_u(lp, w, val, res)) {
+                break;
+            }
+        }
+    }
     i686_flags_logiczx(ctx, res, w);
     sh_set_cf(ctx, (val >> (cnt - 1U)) & 1U);
     if (cnt == 1U) {
@@ -184,13 +261,25 @@ static int h_sar(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned w = sh_width(insn);
     uint32_t cnt = sh_count(ctx, insn);
     uint32_t val, res;
+    void *lp;
 
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    val = x86_rm_read(ctx, insn, w);
-    res = sh_sar_value(val, w, cnt);
-    x86_rm_write(ctx, insn, w, res);
+    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    if (lp == NULL) {
+        val = x86_rm_read(ctx, insn, w);
+        res = sh_sar_value(val, w, cnt);
+        x86_rm_write(ctx, insn, w, res);
+    } else {
+        for (;;) {
+            val = sh_atomic_load_u(lp, w);
+            res = sh_sar_value(val, w, cnt);
+            if (sh_atomic_cas_u(lp, w, val, res)) {
+                break;
+            }
+        }
+    }
     i686_flags_logiczx(ctx, res, w);
     if (cnt <= w) {
         sh_set_cf(ctx, (val >> (cnt - 1U)) & 1U);
@@ -207,12 +296,24 @@ static int h_rol(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned w = sh_width(insn);
     uint32_t cnt = sh_count(ctx, insn);
     uint32_t res;
+    void *lp;
 
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), cnt, w);
-    x86_rm_write(ctx, insn, w, res);
+    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    if (lp == NULL) {
+        res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), cnt, w);
+        x86_rm_write(ctx, insn, w, res);
+    } else {
+        for (;;) {
+            uint32_t v = sh_atomic_load_u(lp, w);
+            res = (uint32_t)sh_rotl(v, cnt, w);
+            if (sh_atomic_cas_u(lp, w, v, res)) {
+                break;
+            }
+        }
+    }
     /* Undefined SF/ZF/PF/AF are preserved: materialize first, then only
      * CF (and OF for count 1) change. */
     i686_flags_materialize(ctx);
@@ -229,12 +330,24 @@ static int h_ror(i686_ctx_t *ctx, const x86_insn_t *insn)
     unsigned w = sh_width(insn);
     uint32_t cnt = sh_count(ctx, insn);
     uint32_t res;
+    void *lp;
 
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), w - (cnt % w), w);
-    x86_rm_write(ctx, insn, w, res);
+    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    if (lp == NULL) {
+        res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), w - (cnt % w), w);
+        x86_rm_write(ctx, insn, w, res);
+    } else {
+        for (;;) {
+            uint32_t v = sh_atomic_load_u(lp, w);
+            res = (uint32_t)sh_rotl(v, w - (cnt % w), w);
+            if (sh_atomic_cas_u(lp, w, v, res)) {
+                break;
+            }
+        }
+    }
     i686_flags_materialize(ctx);
     sh_set_cf(ctx, (res >> (w - 1U)) & 1U);
     if (cnt == 1U) {
@@ -251,6 +364,7 @@ static int h_rcl(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint64_t entity, rotd;
     uint32_t res;
     unsigned cf_in, cf_out;
+    void *lp;
 
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
@@ -258,11 +372,25 @@ static int h_rcl(i686_ctx_t *ctx, const x86_insn_t *insn)
     /* CF in can live in the lazy descriptor: materialize before use. */
     i686_flags_materialize(ctx);
     cf_in = (ctx->eflags & I686_EF_CF) ? 1U : 0U;
-    entity = ((uint64_t)cf_in << w) | x86_rm_read(ctx, insn, w);
-    rotd = sh_rotl(entity, cnt, w + 1U);
-    res = (uint32_t)(rotd & sh_mask(w));
-    cf_out = (unsigned)((rotd >> w) & 1U);
-    x86_rm_write(ctx, insn, w, res);
+    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    if (lp == NULL) {
+        entity = ((uint64_t)cf_in << w) | x86_rm_read(ctx, insn, w);
+        rotd = sh_rotl(entity, cnt, w + 1U);
+        res = (uint32_t)(rotd & sh_mask(w));
+        cf_out = (unsigned)((rotd >> w) & 1U);
+        x86_rm_write(ctx, insn, w, res);
+    } else {
+        for (;;) {
+            uint32_t v = sh_atomic_load_u(lp, w);
+            entity = ((uint64_t)cf_in << w) | v;
+            rotd = sh_rotl(entity, cnt, w + 1U);
+            res = (uint32_t)(rotd & sh_mask(w));
+            cf_out = (unsigned)((rotd >> w) & 1U);
+            if (sh_atomic_cas_u(lp, w, v, res)) {
+                break;
+            }
+        }
+    }
     sh_set_cf(ctx, cf_out);
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) & 1U) ^ cf_out); /* MSB ^ CF */
@@ -278,17 +406,32 @@ static int h_rcr(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint64_t entity, rotd;
     uint32_t res;
     unsigned cf_in, cf_out;
+    void *lp;
 
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
     i686_flags_materialize(ctx);
     cf_in = (ctx->eflags & I686_EF_CF) ? 1U : 0U;
-    entity = ((uint64_t)cf_in << w) | x86_rm_read(ctx, insn, w);
-    rotd = sh_rotl(entity, (w + 1U) - (cnt % (w + 1U)), w + 1U);
-    res = (uint32_t)(rotd & sh_mask(w));
-    cf_out = (unsigned)((rotd >> w) & 1U);
-    x86_rm_write(ctx, insn, w, res);
+    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    if (lp == NULL) {
+        entity = ((uint64_t)cf_in << w) | x86_rm_read(ctx, insn, w);
+        rotd = sh_rotl(entity, (w + 1U) - (cnt % (w + 1U)), w + 1U);
+        res = (uint32_t)(rotd & sh_mask(w));
+        cf_out = (unsigned)((rotd >> w) & 1U);
+        x86_rm_write(ctx, insn, w, res);
+    } else {
+        for (;;) {
+            uint32_t v = sh_atomic_load_u(lp, w);
+            entity = ((uint64_t)cf_in << w) | v;
+            rotd = sh_rotl(entity, (w + 1U) - (cnt % (w + 1U)), w + 1U);
+            res = (uint32_t)(rotd & sh_mask(w));
+            cf_out = (unsigned)((rotd >> w) & 1U);
+            if (sh_atomic_cas_u(lp, w, v, res)) {
+                break;
+            }
+        }
+    }
     sh_set_cf(ctx, cf_out);
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) ^ (res >> (w - 2U))) & 1U);
