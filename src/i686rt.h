@@ -61,6 +61,11 @@
 #define I686_EF_ARITH_MASK \
     (I686_EF_CF | I686_EF_PF | I686_EF_AF | I686_EF_ZF | I686_EF_SF | I686_EF_OF)
 
+/* Wave U3 two-regime Class-A VM selector (lane u3-i686,
+ * UNIFICATION-PLAN.md Rev 4 section 4.6). */
+#define I686_VM_REGIME_A1 1U /* H == 4096: direct 4 GiB window [x20, wAddr, uxtw] */
+#define I686_VM_REGIME_A2 2U /* H > 4096: Soft-TLB over MAP_PRIVATE arena (x20 = &tlb[0]) */
+
 /* Block exit reasons (engines return to the dispatcher via ctx->exit_reason). */
 #define I686_EXIT_NONE    0U
 #define I686_EXIT_BRANCH  1U /* jcc/jmp/call/ret/loop taken to ctx->exit_dest */
@@ -265,6 +270,15 @@ typedef struct i686_ctx {
      * own slot state).  Raw i686_desc_t images (interp/seg.h shape);
      * zero = free. */
     uint8_t  tls_desc[3][16];
+
+    /* Wave U3 two-regime VM + DBT fault-landing tail (lane u3-i686).
+     * C-only tail: ABI-locked prefix above is untouched. */
+    void    *vm_tlb;             /* Regime A2 Soft-TLB (4096 x 32B entries), NULL on A1 */
+    uint32_t vm_regime;          /* I686_VM_REGIME_A1 / I686_VM_REGIME_A2 (0 = uninit) */
+    uint32_t vm_host_page;       /* cached rt_host_page_size() at vm init */
+    uint32_t dbt_fault_nzcv;     /* NZCV word spilled by the fault landing pad */
+    uint32_t dbt_fault_w21;      /* w21 (faulting EA scratch) spilled by the landing pad */
+    uint64_t vm_reserved[2];
 } i686_ctx_t;
 
 /* ABI-locked offsets (src/trampoline.S, Phase 3, must agree). */

@@ -9,10 +9,11 @@
  * contract in docs/lanes/phase-1.md.  Flags stay lazy (SPEC D6): handlers
  * only record descriptors via src/interp/flags.h and force materialization
  * exactly where the architecture needs the previous value (ADC/SBB carry-in,
- * INC/DEC carry preservation).  The LOCK prefix is a no-op here: the
- * interpreter is the single-threaded correctness oracle; Phase 4 adds real
- * atomics under the DBT.  All operand values are masked to the operand
- * width before use, so the lazy descriptor stays width-faithful.
+ * INC/DEC carry preservation).  The LOCK prefix selects true C11
+ * __atomic_* RMWs on the HVA for memory destinations (Wave U3,
+ * UNIFICATION-PLAN 4.4); XCHG/CMPXCHG/XADD mem forms are implicitly
+ * locked.  All operand values are masked to the operand width before use,
+ * so the lazy descriptor stays width-faithful.
  */
 
 #include <stdbool.h>
@@ -87,12 +88,246 @@ static int step(i686_ctx_t *ctx, const x86_insn_t *insn)
     return I686_INTERP_CONTINUE;
 }
 
+/* ---- Wave U3 LOCK-atomics (lane u3-i686, UNIFICATION-PLAN 4.4):
+ * LOCK-prefixed memory RMWs use __atomic_* SEQ_CST on the HVA; mem-form
+ * XCHG/CMPXCHG/XADD are implicitly locked. */
+
+extern uint8_t x86_ea_seg(const x86_insn_t *insn);
+extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                                unsigned bytes);
+
+static bool alu_locked_mem(const x86_insn_t *insn, bool dst_is_rm)
+{
+    return dst_is_rm && insn->pfx_lock != 0U && insn->modrm_mod != 3U &&
+           insn->ea_has != 0U;
+}
+
+static bool alu_mem_operand(const x86_insn_t *insn)
+{
+    return insn->modrm_mod != 3U && insn->ea_has != 0U;
+}
+
+/* Canonical HVA for a memory operand (limit-checked like the plain path). */
+static void *alu_locked_hva(i686_ctx_t *ctx, const x86_insn_t *insn,
+                            unsigned width)
+{
+    uint32_t ea = x86_ea_compute(ctx, insn);
+    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, width / 8U);
+    return i686_guest_ptr(ctx, ea);
+}
+
+static uint32_t mem_atomic_load_u(void *p, unsigned width)
+{
+    if (width == 8U) {
+        return __atomic_load_n((const uint8_t *)p, __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        return __atomic_load_n((const uint16_t *)p, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_load_n((const uint32_t *)p, __ATOMIC_SEQ_CST);
+}
+
+static uint32_t mem_atomic_fetch_add(void *p, unsigned width, uint32_t v)
+{
+    if (width == 8U) {
+        return __atomic_fetch_add((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        return __atomic_fetch_add((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_fetch_add((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+}
+
+static uint32_t mem_atomic_fetch_sub(void *p, unsigned width, uint32_t v)
+{
+    if (width == 8U) {
+        return __atomic_fetch_sub((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        return __atomic_fetch_sub((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_fetch_sub((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+}
+
+static uint32_t mem_atomic_fetch_and(void *p, unsigned width, uint32_t v)
+{
+    if (width == 8U) {
+        return __atomic_fetch_and((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        return __atomic_fetch_and((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_fetch_and((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+}
+
+static uint32_t mem_atomic_fetch_or(void *p, unsigned width, uint32_t v)
+{
+    if (width == 8U) {
+        return __atomic_fetch_or((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        return __atomic_fetch_or((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_fetch_or((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+}
+
+static uint32_t mem_atomic_fetch_xor(void *p, unsigned width, uint32_t v)
+{
+    if (width == 8U) {
+        return __atomic_fetch_xor((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        return __atomic_fetch_xor((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_fetch_xor((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+}
+
+static uint32_t mem_atomic_exchange_u(void *p, unsigned width, uint32_t v)
+{
+    if (width == 8U) {
+        return __atomic_exchange_n((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        return __atomic_exchange_n((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_exchange_n((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+}
+
+/* Strong CAS: true exactly when *p == expected (then *p = desired). */
+static bool mem_atomic_cas(void *p, unsigned width, uint32_t expected,
+                           uint32_t desired)
+{
+    uint8_t e8;
+    uint16_t e16;
+    uint32_t e32;
+    if (width == 8U) {
+        e8 = (uint8_t)expected;
+        return __atomic_compare_exchange_n((uint8_t *)p, &e8, (uint8_t)desired,
+                                           false, __ATOMIC_SEQ_CST,
+                                           __ATOMIC_SEQ_CST);
+    }
+    if (width == 16U) {
+        e16 = (uint16_t)expected;
+        return __atomic_compare_exchange_n((uint16_t *)p, &e16,
+                                           (uint16_t)desired, false,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    e32 = expected;
+    return __atomic_compare_exchange_n((uint32_t *)p, &e32, desired, false,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
 /* ---- binary ALU executor -------------------------------------------- */
+
+/* LOCK-prefixed mem-dst ALU op (EbGb/EvGv/EbIb/EvIz/EvIbSX): C11 RMW on the HVA. */
+static int alu_exec_locked(i686_ctx_t *ctx, const x86_insn_t *insn,
+                           alu_kind_t kind, alu_form_t form)
+{
+    unsigned width = (form == FORM_EbGb || form == FORM_EbIb) ? 8U
+                                                             : v_width(insn);
+    uint32_t mask = width_mask(width);
+    uint32_t b;
+    void *hva;
+    uint32_t old;
+    uint32_t res;
+    switch (form) {
+    case FORM_EbGb:
+        b = x86_reg_read(ctx, insn->modrm_reg, 8U) & 0xFFU;
+        break;
+    case FORM_EvGv:
+        b = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
+        break;
+    case FORM_EbIb:
+        b = insn->imm & 0xFFU;
+        break;
+    case FORM_EvIz:
+        b = insn->imm & mask;
+        break;
+    default: /* FORM_EvIbSX */
+        b = sext_imm8(insn->imm) & mask;
+        break;
+    }
+    hva = alu_locked_hva(ctx, insn, width);
+    switch (kind) {
+    case ALU_ADD:
+        old = mem_atomic_fetch_add(hva, width, b);
+        res = (old + b) & mask;
+        i686_flags_add(ctx, old & mask, b, width);
+        break;
+    case ALU_ADC: {
+        uint32_t cf = (i686_flags_read(ctx) & I686_EF_CF) != 0U ? 1U : 0U;
+        for (;;) {
+            old = mem_atomic_load_u(hva, width) & mask;
+            res = (old + b + cf) & mask;
+            if (mem_atomic_cas(hva, width, old, res)) {
+                break;
+            }
+        }
+        i686_flags_adc(ctx, old, b, cf, width);
+        break;
+    }
+    case ALU_AND:
+        old = mem_atomic_fetch_and(hva, width, b);
+        res = (old & b) & mask;
+        i686_flags_logic(ctx, res, width);
+        break;
+    case ALU_OR:
+        old = mem_atomic_fetch_or(hva, width, b);
+        res = (old | b) & mask;
+        i686_flags_logic(ctx, res, width);
+        break;
+    case ALU_XOR:
+        old = mem_atomic_fetch_xor(hva, width, b);
+        res = (old ^ b) & mask;
+        i686_flags_logic(ctx, res, width);
+        break;
+    case ALU_TEST:
+        old = mem_atomic_load_u(hva, width) & mask;
+        res = (old & b) & mask;
+        i686_flags_logic(ctx, res, width);
+        return step(ctx, insn);
+    case ALU_SBB: {
+        uint32_t cf = (i686_flags_read(ctx) & I686_EF_CF) != 0U ? 1U : 0U;
+        for (;;) {
+            old = mem_atomic_load_u(hva, width) & mask;
+            res = (old - b - cf) & mask;
+            if (mem_atomic_cas(hva, width, old, res)) {
+                break;
+            }
+        }
+        i686_flags_sbb(ctx, old, b, cf, width);
+        break;
+    }
+    case ALU_SUB:
+    case ALU_CMP:
+        if (kind == ALU_CMP) {
+            old = mem_atomic_load_u(hva, width) & mask;
+            res = (old - b) & mask;
+            i686_flags_sub(ctx, old, b, width);
+            return step(ctx, insn);
+        }
+        old = mem_atomic_fetch_sub(hva, width, b);
+        res = (old - b) & mask;
+        i686_flags_sub(ctx, old & mask, b, width);
+        break;
+    default: /* unreachable: kinds are exhaustive */
+        return I686_INTERP_CONTINUE;
+    }
+    (void)res;
+    return step(ctx, insn);
+}
 
 static int alu_exec(i686_ctx_t *ctx, const x86_insn_t *insn, alu_kind_t kind,
                     alu_form_t form)
 {
     unsigned width;
+    /* LOCK + memory destination: true C11 RMW (UNIFICATION-PLAN 4.4). */
+    if (insn->pfx_lock != 0U &&
+        (form == FORM_EbGb || form == FORM_EvGv || form == FORM_EbIb ||
+         form == FORM_EvIz || form == FORM_EvIbSX) &&
+        insn->modrm_mod != 3U && insn->ea_has != 0U) {
+        return alu_exec_locked(ctx, insn, kind, form);
+    }
     switch (form) {
     case FORM_EbGb:
     case FORM_GbEb:
@@ -285,17 +520,42 @@ static int h_TEST_EvIz(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int not_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
-    uint32_t a = x86_rm_read(ctx, insn, width) & mask;
-    x86_rm_write(ctx, insn, width, (~a) & mask); /* NOT sets no flags */
+    if (alu_locked_mem(insn, true)) {
+        void *hva = alu_locked_hva(ctx, insn, width);
+        for (;;) {
+            uint32_t a = mem_atomic_load_u(hva, width) & mask;
+            if (mem_atomic_cas(hva, width, a, (~a) & mask)) {
+                break;
+            }
+        }
+        return step(ctx, insn);
+    }
+    {
+        uint32_t a = x86_rm_read(ctx, insn, width) & mask;
+        x86_rm_write(ctx, insn, width, (~a) & mask); /* NOT sets no flags */
+    }
     return step(ctx, insn);
 }
 
 static int neg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
-    uint32_t a = x86_rm_read(ctx, insn, width) & mask;
-    i686_flags_neg(ctx, a, width); /* res = 0 - a is derived by flags.c */
-    x86_rm_write(ctx, insn, width, (0U - a) & mask);
+    if (alu_locked_mem(insn, true)) {
+        void *hva = alu_locked_hva(ctx, insn, width);
+        for (;;) {
+            uint32_t a = mem_atomic_load_u(hva, width) & mask;
+            if (mem_atomic_cas(hva, width, a, (0U - a) & mask)) {
+                i686_flags_neg(ctx, a, width);
+                break;
+            }
+        }
+        return step(ctx, insn);
+    }
+    {
+        uint32_t a = x86_rm_read(ctx, insn, width) & mask;
+        i686_flags_neg(ctx, a, width); /* res = 0 - a is derived by flags.c */
+        x86_rm_write(ctx, insn, width, (0U - a) & mask);
+    }
     return step(ctx, insn);
 }
 
@@ -307,6 +567,22 @@ static int incdec_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width,
 {
     uint32_t mask = width_mask(width);
     (void)i686_flags_read(ctx);
+    if (!opnd0_is_reg(insn) && alu_locked_mem(insn, true)) {
+        void *hva = alu_locked_hva(ctx, insn, width);
+        for (;;) {
+            uint32_t a = mem_atomic_load_u(hva, width) & mask;
+            uint32_t res = (is_inc ? (a + 1U) : (a - 1U)) & mask;
+            if (mem_atomic_cas(hva, width, a, res)) {
+                if (is_inc) {
+                    i686_flags_inc(ctx, a, width);
+                } else {
+                    i686_flags_dec(ctx, a, width);
+                }
+                break;
+            }
+        }
+        return step(ctx, insn);
+    }
     uint32_t a;
     if (opnd0_is_reg(insn)) { /* 40+r / FE-FF mod=3 share these ids */
         a = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
@@ -372,10 +648,20 @@ static int h_DEC_Ev(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int xchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
-    uint32_t t = x86_rm_read(ctx, insn, width) & mask;
-    x86_rm_write(ctx, insn, width,
-                 x86_reg_read(ctx, insn->modrm_reg, width) & mask);
-    x86_reg_write(ctx, insn->modrm_reg, width, t);
+    if (alu_mem_operand(insn)) {
+        /* Implicitly locked: single atomic exchange on the HVA. */
+        void *hva = alu_locked_hva(ctx, insn, width);
+        uint32_t b = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
+        uint32_t t = mem_atomic_exchange_u(hva, width, b) & mask;
+        x86_reg_write(ctx, insn->modrm_reg, width, t);
+        return step(ctx, insn);
+    }
+    {
+        uint32_t t = x86_rm_read(ctx, insn, width) & mask;
+        x86_rm_write(ctx, insn, width,
+                     x86_reg_read(ctx, insn->modrm_reg, width) & mask);
+        x86_reg_write(ctx, insn->modrm_reg, width, t);
+    }
     return step(ctx, insn);
 }
 
@@ -408,13 +694,32 @@ static int cmpxchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
     uint32_t acc = x86_reg_read(ctx, I686_REG_EAX, width) & mask;
-    uint32_t rmv = x86_rm_read(ctx, insn, width) & mask;
-    i686_flags_sub(ctx, acc, rmv, width);
-    if (acc == rmv) {
-        x86_rm_write(ctx, insn, width,
-                     x86_reg_read(ctx, insn->modrm_reg, width) & mask);
-    } else {
-        x86_reg_write(ctx, I686_REG_EAX, width, rmv);
+    if (alu_mem_operand(insn)) {
+        /* Implicitly locked: strong-CAS retry on the HVA. */
+        void *hva = alu_locked_hva(ctx, insn, width);
+        uint32_t src = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
+        for (;;) {
+            uint32_t rmv = mem_atomic_load_u(hva, width) & mask;
+            i686_flags_sub(ctx, acc, rmv, width);
+            if (acc != rmv) {
+                x86_reg_write(ctx, I686_REG_EAX, width, rmv);
+                break;
+            }
+            if (mem_atomic_cas(hva, width, rmv, src)) {
+                break;
+            }
+        }
+        return step(ctx, insn);
+    }
+    {
+        uint32_t rmv = x86_rm_read(ctx, insn, width) & mask;
+        i686_flags_sub(ctx, acc, rmv, width);
+        if (acc == rmv) {
+            x86_rm_write(ctx, insn, width,
+                         x86_reg_read(ctx, insn->modrm_reg, width) & mask);
+        } else {
+            x86_reg_write(ctx, I686_REG_EAX, width, rmv);
+        }
     }
     return step(ctx, insn);
 }
@@ -433,11 +738,21 @@ static int h_CMPXCHG_EvGv(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int xadd_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
-    uint32_t old_rm = x86_rm_read(ctx, insn, width) & mask;
     uint32_t src = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
-    i686_flags_add(ctx, old_rm, src, width);
-    x86_rm_write(ctx, insn, width, (old_rm + src) & mask);
-    x86_reg_write(ctx, insn->modrm_reg, width, old_rm);
+    if (alu_mem_operand(insn)) {
+        /* Implicitly locked: fetch-add returns the old value atomically. */
+        void *hva = alu_locked_hva(ctx, insn, width);
+        uint32_t old_rm = mem_atomic_fetch_add(hva, width, src) & mask;
+        i686_flags_add(ctx, old_rm, src, width);
+        x86_reg_write(ctx, insn->modrm_reg, width, old_rm);
+        return step(ctx, insn);
+    }
+    {
+        uint32_t old_rm = x86_rm_read(ctx, insn, width) & mask;
+        i686_flags_add(ctx, old_rm, src, width);
+        x86_rm_write(ctx, insn, width, (old_rm + src) & mask);
+        x86_reg_write(ctx, insn->modrm_reg, width, old_rm);
+    }
     return step(ctx, insn);
 }
 
@@ -455,18 +770,18 @@ static int h_XADD_EvGv(i686_ctx_t *ctx, const x86_insn_t *insn)
  * plumbing, the 8-byte extent is handled here): compare EDX:EAX with
  * [EA]; on match ZF=1 and [EA] <- ECX:EBX, else ZF=0 and
  * EDX:EAX <- [EA].  All other flags are untouched (SDM CMPXCHG8B).
- * mod=3 and reg != /1 are #UD; the LOCK prefix is a no-op under the
- * same single-threaded oracle convention as CMPXCHG/XADD above.
+ * mod=3 and reg != /1 are #UD.  The memory form is implicitly locked:
+ * an aligned 8-byte __atomic_compare_exchange on the HVA (Wave U3,
+ * UNIFICATION-PLAN 4.4); unaligned EAs serialize on a lane spinlock.
  * RC7b T4: ntdll.so's NtAllocateUuids interlocked loop executes
  * `lock cmpxchg8b` during wine startup. */
-extern uint8_t x86_ea_seg(const x86_insn_t *insn);
-extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
-                                unsigned bytes);
+
+static _Atomic uint32_t s_cmpxchg8b_lock;
 
 static int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    uint32_t ea, mlo, mhi, alo, ahi;
-    uint8_t *p;
+    uint32_t ea, alo, ahi;
+    uint64_t *q;
     uint32_t fl;
 
     if (insn->modrm_mod == 3U || insn->modrm_reg != 1U) {
@@ -474,29 +789,54 @@ static int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     ea = x86_ea_compute(ctx, insn);
     i686_seg_check_data(ctx, x86_ea_seg(insn), ea, 8U);
-    p = (uint8_t *)i686_guest_ptr(ctx, ea);
-    mlo = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-          ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-    mhi = (uint32_t)p[4] | ((uint32_t)p[5] << 8) |
-          ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+    q = (uint64_t *)i686_guest_ptr(ctx, ea);
     alo = ctx->gpr[I686_REG_EAX];
     ahi = ctx->gpr[I686_REG_EDX];
-    if (alo == mlo && ahi == mhi) {
-        p[0] = (uint8_t)(ctx->gpr[I686_REG_EBX] & 0xFFu);
-        p[1] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 8) & 0xFFu);
-        p[2] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 16) & 0xFFu);
-        p[3] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 24) & 0xFFu);
-        p[4] = (uint8_t)(ctx->gpr[I686_REG_ECX] & 0xFFu);
-        p[5] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 8) & 0xFFu);
-        p[6] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 16) & 0xFFu);
-        p[7] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 24) & 0xFFu);
-        fl = i686_flags_read(ctx) | I686_EF_ZF;
-    } else {
-        ctx->gpr[I686_REG_EAX] = mlo;
-        ctx->gpr[I686_REG_EDX] = mhi;
-        fl = i686_flags_read(ctx) & ~I686_EF_ZF;
+    if ((((uintptr_t)q) & 7u) == 0u) {
+        uint64_t expected =
+            ((uint64_t)ahi << 32) | (uint64_t)alo;
+        uint64_t desired = ((uint64_t)ctx->gpr[I686_REG_ECX] << 32) |
+                           (uint64_t)ctx->gpr[I686_REG_EBX];
+        bool ok = __atomic_compare_exchange_n(q, &expected, desired, false,
+                                              __ATOMIC_SEQ_CST,
+                                              __ATOMIC_SEQ_CST);
+        if (ok) {
+            fl = i686_flags_read(ctx) | I686_EF_ZF;
+        } else {
+            ctx->gpr[I686_REG_EAX] = (uint32_t)expected;
+            ctx->gpr[I686_REG_EDX] = (uint32_t)(expected >> 32);
+            fl = i686_flags_read(ctx) & ~I686_EF_ZF;
+        }
+        ctx->eflags = fl;
+        return step(ctx, insn);
     }
-    ctx->eflags = fl;
+    /* Unaligned EA: AArch64 CAS faults, so serialize interpreter peers
+     * on a lane lock for the byte-wise sequence. */
+    i686_spin_lock(&s_cmpxchg8b_lock);
+    {
+        uint8_t *p = (uint8_t *)q;
+        uint32_t mlo = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint32_t mhi = (uint32_t)p[4] | ((uint32_t)p[5] << 8) |
+                       ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+        if (alo == mlo && ahi == mhi) {
+            p[0] = (uint8_t)(ctx->gpr[I686_REG_EBX] & 0xFFu);
+            p[1] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 8) & 0xFFu);
+            p[2] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 16) & 0xFFu);
+            p[3] = (uint8_t)((ctx->gpr[I686_REG_EBX] >> 24) & 0xFFu);
+            p[4] = (uint8_t)(ctx->gpr[I686_REG_ECX] & 0xFFu);
+            p[5] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 8) & 0xFFu);
+            p[6] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 16) & 0xFFu);
+            p[7] = (uint8_t)((ctx->gpr[I686_REG_ECX] >> 24) & 0xFFu);
+            fl = i686_flags_read(ctx) | I686_EF_ZF;
+        } else {
+            ctx->gpr[I686_REG_EAX] = mlo;
+            ctx->gpr[I686_REG_EDX] = mhi;
+            fl = i686_flags_read(ctx) & ~I686_EF_ZF;
+        }
+        ctx->eflags = fl;
+    }
+    i686_spin_unlock(&s_cmpxchg8b_lock);
     return step(ctx, insn);
 }
 

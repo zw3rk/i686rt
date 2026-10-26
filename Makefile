@@ -20,14 +20,27 @@ endif
 # and every prescribed warning intact).
 CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 LDFLAGS ?= -static-pie
+HOST_CC ?= cc
+# Host-toolchain builds (build-darwin, test-u3) widen strict POSIX to the
+# full host API set (MAP_ANONYMOUS, kqueue, MAP_JIT...). Never used for
+# cross targets.
+ifeq ($(shell uname),Darwin)
+HOST_DEFS := -D_DARWIN_C_SOURCE
+else
+HOST_DEFS :=
+endif
 
 # src/main.c plus every vendored rt32 core file present; src/rt32/ arrives
 # with lane L0a, so pre-merge this globs to nothing and main.c builds alone.
+# Wave U3 (lane u3-i686): src/vm/ (two-regime vm32 + Provider A) and
+# src/dbt/aot/ (relative site-table serializer) join the build.
 SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
         $(wildcard src/interp/*.c) $(wildcard src/os/*.c) \
-        $(wildcard src/dbt/*.c) src/trampoline.S
+        $(wildcard src/vm/*.c) \
+        $(wildcard src/dbt/*.c) $(wildcard src/dbt/aot/*.c) src/trampoline.S
 HDRS := src/i686rt.h include/a32host.h $(wildcard src/rt32/*.h) \
-         $(wildcard src/x86/*.h) $(wildcard src/interp/*.h) $(wildcard src/os/*.h)
+         $(wildcard src/x86/*.h) $(wildcard src/interp/*.h) $(wildcard src/os/*.h) \
+         $(wildcard src/vm/*.h) $(wildcard src/dbt/*.h) $(wildcard src/dbt/aot/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
 OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
@@ -38,7 +51,8 @@ help: ## Show available build and verification targets
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 SRCS_X64 := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
-        $(wildcard src/interp/*.c) $(wildcard src/os/*.c)
+        $(wildcard src/interp/*.c) $(wildcard src/os/*.c) \
+        $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)
 SRCS_X64 := $(filter-out src/rt32/rt32_a64_emit.c,$(SRCS_X64))
 OBJS_X64  := $(patsubst src/%.c,$(OBJ_DIR)-x64/%.o,$(SRCS_X64))
 I686RT_X64 := $(BUILD_DIR)/i686rt-x86_64
@@ -205,6 +219,68 @@ h2-report: ## Assemble tests/hardening/h2-report.md from the committed runner lo
 	tests/hardening/mkreport.sh
 
 .PHONY: h2-report
+
+## ------------------------------------------------------------------ ##
+##  Wave U3 — lane u3-i686: two-regime vm32, dual backends, AOT sites   ##
+## ------------------------------------------------------------------ ##
+
+# Curated-C11 file size discipline for this lane's exclusive ownership
+# (Wave U3 card L-U3-I686 as delegated: src/vm/, dual backends,
+# src/dbt/aot/, the LOCK-atomics lines in h_alu.c/h_shift.c, the site
+# records in emit_mov.c, the i686rt.h tail, and the lane test). Files
+# outside this list (vendored src/rt32 donor, src/os/sys_* syscall
+# tables) belong to sibling lanes and are not gated here.
+U3_OWNED := src/vm/vm32.c src/vm/vm32.h src/vm/vm_file.c src/vm/vm_file.h \
+        src/os/backend.h src/os/backend_linux.c src/os/backend_linux_sys.c \
+        src/os/backend_darwin.c src/os/backend_darwin_io.c \
+        src/os/backend_darwin_net.c \
+        src/dbt/aot/aot.h src/dbt/aot/aot.c \
+        src/interp/h_alu.c src/interp/h_shift.c src/dbt/emit_mov.c \
+        src/i686rt.h tests/unit/test_u3_sites.c
+check-line-limits: ## Enforce the <= 900-line rule on lane-owned files
+	@fail=0; \
+	for f in $(U3_OWNED); do \
+	  n=$$(wc -l < "$$f"); \
+	  if [ "$$n" -gt 900 ]; then echo "OVER LIMIT: $$f ($$n lines)"; fail=1; fi; \
+	done; \
+	if [ "$$fail" -ne 0 ]; then echo "FAIL: files over 900 lines"; exit 1; fi; \
+	echo "check-line-limits: all lane-owned files <= 900 lines"
+
+# Darwin-portable Wave U3 TU set. The full _build/i686rt-darwin-arm64
+# translator binary additionally needs the syscall marshal lane
+# (src/os/sys_*.c uses Linux-only headers); until that lane lands,
+# build-darwin compiles every lane TU warning-clean under the host
+# toolchain and links + runs the portable host check below.
+U3_DARWIN_SRCS := src/vm/vm32.c src/vm/vm_file.c \
+        src/os/backend_linux.c src/os/backend_linux_sys.c \
+        src/os/backend_darwin.c src/os/backend_darwin_io.c \
+        src/os/backend_darwin_net.c \
+        src/dbt/aot/aot.c \
+        src/interp/h_alu.c src/interp/h_shift.c src/dbt/emit_mov.c \
+        src/rt32/rt32_vm.c src/x86/decode.c
+U3_DARWIN_OBJS := $(patsubst src/%.c,$(OBJ_DIR)-darwin/%.o,$(U3_DARWIN_SRCS))
+
+$(OBJ_DIR)-darwin/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -c $< -o $@
+
+build-darwin: $(U3_DARWIN_OBJS) test-u3 ## Compile the Wave U3 TU set for macOS arm64 + run the host check
+
+# Portable host check: layout pins, AOT round-trip, Provider A promotion,
+# regime selection, and the dual-backend smoke set. Uses the host
+# toolchain (never the cross CC).
+U3_TEST_SRCS := tests/unit/test_u3_sites.c src/dbt/aot/aot.c \
+        src/vm/vm32.c src/vm/vm_file.c src/rt32/rt32_vm.c \
+        src/os/backend_linux.c src/os/backend_linux_sys.c \
+        src/os/backend_darwin.c src/os/backend_darwin_io.c \
+        src/os/backend_darwin_net.c
+
+test-u3: ## Build and run the Wave U3 host check (must print U3-I686 OK)
+	@mkdir -p $(BUILD_DIR)
+	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -DI686RT_NO_DBT $(U3_TEST_SRCS) -o $(BUILD_DIR)/test_u3_sites -pthread
+	./$(BUILD_DIR)/test_u3_sites
+
+.PHONY: check-line-limits build-darwin test-u3
 
 ## ------------------------------------------------------------------ ##
 ##  Phase H — H3: CoreMark performance (interp vs dbt vs oracle)        ##
