@@ -51,17 +51,45 @@
 extern uint8_t x86_ea_seg(const x86_insn_t *insn);
 extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
                                 unsigned bytes);
+/* RC-U3 split lock (defined in src/dbt/aot/aot.c). */
+extern void i686_split_lock_acquire(void);
+extern void i686_split_lock_release(void);
+extern bool i686_mem_is_unaligned(const void *p, unsigned width);
+extern bool i686_span_mapped_writable(const i686_ctx_t *ctx, uint32_t ea,
+                                      unsigned bytes);
+
+/* RC-U3 unaligned entry: NULL = run the __atomic_* CAS path; otherwise
+ * the split lock is held (0/1 encoded in *held) and the caller runs the
+ * byte-wise plain path, then calls sh_lock_leave. */
+static void *sh_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
+                           unsigned w, int *held)
+{
+    uint32_t ea = x86_ea_compute(ctx, insn);
+    void *hva;
+
+    *held = 0;
+    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, w / 8U);
+    hva = i686_guest_ptr(ctx, ea);
+    if (!i686_mem_is_unaligned(hva, w)) {
+        return hva;
+    }
+    if (i686_span_mapped_writable(ctx, ea, w / 8U)) {
+        i686_split_lock_acquire();
+        *held = 1;
+    }
+    return NULL;
+}
+
+static void sh_lock_leave(int held)
+{
+    if (held != 0) {
+        i686_split_lock_release();
+    }
+}
 
 static bool sh_locked_mem(const x86_insn_t *insn)
 {
     return insn->pfx_lock != 0U && insn->modrm_mod != 3U && insn->ea_has != 0U;
-}
-
-static void *sh_locked_hva(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
-{
-    uint32_t ea = x86_ea_compute(ctx, insn);
-    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, w / 8U);
-    return i686_guest_ptr(ctx, ea);
 }
 
 static uint32_t sh_atomic_load_u(void *p, unsigned w)
@@ -178,7 +206,8 @@ static int h_shl(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; } /* no write, no flags */
     }
-    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    int held = 0;
+    lp = sh_locked_mem(insn) ? sh_lock_enter(ctx, insn, w, &held) : NULL;
     if (lp == NULL) {
         val = x86_rm_read(ctx, insn, w);
         res = (uint32_t)(((uint64_t)val << cnt) & sh_mask(w));
@@ -199,6 +228,7 @@ static int h_shl(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, cf ^ ((res >> (w - 1U)) & 1U));
     }
+    sh_lock_leave(held);
     { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
@@ -213,7 +243,8 @@ static int h_shr(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    int held = 0;
+    lp = sh_locked_mem(insn) ? sh_lock_enter(ctx, insn, w, &held) : NULL;
     if (lp == NULL) {
         val = x86_rm_read(ctx, insn, w);
         res = (val >> cnt) & sh_mask(w); /* val is zero-extended: logical */
@@ -232,6 +263,7 @@ static int h_shr(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, (val >> (w - 1U)) & 1U); /* OF = MSB(operand) */
     }
+    sh_lock_leave(held);
     { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
@@ -266,7 +298,8 @@ static int h_sar(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    int held = 0;
+    lp = sh_locked_mem(insn) ? sh_lock_enter(ctx, insn, w, &held) : NULL;
     if (lp == NULL) {
         val = x86_rm_read(ctx, insn, w);
         res = sh_sar_value(val, w, cnt);
@@ -287,6 +320,7 @@ static int h_sar(i686_ctx_t *ctx, const x86_insn_t *insn)
         sh_set_cf(ctx, (val >> (w - 1U)) & 1U); /* sign bit repeats */
     }
     /* count==1: OF = 0 — already cleared by i686_flags_logiczx. */
+    sh_lock_leave(held);
     { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
@@ -301,7 +335,8 @@ static int h_rol(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    int held = 0;
+    lp = sh_locked_mem(insn) ? sh_lock_enter(ctx, insn, w, &held) : NULL;
     if (lp == NULL) {
         res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), cnt, w);
         x86_rm_write(ctx, insn, w, res);
@@ -321,6 +356,7 @@ static int h_rol(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) ^ res) & 1U); /* MSB ^ CF */
     }
+    sh_lock_leave(held);
     { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
@@ -335,7 +371,8 @@ static int h_ror(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 0U) {
         { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
     }
-    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    int held = 0;
+    lp = sh_locked_mem(insn) ? sh_lock_enter(ctx, insn, w, &held) : NULL;
     if (lp == NULL) {
         res = (uint32_t)sh_rotl(x86_rm_read(ctx, insn, w), w - (cnt % w), w);
         x86_rm_write(ctx, insn, w, res);
@@ -353,6 +390,7 @@ static int h_ror(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) ^ (res >> (w - 2U))) & 1U);
     }
+    sh_lock_leave(held);
     { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
@@ -372,7 +410,8 @@ static int h_rcl(i686_ctx_t *ctx, const x86_insn_t *insn)
     /* CF in can live in the lazy descriptor: materialize before use. */
     i686_flags_materialize(ctx);
     cf_in = (ctx->eflags & I686_EF_CF) ? 1U : 0U;
-    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    int held = 0;
+    lp = sh_locked_mem(insn) ? sh_lock_enter(ctx, insn, w, &held) : NULL;
     if (lp == NULL) {
         entity = ((uint64_t)cf_in << w) | x86_rm_read(ctx, insn, w);
         rotd = sh_rotl(entity, cnt, w + 1U);
@@ -395,6 +434,7 @@ static int h_rcl(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) & 1U) ^ cf_out); /* MSB ^ CF */
     }
+    sh_lock_leave(held);
     { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 
@@ -413,7 +453,8 @@ static int h_rcr(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     i686_flags_materialize(ctx);
     cf_in = (ctx->eflags & I686_EF_CF) ? 1U : 0U;
-    lp = sh_locked_mem(insn) ? sh_locked_hva(ctx, insn, w) : NULL;
+    int held = 0;
+    lp = sh_locked_mem(insn) ? sh_lock_enter(ctx, insn, w, &held) : NULL;
     if (lp == NULL) {
         entity = ((uint64_t)cf_in << w) | x86_rm_read(ctx, insn, w);
         rotd = sh_rotl(entity, (w + 1U) - (cnt % (w + 1U)), w + 1U);
@@ -436,6 +477,7 @@ static int h_rcr(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (cnt == 1U) {
         sh_set_of(ctx, ((res >> (w - 1U)) ^ (res >> (w - 2U))) & 1U);
     }
+    sh_lock_leave(held);
     { ctx->eip += insn->len; return I686_INTERP_CONTINUE; }
 }
 

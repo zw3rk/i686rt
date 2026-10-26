@@ -23,6 +23,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "vm/vm32.h"
+#include "vm/vm_file.h"
+
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
@@ -139,6 +142,52 @@ static void vm_remove_region_at(size_t idx)
     g_vm_region_count--;
 }
 
+/* Mirror the authoritative region list into the Provider A prot tables
+ * over [start, end) (RC-U3: union host-page protection reads these).
+ * Unmapped holes sync to 0 (PROT_NONE window, no guest access). */
+static void vm_file_sync_prot_locked(uint32_t start, uint32_t end)
+{
+    uint32_t cur = start;
+    while (cur < end) {
+        bool hit = false;
+        size_t i;
+        for (i = 0U; i < g_vm_region_count; i++) {
+            const i686_region_t *r = &g_vm_regions[i];
+            if (r->start <= cur && r->end > cur) {
+                uint32_t seg_end = (r->end < end) ? r->end : end;
+                i686_vm_file_set_prot(cur, seg_end - cur,
+                                      (uint8_t)(r->prot & 0x7U));
+                cur = seg_end;
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            uint32_t next = end;
+            for (i = 0U; i < g_vm_region_count; i++) {
+                if (g_vm_regions[i].start > cur &&
+                    g_vm_regions[i].start < next) {
+                    next = g_vm_regions[i].start;
+                }
+            }
+            i686_vm_file_set_prot(cur, next - cur, 0U);
+            cur = next;
+        }
+    }
+}
+
+/* RC-U3 P1: on Regime A2 (host page > 4 KiB) a 4 KiB guest range shares
+ * its host page with neighbours, so the host page must carry the union
+ * of the covered sub-page protections (never EXEC).  No-op on A1. */
+static void vm_union_protect_a2(i686_ctx_t *ctx, uint32_t start, uint32_t end)
+{
+    if (ctx == NULL || end <= start ||
+        ctx->vm_regime != I686_VM_REGIME_A2) {
+        return;
+    }
+    (void)i686_vm32_union_prot(ctx, start, end);
+}
+
 static int vm_insert_region_raw(uint32_t start, uint32_t end,
                                 uint32_t prot, uint32_t flags, const char *name)
 {
@@ -250,6 +299,8 @@ static int vm_record_region_locked(uint32_t start, uint32_t end,
         rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
     }
     vm_coalesce_regions_locked();
+    /* RC-U3: keep the Provider A prot tables exact for union protection. */
+    vm_file_sync_prot_locked(start, end);
     return rc;
 }
 
@@ -298,6 +349,8 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
         }
     }
     vm_coalesce_regions_locked();
+    /* RC-U3: keep the Provider A prot tables exact for union protection. */
+    vm_file_sync_prot_locked(mp_start, mp_end);
 }
 
 static bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
@@ -591,11 +644,16 @@ uint32_t rt32_vm_brk(i686_ctx_t *ctx, uint32_t new_brk)
         }
         (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
+        /* RC-U3: the 4 KiB mmap rounds to the host page on A2. */
+        vm_union_protect_a2(ctx, old_page, new_page);
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
         (void)vm_reserve_prot_none(ctx, new_page, len);
         vm_unmap_regions_locked(new_page, old_page);
+        /* RC-U3: sync the prot tables and re-union the host pages. */
+        vm_file_sync_prot_locked(new_page, old_page);
+        vm_union_protect_a2(ctx, new_page, old_page);
     }
 
     g_vm_brk_curr = new_brk;
@@ -678,6 +736,17 @@ static uint32_t vm_mmap2_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len, ui
     }
     (void)vm_record_region_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
                                   prot & 0x7U, flags, "[mmap]");
+    /* RC-U3: track file-backed maps for pwrite/ftruncate hooks, and union
+     * the host pages on Regime A2 (the 4 KiB mmap rounds to the host
+     * page, so neighbours share it). */
+    if ((flags & RT32_MAP_ANONYMOUS) == 0U && fd >= 0) {
+        uint8_t kind = ((flags & 0x01U) != 0U) ? I686_BACKING_SHARED_FILE
+                                              : I686_BACKING_PRIVATE_FILE;
+        i686_vm_file_track_map(fd, target_va, (size_t)aligned_len,
+                               (uint64_t)pgoffset * 4096u, kind);
+    }
+    vm_union_protect_a2(ctx, target_va,
+                        (uint32_t)((uint64_t)target_va + aligned_len));
     return target_va;
 }
 
@@ -721,6 +790,17 @@ static int vm_mprotect_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len, uint
         end64 > (uint64_t)I686_TASK_SIZE_TOP ||
         !vm_check_mapped_range_locked(addr, (uint32_t)end64, NULL, NULL, NULL, 0U)) {
         return -ENOMEM;
+    }
+
+    /* RC-U3 P1: on Regime A2 the 4 KiB mprotect would round to (and
+     * fault on) the host page; the region tables (synced by
+     * vm_mprotect_regions_locked) drive the union instead. */
+    if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
+        vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
+        if (i686_vm32_union_prot(ctx, addr, (uint32_t)end64) != 0) {
+            return -EIO;
+        }
+        return 0;
     }
 
     if (mprotect(i686_guest_ptr(ctx, addr), (size_t)aligned_len, i686_host_prot(ctx, prot)) != 0) {
@@ -769,6 +849,9 @@ static int vm_munmap_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len)
 
     uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
     vm_unmap_regions_locked(start, end);
+    /* RC-U3: drop file-map tracking and sync the prot tables. */
+    i686_vm_file_untrack_map(start, (size_t)aligned_len);
+    vm_file_sync_prot_locked(start, end);
     if (g_vm_mmap_cursor == end && start >= RT32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
     }

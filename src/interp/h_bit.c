@@ -76,13 +76,32 @@ static int bt_common(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mode,
         uint8_t *p = (uint8_t *)i686_guest_ptr(ctx, ea + byte_off);
         unsigned bitpos = index & 7U;
 
-        bit = (uint32_t)(*p >> bitpos) & 1U;
-        if (mode == (unsigned)BT_SET) {
-            *p = (uint8_t)(*p | (uint8_t)(1U << bitpos));
-        } else if (mode == (unsigned)BT_RESET) {
-            *p = (uint8_t)(*p & (uint8_t)~(uint8_t)(1U << bitpos));
-        } else if (mode == (unsigned)BT_COMPLEMENT) {
-            *p = (uint8_t)(*p ^ (uint8_t)(1U << bitpos));
+        if (insn->pfx_lock != 0U && mode != (unsigned)BT_TEST) {
+            /* RC-U3 P1: LOCK BTS/BTR/BTC are atomic SEQ_CST RMWs;
+             * CF extracts the old bit.  Single-byte: always aligned. */
+            uint8_t mask = (uint8_t)(1U << bitpos);
+            uint8_t old;
+            if (mode == (unsigned)BT_SET) {
+                old = __atomic_fetch_or(p, mask, __ATOMIC_SEQ_CST);
+            } else if (mode == (unsigned)BT_RESET) {
+                old = __atomic_fetch_and(p, (uint8_t)~mask,
+                                         __ATOMIC_SEQ_CST);
+            } else {
+                old = __atomic_fetch_xor(p, mask, __ATOMIC_SEQ_CST);
+            }
+            bit = (uint32_t)(old >> bitpos) & 1U;
+        } else if (insn->pfx_lock != 0U) {
+            bit = (uint32_t)(__atomic_load_n(p, __ATOMIC_SEQ_CST) >>
+                             bitpos) & 1U;
+        } else {
+            bit = (uint32_t)(*p >> bitpos) & 1U;
+            if (mode == (unsigned)BT_SET) {
+                *p = (uint8_t)(*p | (uint8_t)(1U << bitpos));
+            } else if (mode == (unsigned)BT_RESET) {
+                *p = (uint8_t)(*p & (uint8_t)~(uint8_t)(1U << bitpos));
+            } else if (mode == (unsigned)BT_COMPLEMENT) {
+                *p = (uint8_t)(*p ^ (uint8_t)(1U << bitpos));
+            }
         }
     }
 

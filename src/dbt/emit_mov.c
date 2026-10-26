@@ -22,11 +22,11 @@
  *
  * Wave U3 (lane u3-i686, UNIFICATION-PLAN 4.3.3): every PUSH/POP records
  * a 24-byte relative dbt_mem_site_t (dbt/aot/aot.h) with sp_rollback_delta
- * so the shared fault landing pad (i686_emit_fault_landing below) can undo
- * the pre-store ESP decrement before the guest signal is raised
- * (No-Double-Side-Effect rule). CALL/RET sites use the same record shape
- * and landing pad; their emitters live in emit_branch.c (owning lane fills
- * npc_delta / NPC_STATIC_TARGET there).
+ * so the engine fault path (src/dbt/engine.c) can undo the pre-store ESP
+ * decrement before the guest signal is raised (No-Double-Side-Effect
+ * rule).  RC-U3 records the real guest_pc_delta via the site_pc cursor
+ * below.  CALL/RET sites use the same record shape; their emitters live
+ * in emit_branch.c.
  *
  * Declined forms (return -1; translate.c ends the block with UNDEF and
  * the engine interprets one insn, D2 — declining is always safe):
@@ -87,6 +87,57 @@ void i686_emit_fault_landing(i686_emit_ctx_t *e)
  * matching the frozen exit epilogue's own w8/w9/w10 use). */
 #define SCR0 8U
 #define SCR1 9U
+
+/* Per-block guest-PC cursor for real guest_pc_delta (RC-U3): the frozen
+ * emitter API carries no per-insn PC, so walk x86_decode forward from
+ * the block base in emission order.  Keyed on (ctx, block base, code
+ * buffer): a new key means a new translation, reset to the base.  Each
+ * site-emitting insn advances past exactly one matching op+len, so
+ * repeated same-op insns attribute in order; a failed walk keeps
+ * I686_SITE_PC_UNKNOWN. */
+static const i686_ctx_t *s_pc_ctx;
+static uint32_t s_pc_base;
+static const void *s_pc_buf;
+static uint32_t s_pc_cur;
+
+static uint32_t site_pc(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    uint32_t pc;
+    unsigned n;
+
+    if (e->ctx != s_pc_ctx || e->guest_eip != s_pc_base ||
+        e->buf.words != s_pc_buf) {
+        s_pc_ctx = e->ctx;
+        s_pc_base = e->guest_eip;
+        s_pc_buf = e->buf.words;
+        s_pc_cur = e->guest_eip;
+    }
+    pc = s_pc_cur;
+    for (n = 0U; n < 64U; n++) { /* I686_DBT_MAX_INSNS bound */
+        x86_insn_t w;
+        if (x86_decode(e->ctx, pc, &w) != 0) {
+            break;
+        }
+        if (w.op == insn->op && w.len == insn->len) {
+            s_pc_cur = pc + (uint32_t)w.len;
+            return pc;
+        }
+        pc += (uint32_t)w.len;
+    }
+    return UINT32_MAX;
+}
+
+static uint16_t site_pc_delta(i686_emit_ctx_t *e, const x86_insn_t *insn)
+{
+    uint32_t pc = site_pc(e, insn);
+    if (pc == UINT32_MAX || pc < e->guest_eip) {
+        return I686_SITE_PC_UNKNOWN;
+    }
+    if (pc - e->guest_eip > 0xFFF0U) {
+        return I686_SITE_PC_UNKNOWN;
+    }
+    return (uint16_t)(pc - e->guest_eip);
+}
 
 /* 0xFF sentinel in the frozen x86_insn_t (ea_base/ea_index/pfx_seg none). */
 #define NONE 0xFFU
@@ -462,7 +513,7 @@ static void emit_push_store(i686_emit_ctx_t *e, const x86_insn_t *insn,
     site.seq_start_offset = (uint16_t)seq;
     site.host_insn_offset = (uint16_t)mem;
     site.cont_insn_offset = (uint16_t)cont;
-    site.guest_pc_delta = I686_SITE_PC_UNKNOWN; /* patched by translate lane */
+    site.guest_pc_delta = site_pc_delta(e, insn); /* real PC, RC-U3 */
     site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
                      ((uint32_t)insn->pfx_lock << 16);
     site.sp_rollback_delta = (int16_t)(-(int32_t)bytes);
@@ -545,7 +596,7 @@ static int em_pop_gv(i686_emit_ctx_t *e, const x86_insn_t *insn)
     site.seq_start_offset = (uint16_t)seq;
     site.host_insn_offset = (uint16_t)seq;
     site.cont_insn_offset = (uint16_t)cont;
-    site.guest_pc_delta = I686_SITE_PC_UNKNOWN; /* patched by translate lane */
+    site.guest_pc_delta = site_pc_delta(e, insn); /* real PC, RC-U3 */
     site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
                      ((uint32_t)insn->pfx_lock << 16);
     site.sp_rollback_delta = 0;

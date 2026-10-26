@@ -69,8 +69,33 @@ int i686_vm_file_map_private(uint64_t arena_base, uint32_t gva, size_t len,
 
 /* Ordered shrink-then-regrow hook (5.1.3): on ftruncate(fd, S_shrink),
  * discard (zero + mark CLEAN) MAP_PRIVATE pages wholly at or past
- * align_up(S_shrink); partial final dirty pages are preserved. */
+ * align_up(S_shrink); partial final dirty pages are preserved.
+ * RC-U3: shrink_size is a FILE OFFSET (not a guest VA); map_file_offset
+ * translates it into the mapping (cut = map_start + align_up(shrink -
+ * file_offset), clamped to the map). */
 void i686_vm_file_note_shrink(uint64_t arena_base, uint32_t map_start,
-                              size_t map_len, uint64_t shrink_size);
+                              size_t map_len, uint64_t map_file_offset,
+                              uint64_t shrink_size);
+
+/* Pure cut computation for the shrink hook: the first guest VA at or
+ * past the shrink point, or map_end when nothing is cut. */
+uint32_t i686_vm_file_shrink_cut(uint32_t map_start, size_t map_len,
+                                 uint64_t map_file_offset,
+                                 uint64_t shrink_size);
+
+/* Track / untrack a file-backed mapping for the pwrite/ftruncate hooks.
+ * kind is an i686_backing_kind_t.  Returns 0 on success, -1 when the
+ * fixed registry is full (best effort: the hooks then skip the map). */
+int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
+                           uint64_t file_offset, uint8_t kind);
+void i686_vm_file_untrack_map(uint32_t gva, size_t len);
+
+/* pwrite hook: re-read overlapped MAP_PRIVATE CLEAN pages from fd so
+ * they observe the new file bytes.  Returns pages refreshed. */
+size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len);
+
+/* ftruncate hook: shrink every tracked MAP_PRIVATE map on fd to
+ * new_size via the shrink hook above.  Returns maps shrunk. */
+size_t i686_vm_file_note_ftruncate(int fd, uint64_t new_size);
 
 #endif /* I686RT_VM_FILE_H */

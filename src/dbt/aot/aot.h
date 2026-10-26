@@ -20,8 +20,11 @@
 #ifndef I686RT_DBT_AOT_H
 #define I686RT_DBT_AOT_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "i686rt.h"
 
 /* Guest PC resolution mode for a faulting site. */
 typedef enum {
@@ -124,5 +127,34 @@ static inline uint32_t i686_aot_apply_rollback(uint32_t sp, int16_t delta)
 {
     return (uint32_t)((int64_t)(int32_t)sp - (int64_t)delta);
 }
+
+/* ---- RC-U3 fault-safe split-lock + site lookup (lane rc-u3-i686) ----
+ * Unaligned LOCK RMWs and unaligned CMPXCHG8B serialize on one lane
+ * split lock with byte-wise access so AArch64 LDXR/STXR never sees an
+ * unaligned address.  The interp fault checkpoint releases the lock when
+ * a fault strands it mid-section (same thread: the signal longjmps out
+ * of the locked region on the faulting thread itself). */
+
+/* Number of ring entries ever recorded (monotonic sequence counter). */
+size_t i686_aot_ring_count(void);
+
+/* Copy ring sequence number seq (0 <= seq < ring_count) when its slot
+ * still holds that generation (else the ring wrapped: return 0). */
+int i686_aot_ring_at(size_t seq, dbt_mem_site_t *out);
+
+/* Lane split lock (fault-safe: see release_if_held). */
+void i686_split_lock_acquire(void);
+void i686_split_lock_release(void);
+void i686_split_lock_release_if_held(void);
+
+/* True when [p, p + width/8) is not naturally aligned (width in bits:
+ * 8, 16, or 32).  8-bit accesses are always aligned. */
+bool i686_mem_is_unaligned(const void *p, unsigned width);
+
+/* True when every byte of [ea, ea + bytes) is covered by a guest region
+ * with PROT_READ | PROT_WRITE (ctx mirror).  Used to pre-validate an
+ * unaligned span BEFORE taking the split lock. */
+bool i686_span_mapped_writable(const i686_ctx_t *ctx, uint32_t ea,
+                               unsigned bytes);
 
 #endif /* I686RT_DBT_AOT_H */

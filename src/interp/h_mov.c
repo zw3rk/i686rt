@@ -350,15 +350,19 @@ static int h_xlat(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 /* All pushes/pops run against SS.  ESP arithmetic wraps at 32 bits; the
  * 66 prefix narrows the pushed/pop width to 2 bytes but ESP stays the
- * full 32-bit register (32-bit mode stack). */
+ * full 32-bit register (32-bit mode stack).
+ *
+ * RC-U3: the faultable memory access runs BEFORE ESP commits (like
+ * stack_push in h_branch.c), so a faulting PUSH/POP leaves ESP
+ * untouched; the run-loop catch restores ESP/EBP as a backstop. */
 /* width in BITS (8/16/32), consistent with the frozen accessors. */
 static void push_val(i686_ctx_t *ctx, uint32_t val, unsigned width)
 {
     unsigned bytes = width / 8U;
     uint32_t esp = ctx->gpr[I686_REG_ESP] - bytes;
 
-    ctx->gpr[I686_REG_ESP] = esp;
     mem_write(ctx, ctx->seg_base[I686_SEG_SS] + esp, bytes, val);
+    ctx->gpr[I686_REG_ESP] = esp;
 }
 
 static uint32_t pop_val(i686_ctx_t *ctx, unsigned width)
@@ -472,34 +476,50 @@ static int h_popa(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_enter(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     unsigned w = opsz(insn);
+    unsigned bytes = w / 8U; /* RC-U3: byte width, not bit width */
     uint32_t size = insn->imm & 0xffffU;
     uint32_t level = (insn->imm >> 16) & 0x1fU;
     uint32_t ebp = ctx->gpr[I686_REG_EBP];
     uint32_t ss = ctx->seg_base[I686_SEG_SS];
+    uint32_t esp = ctx->gpr[I686_REG_ESP];
     uint32_t frame;
 
-    push_val(ctx, ebp, w);
-    frame = ctx->gpr[I686_REG_ESP];
+    /* Fault-safe: frame accesses run against the local esp; ctx ESP/EBP
+     * commit only after the last faultable access (catch restores). */
+    esp -= bytes;
+    mem_write(ctx, ss + esp, bytes, x86_reg_read(ctx, I686_REG_EBP, w));
+    frame = esp;
     for (uint32_t i = 1U; i < level; i++) {
-        ebp -= w;
-        push_val(ctx, mem_read(ctx, ss + ebp, w), w);
+        uint32_t disp;
+        ebp -= bytes;
+        disp = mem_read(ctx, ss + ebp, bytes);
+        esp -= bytes;
+        mem_write(ctx, ss + esp, bytes, disp);
     }
     if (level > 0U) {
-        push_val(ctx, frame, w);
+        esp -= bytes;
+        mem_write(ctx, ss + esp, bytes, frame);
     }
     ctx->gpr[I686_REG_EBP] = frame;
-    ctx->gpr[I686_REG_ESP] -= size;
+    ctx->gpr[I686_REG_ESP] = esp - size;
     return interp_done(ctx, insn);
 }
 
 /* C9: MOV SP/ESP, BP/EBP then POP BP/EBP (writes at operand-size width,
- * preserving the upper register bits in the 16-bit form). */
+ * preserving the upper register bits in the 16-bit form).  The pop
+ * reads before ESP commits, so a fault leaves ESP/EBP untouched. */
 static int h_leave(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     unsigned w = opsz(insn);
+    unsigned bytes = w / 8U;
+    uint32_t esp = (w == 16U)
+                       ? ((ctx->gpr[I686_REG_ESP] & 0xffff0000U) |
+                          x86_reg_read(ctx, I686_REG_EBP, w))
+                       : x86_reg_read(ctx, I686_REG_EBP, w);
+    uint32_t v = mem_read(ctx, ctx->seg_base[I686_SEG_SS] + esp, bytes);
 
-    x86_reg_write(ctx, I686_REG_ESP, w, x86_reg_read(ctx, I686_REG_EBP, w));
-    x86_reg_write(ctx, I686_REG_EBP, w, pop_val(ctx, w));
+    ctx->gpr[I686_REG_ESP] = esp + bytes;
+    x86_reg_write(ctx, I686_REG_EBP, w, v);
     return interp_done(ctx, insn);
 }
 
