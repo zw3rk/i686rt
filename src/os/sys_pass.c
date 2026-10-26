@@ -85,6 +85,7 @@
 #include "os/marshal.h"
 #include "os/proc.h"
 #include "os/threads.h"
+#include "vm/vm_file.h"
 #include <sys/ioctl.h>
 #include <sys/mman.h> /* msync(2) */
 #include <sys/resource.h>
@@ -1827,8 +1828,16 @@ static long sys_pwrite64(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
     if (count > 0U && buf_va < 0x1000U) {
         return -EFAULT;
     }
-    return host_ret_(pwrite((int)fd, i686_guest_ptr(ctx, buf_va),
-                            (size_t)count, pos));
+    {
+        long rc = host_ret_(pwrite((int)fd, i686_guest_ptr(ctx, buf_va),
+                                   (size_t)count, pos));
+        /* RC-U3 P1: refresh MAP_PRIVATE CLEAN pages that observed the
+         * old file bytes. */
+        if (rc > 0) {
+            i686_vm_file_note_pwrite((int)fd, (uint64_t)pos, (size_t)rc);
+        }
+        return rc;
+    }
 }
 
 static int64_t r_pread64(i686_ctx_t *ctx)
@@ -1854,7 +1863,13 @@ static int64_t r_ftruncate64(i686_ctx_t *ctx)
 {
     off_t len = (off_t)(((uint64_t)ctx->gpr[I686_REG_EDX] << 32) |
                         (uint64_t)ctx->gpr[I686_REG_ECX]);
-    return host_ret_(ftruncate((int)ctx->gpr[I686_REG_EBX], len));
+    long rc = host_ret_(ftruncate((int)ctx->gpr[I686_REG_EBX], len));
+    /* RC-U3 P1: discard MAP_PRIVATE pages wholly past the new EOF. */
+    if (rc == 0 && len >= 0) {
+        i686_vm_file_note_ftruncate((int)ctx->gpr[I686_REG_EBX],
+                                    (uint64_t)len);
+    }
+    return (int64_t)rc;
 }
 
 static int64_t r_ioctl(i686_ctx_t *ctx)

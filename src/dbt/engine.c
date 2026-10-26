@@ -17,12 +17,17 @@
  */
 
 #include <setjmp.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 
+#include "dbt/aot/aot.h"
 #include "dbt/emit.h"
 #include "interp/interp.h"
+
+extern uint64_t i686_fault_host_pc(void);
 
 uint32_t i686_jit_run_block(i686_ctx_t *ctx, const void *code_ptr,
                             void *cur_entry, const void *epoch_ptr);
@@ -170,10 +175,17 @@ static void dbt_ibtc_sever(i686_ctx_t *ctx, uint32_t eip)
 /* D11: drop every translated block with eip in [start,end), unprotect
  * the pages, and clear IBTC/RAS entries that may chain into the freed
  * code (use-after-free guard). */
+/* RC-U3 stack-site index (lane rc-u3-i686): each translated block's
+ * ring slice, so the fault path maps host PC -> site.  Forward decls;
+ * definitions sit beside dbt_get_or_compile below. */
+static void dbt_sites_clear_range(uint32_t start, uint32_t end);
+static void dbt_sites_clear_all(void);
+
 void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start, uint32_t end)
 {
     uint32_t page;
 
+    dbt_sites_clear_range(start, end);
     for (page = start & ~(SMC_PAGE - 1U); page < end; page += SMC_PAGE) {
         if (!smc_page_marked(page)) {
             continue;
@@ -235,6 +247,7 @@ int i686_dbt_smc_write_fault(uint64_t host_addr)
         return 0;
     }
     smc_page_unmark(page);
+    dbt_sites_clear_range(page, page + SMC_PAGE);
     (void)mprotect((void *)(uintptr_t)(s_smc_window_base + page), SMC_PAGE,
                    PROT_READ | PROT_WRITE);
     /* Drop this page's translated blocks AND any IBTC/RAS entries that
@@ -297,6 +310,7 @@ void i686_dbt_trace_enable(int on)
  * execute the previous image's stale blocks. */
 void i686_dbt_flush_all(void)
 {
+    dbt_sites_clear_all();
     for (size_t i = 0U; i < DBT_HT_SIZE; i++) {
         if (s_ht[i].len != 0U) {
             munmap(s_ht[i].code, s_ht[i].cap);
@@ -322,6 +336,126 @@ void i686_dbt_flush_all(void)
 static uint32_t dbt_hash(uint32_t eip)
 {
     return (eip >> 2U) & (DBT_HT_SIZE - 1U);
+}
+
+/* RC-U3 stack-site index: the ring slice [start, end) (sequence numbers
+ * from i686_aot_ring_count) recorded by the last translation cached in
+ * each direct-mapped slot, plus that block's base EIP. */
+static uint64_t s_site_start[DBT_HT_SIZE];
+static uint64_t s_site_end[DBT_HT_SIZE];
+static uint32_t s_site_eip[DBT_HT_SIZE];
+
+static void dbt_sites_clear_hash(uint32_t h)
+{
+    s_site_start[h] = 0U;
+    s_site_end[h] = 0U;
+    s_site_eip[h] = 0xFFFFFFFFU;
+}
+
+static void dbt_sites_clear_range(uint32_t start, uint32_t end)
+{
+    uint32_t h;
+    for (h = 0U; h < DBT_HT_SIZE; h++) {
+        if (s_site_end[h] > s_site_start[h] && s_site_eip[h] >= start &&
+            s_site_eip[h] < end) {
+            dbt_sites_clear_hash(h);
+        }
+    }
+}
+
+static void dbt_sites_clear_all(void)
+{
+    uint32_t h;
+    for (h = 0U; h < DBT_HT_SIZE; h++) {
+        dbt_sites_clear_hash(h);
+    }
+}
+
+/* Fault recovery (RC-U3 P1): map the faulting host PC to its stack site
+ * and recover.  ctx->eip becomes the faulting guest PC (block base +
+ * guest_pc_delta) and ctx ESP replays the block's committed stack
+ * effects, with the faulting site's pre-commit delta undone through
+ * i686_aot_apply_rollback.  ctx GPRs hold block-entry state (the
+ * trampoline spills only on clean exits), so block-entry ESP is already
+ * the pre-commit value; the explicit rollback documents and enforces
+ * the No-Double-Side-Effect invariant.  Without a matching site the
+ * state is left untouched. */
+static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
+{
+    uint32_t h = DBT_HT_SIZE;
+    uint32_t i;
+    uint32_t base;
+    uint64_t start;
+    uint64_t end;
+    uint64_t seq;
+    uint32_t esp;
+    uint32_t fault_off;
+    dbt_mem_site_t fault_site;
+    bool have_site = false;
+
+    if (host_pc == 0U) {
+        return;
+    }
+    for (i = 0U; i < DBT_HT_SIZE; i++) {
+        uint64_t lo = (uint64_t)(uintptr_t)s_ht[i].code;
+        if (s_ht[i].len != 0U && host_pc >= lo &&
+            host_pc < lo + (uint64_t)s_ht[i].len) {
+            h = i;
+            break;
+        }
+    }
+    if (h == DBT_HT_SIZE) {
+        return;
+    }
+    base = s_ht[h].eip;
+    start = s_site_start[h];
+    end = s_site_end[h];
+    if (end <= start || s_site_eip[h] != base) {
+        return;
+    }
+    fault_off = (uint32_t)(host_pc - (uint64_t)(uintptr_t)s_ht[h].code);
+    esp = ctx->gpr[I686_REG_ESP];
+    memset(&fault_site, 0, sizeof(fault_site));
+    for (seq = start; seq < end; seq++) {
+        dbt_mem_site_t s;
+        if (i686_aot_ring_at((size_t)seq, &s) == 0) {
+            break; /* recycled: stop rather than misapply */
+        }
+        if ((uint32_t)s.host_insn_offset < fault_off) {
+            /* Committed before the fault: replay the post-success ESP
+             * effect (PUSH/CALL decremented by the delta; POP/RET
+             * bumped by the width). */
+            if ((s.flags & I686_SITE_PRE_COMMITTED_SP) != 0U) {
+                esp = (uint32_t)((int64_t)(int32_t)esp +
+                                 (int64_t)s.sp_rollback_delta);
+            } else {
+                esp += (uint32_t)s.width;
+            }
+            continue;
+        }
+        if ((uint32_t)s.host_insn_offset == fault_off) {
+            fault_site = s;
+            have_site = true;
+        }
+        break;
+    }
+    if (!have_site) {
+        return;
+    }
+    if (fault_site.guest_pc_delta != I686_SITE_PC_UNKNOWN) {
+        ctx->eip = base + (uint32_t)fault_site.guest_pc_delta;
+    }
+    if ((fault_site.flags & I686_SITE_PRE_COMMITTED_SP) != 0U) {
+        /* Live ESP at the fault already included this site's pre-commit
+         * decrement; ctx holds the pre-commit value, so reconstruct the
+         * live value and undo it explicitly. */
+        uint32_t live = (uint32_t)((int64_t)(int32_t)esp +
+                                   (int64_t)fault_site.sp_rollback_delta);
+        ctx->gpr[I686_REG_ESP] =
+            i686_aot_apply_rollback(live, fault_site.sp_rollback_delta);
+    } else {
+        ctx->gpr[I686_REG_ESP] = esp;
+    }
 }
 
 static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
@@ -358,19 +492,27 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
         uint8_t *code = mmap(NULL, cap, PROT_READ | PROT_WRITE | PROT_EXEC,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         size_t len;
+        size_t ring_before;
         if (code == MAP_FAILED) {
             return NULL;
         }
+        ring_before = i686_aot_ring_count();
         len = i686_dbt_translate(ctx, eip, code, cap);
         if (len == 0U) {
             munmap(code, cap);
+            dbt_sites_clear_hash(dbt_hash(eip));
             return NULL;
         }
         if (len < cap) {
+            uint32_t h = dbt_hash(eip);
             e->eip = eip;
             e->len = (uint32_t)len;
             e->code = code;
             e->cap = cap;
+            /* RC-U3: index this block's stack-site ring slice. */
+            s_site_start[h] = (uint64_t)ring_before;
+            s_site_end[h] = (uint64_t)i686_aot_ring_count();
+            s_site_eip[h] = eip;
             /* C6b: publish the IBTC slot so the trampoline links BRANCH
              * exits straight into this block.  epoch=1 marks a live
              * install; dead-marked slots refill only here (a fresh
@@ -429,6 +571,9 @@ int i686_dbt_run(i686_ctx_t *ctx)
         } else {
             ctx->fault_addr = (uint32_t)fa;
         }
+        /* RC-U3 P1: recover the faulting guest PC and ESP from the
+         * block's stack-site table (undoes pre-commit SP adjustments). */
+        i686_dbt_recover_fault(ctx, i686_fault_host_pc());
         if (i686_deliver_sync(ctx, I686_EXIT_FAULT) == 0) {
             goto dispatch; /* guest handler installed; resume at it */
         }

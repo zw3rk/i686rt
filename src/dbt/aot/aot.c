@@ -48,6 +48,98 @@ size_t i686_aot_note_stack_site(const dbt_mem_site_t *site)
     return slot;
 }
 
+size_t i686_aot_ring_count(void)
+{
+    return (size_t)s_ring_next;
+}
+
+int i686_aot_ring_at(size_t seq, dbt_mem_site_t *out)
+{
+    size_t slot;
+    if (seq >= (size_t)s_ring_next) {
+        return 0;
+    }
+    slot = seq % I686_AOT_SITE_RING;
+    if (s_ring_gen[slot] != (uint64_t)seq) {
+        return 0; /* wrapped: never misapply a recycled slot */
+    }
+    if (out != NULL) {
+        *out = s_ring[slot];
+    }
+    return 1;
+}
+
+/* Lane split lock: the same serialization the unaligned CMPXCHG8B path
+ * always used, now shared with unaligned LOCK RMWs.  Held-state is
+ * per-thread so the fault checkpoint only releases a lock this thread
+ * stranded (never a live peer's). */
+static _Atomic uint32_t s_split_lock;
+static __thread int t_split_held;
+
+void i686_split_lock_acquire(void)
+{
+    i686_spin_lock(&s_split_lock);
+    t_split_held = 1;
+}
+
+void i686_split_lock_release(void)
+{
+    t_split_held = 0;
+    i686_spin_unlock(&s_split_lock);
+}
+
+void i686_split_lock_release_if_held(void)
+{
+    if (t_split_held != 0) {
+        t_split_held = 0;
+        i686_spin_unlock(&s_split_lock);
+    }
+}
+
+bool i686_mem_is_unaligned(const void *p, unsigned width)
+{
+    uintptr_t a;
+    unsigned bytes;
+    if (width <= 8U) {
+        return false;
+    }
+    bytes = width / 8U;
+    a = (uintptr_t)p;
+    return (a & (uintptr_t)(bytes - 1U)) != 0U;
+}
+
+bool i686_span_mapped_writable(const i686_ctx_t *ctx, uint32_t ea,
+                               unsigned bytes)
+{
+    uint64_t end;
+    uint32_t cur;
+    size_t i;
+    if (ctx == NULL || bytes == 0U) {
+        return false;
+    }
+    end = (uint64_t)ea + (uint64_t)bytes;
+    if (end > UINT64_C(0x100000000)) {
+        return false;
+    }
+    cur = ea;
+    while (cur < (uint32_t)end) {
+        bool ok = false;
+        for (i = 0U; i < ctx->region_count; i++) {
+            const i686_region_t *r = &ctx->regions[i];
+            if (r->start <= cur && r->end > cur &&
+                (r->prot & 0x3U) == 0x3U) {
+                cur = r->end;
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
 uint64_t i686_aot_site_generation(size_t slot)
 {
     if (slot >= I686_AOT_SITE_RING) {

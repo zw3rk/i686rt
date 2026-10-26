@@ -91,7 +91,7 @@ $(OBJ_DIR)/%.o: src/%.c $(HDRS)
 test: ## Run the test suite (none yet; fixtures arrive in Phase 1)
 	@echo "phase 0: no tests yet"
 
-check: test ## Alias for test
+check: check-line-limits test-u3 ## Run line limits + host unit tests (RC-U3)
 
 test-p0-lima: ## Phase 0 Lima placeholder; the real RC0 check is nix build .#i686rt
 	@echo "phase 0: no test yet (RC0 = nix build)"

@@ -40,6 +40,21 @@ static uint8_t *s_prot;   /* guest PROT_READ/PROT_WRITE per sub-page */
 static uint8_t *s_state;  /* i686_page_state_t per sub-page */
 static uint8_t *s_flags;  /* I686_PAGE_HAS_* per sub-page */
 static int s_ready;
+static uint64_t s_arena_base; /* canonical HVA base (arena_base + gva) */
+
+/* Tracked file-backed mappings for the pwrite/ftruncate hooks. */
+#define I686_FILE_MAX_MAPS 64u
+
+typedef struct {
+    int used;
+    int fd;
+    uint32_t gva;
+    size_t len;
+    uint64_t file_offset;
+    uint8_t kind;
+} file_map_t;
+
+static file_map_t s_maps[I686_FILE_MAX_MAPS];
 
 static uint32_t page_index(uint32_t gva)
 {
@@ -62,10 +77,11 @@ static void touch_span(uint32_t gva, size_t len, uint32_t *first, uint32_t *coun
 
 int i686_vm_file_init(uint64_t arena_base)
 {
-    (void)arena_base;
     if (s_ready != 0) {
+        s_arena_base = arena_base;
         return 0;
     }
+    s_arena_base = arena_base;
     s_prot = mmap(NULL, I686_FILE_NPAGES, PROT_READ | PROT_WRITE,
                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (s_prot == MAP_FAILED) {
@@ -229,30 +245,152 @@ int i686_vm_file_map_private(uint64_t arena_base, uint32_t gva, size_t len,
     return 0;
 }
 
-void i686_vm_file_note_shrink(uint64_t arena_base, uint32_t map_start,
-                              size_t map_len, uint64_t shrink_size)
+uint32_t i686_vm_file_shrink_cut(uint32_t map_start, size_t map_len,
+                                 uint64_t map_file_offset,
+                                 uint64_t shrink_size)
 {
     uint64_t map_end = (uint64_t)map_start + (uint64_t)map_len;
-    uint64_t cut = (shrink_size + 0xFFFULL) & ~0xFFFULL;
-    if (s_ready == 0 || cut >= map_end) {
+    uint64_t cut;
+    if (map_len == 0u) {
+        return map_start;
+    }
+    if (shrink_size >= map_file_offset + (uint64_t)map_len) {
+        return (uint32_t)map_end; /* shrink at/past EOF of the map */
+    }
+    if (shrink_size <= map_file_offset) {
+        return map_start; /* whole map beyond EOF */
+    }
+    cut = (uint64_t)map_start + (((shrink_size - map_file_offset) +
+                                  0xFFFULL) & ~0xFFFULL);
+    if (cut > map_end) {
+        cut = map_end;
+    }
+    return (uint32_t)cut;
+}
+
+void i686_vm_file_note_shrink(uint64_t arena_base, uint32_t map_start,
+                              size_t map_len, uint64_t map_file_offset,
+                              uint64_t shrink_size)
+{
+    uint64_t map_end = (uint64_t)map_start + (uint64_t)map_len;
+    uint32_t cut = i686_vm_file_shrink_cut(map_start, map_len,
+                                           map_file_offset, shrink_size);
+    uint64_t a;
+    if (s_ready == 0 || (uint64_t)cut >= map_end || map_len == 0u) {
         return;
     }
-    if (cut < (uint64_t)map_start) {
-        cut = (uint64_t)map_start;
+    /* Pages wholly past EOF revert to zero-backed CLEAN so a later
+     * regrow observes fresh file bytes.  The partial page straddling
+     * shrink_size sits before the aligned cut and is preserved. */
+    for (a = (uint64_t)cut; a < map_end; a += 0x1000ULL) {
+        uint32_t idx = page_index((uint32_t)a);
+        memset((void *)(uintptr_t)(arena_base + a), 0, 0x1000u);
+        s_state[idx] = 1u; /* I686_PAGE_COW_CLEAN, write_tag off */
     }
-    /* Wholly-removed MAP_PRIVATE pages revert to zero-backed CLEAN so a
-     * later regrow observes fresh file bytes; partial final dirty pages
-     * (containing < shrink_size bytes) are preserved. */
-    for (uint64_t a = cut; a < map_end; a += 0x1000ULL) {
-        uint32_t gva = (uint32_t)a;
-        uint32_t idx = page_index(gva);
-        if (s_state[idx] == 2u && a >= cut + 0x1000ULL) {
-            memset((void *)(uintptr_t)(arena_base + a), 0, 0x1000u);
-            s_state[idx] = 1u;
-        } else if (s_state[idx] == 2u && a == cut &&
-                   (shrink_size & 0xFFFULL) == 0u) {
-            memset((void *)(uintptr_t)(arena_base + a), 0, 0x1000u);
-            s_state[idx] = 1u;
+}
+
+int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
+                           uint64_t file_offset, uint8_t kind)
+{
+    uint32_t i;
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        if (s_maps[i].used == 0) {
+            s_maps[i].used = 1;
+            s_maps[i].fd = fd;
+            s_maps[i].gva = gva;
+            s_maps[i].len = len;
+            s_maps[i].file_offset = file_offset;
+            s_maps[i].kind = kind;
+            return 0;
         }
     }
+    return -1;
+}
+
+void i686_vm_file_untrack_map(uint32_t gva, size_t len)
+{
+    uint64_t end = (uint64_t)gva + (uint64_t)len;
+    uint32_t i;
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        uint64_t m_end;
+        if (s_maps[i].used == 0) {
+            continue;
+        }
+        m_end = (uint64_t)s_maps[i].gva + (uint64_t)s_maps[i].len;
+        if ((uint64_t)s_maps[i].gva < end && m_end > (uint64_t)gva) {
+            s_maps[i].used = 0;
+        }
+    }
+}
+
+size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len)
+{
+    uint64_t w_end = file_offset + (uint64_t)len;
+    size_t refreshed = 0u;
+    uint32_t i;
+    if (s_ready == 0 || len == 0u) {
+        return 0u;
+    }
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        uint64_t m_start;
+        uint64_t m_end;
+        uint64_t o_start;
+        uint64_t o_end;
+        uint64_t f;
+        if (s_maps[i].used == 0 || s_maps[i].fd != fd ||
+            s_maps[i].kind != 1u) { /* MAP_PRIVATE file image only */
+            continue;
+        }
+        m_start = s_maps[i].file_offset;
+        m_end = m_start + (uint64_t)s_maps[i].len;
+        o_start = (file_offset > m_start) ? file_offset : m_start;
+        o_end = (w_end < m_end) ? w_end : m_end;
+        if (o_end <= o_start) {
+            continue;
+        }
+        /* Re-read the overlapped CLEAN pages so they observe the new
+         * file bytes; DIRTY pages already diverged from the file. */
+        for (f = o_start & ~0xFFFULL; f < o_end; f += 0x1000ULL) {
+            uint32_t gva = s_maps[i].gva + (uint32_t)(f - m_start);
+            uint32_t idx = page_index(gva);
+            uint64_t r_start = (f > o_start) ? f : o_start;
+            uint64_t r_end = (f + 0x1000ULL < o_end) ? f + 0x1000ULL : o_end;
+            uint8_t *dst;
+            if (s_state[idx] != 1u) {
+                continue;
+            }
+            dst = (uint8_t *)(uintptr_t)(s_arena_base + (uint64_t)gva);
+            while (r_start < r_end) {
+                ssize_t n = pread(fd, dst + (r_start - (f & ~0xFFFULL)),
+                                  (size_t)(r_end - r_start),
+                                  (off_t)r_start);
+                if (n <= 0) {
+                    break;
+                }
+                r_start += (uint64_t)n;
+            }
+            refreshed++;
+        }
+    }
+    return refreshed;
+}
+
+size_t i686_vm_file_note_ftruncate(int fd, uint64_t new_size)
+{
+    size_t shrunk = 0u;
+    uint32_t i;
+    if (s_ready == 0) {
+        return 0u;
+    }
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        if (s_maps[i].used != 0 && s_maps[i].fd == fd &&
+            s_maps[i].kind == 1u && /* MAP_PRIVATE file image only */
+            new_size < s_maps[i].file_offset + (uint64_t)s_maps[i].len) {
+            i686_vm_file_note_shrink(s_arena_base, s_maps[i].gva,
+                                     s_maps[i].len, s_maps[i].file_offset,
+                                     new_size);
+            shrunk++;
+        }
+    }
+    return shrunk;
 }

@@ -22,6 +22,7 @@
 #include "i686rt.h"
 #include "interp/interp.h"
 #include "rt32/rt32.h"
+#include "vm/vm32.h"
 
 extern char **environ;
 
@@ -179,7 +180,10 @@ static int run_guest(i686_ctx_t *ctx)
     int r;
 
     rt32_host_probe(ctx);
-    if (rt32_vm_init(ctx, env_window()) != 0) {
+    /* RC-U3 P1: the two-regime vm32 init (which itself reserves the 4 GiB
+     * window via rt32_vm_init, then selects the regime from the host
+     * page size and allocates the Soft-TLB/file tables on A2). */
+    if (i686_vm32_init(ctx, env_window()) != 0) {
         (void)fprintf(stderr, "i686rt: guest window init failed\n");
         return -1;
     }
