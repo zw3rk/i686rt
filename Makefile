@@ -34,8 +34,19 @@ endif
 # with lane L0a, so pre-merge this globs to nothing and main.c builds alone.
 # Wave U3 (lane u3-i686): src/vm/ (two-regime vm32 + Provider A) and
 # src/dbt/aot/ (relative site-table serializer) join the build.
+# Exactly one host backend group joins the build (all define the same
+# backend symbols). Selected from the compiler target triple so
+# cross-builds get the Linux group even when the build host is Darwin.
+U3_PROBE_CC := $(or $(CC),cc)
+ifeq ($(findstring darwin,$(shell $(U3_PROBE_CC) -dumpmachine 2>/dev/null)),darwin)
+U3_BACKEND_SRCS := src/os/backend_darwin.c src/os/backend_darwin_io.c \
+        src/os/backend_darwin_net.c
+else
+U3_BACKEND_SRCS := src/os/backend_linux.c src/os/backend_linux_sys.c
+endif
+U3_OS_SRCS := $(filter-out src/os/backend_linux.c src/os/backend_linux_sys.c src/os/backend_darwin.c src/os/backend_darwin_io.c src/os/backend_darwin_net.c,$(wildcard src/os/*.c)) $(U3_BACKEND_SRCS)
 SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
-        $(wildcard src/interp/*.c) $(wildcard src/os/*.c) \
+        $(wildcard src/interp/*.c) $(U3_OS_SRCS) \
         $(wildcard src/vm/*.c) \
         $(wildcard src/dbt/*.c) $(wildcard src/dbt/aot/*.c) src/trampoline.S
 HDRS := src/i686rt.h include/a32host.h $(wildcard src/rt32/*.h) \
@@ -51,7 +62,7 @@ help: ## Show available build and verification targets
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 SRCS_X64 := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
-        $(wildcard src/interp/*.c) $(wildcard src/os/*.c) \
+        $(wildcard src/interp/*.c) $(U3_OS_SRCS) \
         $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)
 SRCS_X64 := $(filter-out src/rt32/rt32_a64_emit.c,$(SRCS_X64))
 OBJS_X64  := $(patsubst src/%.c,$(OBJ_DIR)-x64/%.o,$(SRCS_X64))
