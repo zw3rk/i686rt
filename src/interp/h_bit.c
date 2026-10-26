@@ -21,6 +21,9 @@
 #include "interp/interp.h"
 #include "x86/decode.h"
 
+extern void i686_split_lock_acquire(void);
+extern void i686_split_lock_release(void);
+
 /* Operand size in bits: 66 selects 16-bit operands in flat 32-bit code. */
 static unsigned opnd_width(const x86_insn_t *insn)
 {
@@ -77,10 +80,12 @@ static int bt_common(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mode,
         unsigned bitpos = index & 7U;
 
         if (insn->pfx_lock != 0U && mode != (unsigned)BT_TEST) {
-            /* RC-U3 P1: LOCK BTS/BTR/BTC are atomic SEQ_CST RMWs;
-             * CF extracts the old bit.  Single-byte: always aligned. */
+            /* RC-U3-r3 #5: hold the split lock across the atomic byte
+             * RMW so it cannot interleave with overlapping unaligned
+             * LOCK RMWs (faults release via the interp catch path). */
             uint8_t mask = (uint8_t)(1U << bitpos);
             uint8_t old;
+            i686_split_lock_acquire();
             if (mode == (unsigned)BT_SET) {
                 old = __atomic_fetch_or(p, mask, __ATOMIC_SEQ_CST);
             } else if (mode == (unsigned)BT_RESET) {
@@ -89,6 +94,7 @@ static int bt_common(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mode,
             } else {
                 old = __atomic_fetch_xor(p, mask, __ATOMIC_SEQ_CST);
             }
+            i686_split_lock_release();
             bit = (uint32_t)(old >> bitpos) & 1U;
         } else if (insn->pfx_lock != 0U) {
             bit = (uint32_t)(__atomic_load_n(p, __ATOMIC_SEQ_CST) >>

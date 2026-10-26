@@ -338,7 +338,9 @@ size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len)
         uint64_t o_end;
         uint64_t f;
         if (s_maps[i].used == 0 || s_maps[i].fd != fd ||
-            s_maps[i].kind != 1u) { /* MAP_PRIVATE file image only */
+            (s_maps[i].kind != 1u &&
+                s_maps[i].kind != 2u)) { /* file image (private or A2
+            staged shared); anonymous mappings carry no file bytes */
             continue;
         }
         m_start = s_maps[i].file_offset;
