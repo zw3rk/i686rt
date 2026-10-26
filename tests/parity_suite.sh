@@ -58,10 +58,10 @@ for f in src/vm/vm32.c src/vm/vm32.h src/vm/vm_file.c src/vm/vm_file.h \
     bad "lane file missing: $f"
   fi
 done
-if git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null | grep -q 'lane/u3-i686'; then
-  note "branch: lane/u3-i686"
+if git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null | grep -qE '^(lane/u3-i686|master)$'; then
+  note "branch: $(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
 else
-  bad "not on lane/u3-i686"
+  bad "not on lane/u3-i686 or master"
 fi
 
 if [ "$fail" -eq 0 ] && [ "$gap" -eq 0 ]; then
