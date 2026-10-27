@@ -16,10 +16,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+long syscall(long, ...);
+#endif
 #include <unistd.h>
 
-long syscall(long, ...);
+static long sig_host_gettid(void)
+{
+#ifdef __linux__
+    return (long)syscall(SYS_gettid);
+#else
+    return (long)getpid();
+#endif
+}
+
 #include "i686rt.h"
 #include "os/marshal.h"
 #include "os/sigframe_i386.h"
@@ -264,7 +275,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
                           "sys=%08x tcb=%08x %08x %08x %08x\n"
                           "SIGGPR ax=%08x bx=%08x cx=%08x dx=%08x "
                           "si=%08x di=%08x bp=%08x\n",
-                          syscall(SYS_gettid), sig, sc.trapno, sc.eip,
+                          sig_host_gettid(), sig, sc.trapno, sc.eip,
                           sc.cr2, ctx->gpr[I686_REG_ESP], frame_va,
                           ctx->seg_sel[I686_SEG_GS],
                           ctx->seg_base[I686_SEG_GS], ret, sysinfo,

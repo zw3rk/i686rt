@@ -187,7 +187,7 @@ int rt_host_madvise(void *host_addr, size_t len, int linux_advice)
 void *rt_host_jit_alloc(size_t size)
 {
     size_t total = size + I686_JIT_HDR;
-    void *p = mmap(NULL, total, PROT_READ | PROT_WRITE,
+    void *p = mmap(NULL, total, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
     if (p == MAP_FAILED) {
         p = mmap(NULL, total, PROT_READ | PROT_WRITE,
@@ -197,6 +197,7 @@ void *rt_host_jit_alloc(size_t size)
         }
         *(uint64_t *)p = 1u;
     } else {
+        pthread_jit_write_protect_np(0);
         *(uint64_t *)p = 0u;
     }
     return (uint8_t *)p + I686_JIT_HDR;

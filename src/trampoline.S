@@ -19,8 +19,12 @@
     .text
     .align 4
     .globl i686_jit_run_block
+    .globl _i686_jit_run_block
+#ifndef __APPLE__
     .type i686_jit_run_block, %function
+#endif
 i686_jit_run_block:
+_i686_jit_run_block:
     stp     x29, x30, [sp, #-160]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
@@ -101,4 +105,6 @@ i686_jit_run_block:
     ldp     x29, x30, [sp], #160
     ret
 
+#ifndef __APPLE__
     .size i686_jit_run_block, . - i686_jit_run_block
+#endif

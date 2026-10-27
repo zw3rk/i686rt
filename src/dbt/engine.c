@@ -24,6 +24,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#ifndef MAP_JIT
+#define MAP_JIT 0x0800
+#endif
+#endif
 
 #include "dbt/aot/aot.h"
 #include "dbt/emit.h"
@@ -123,6 +130,9 @@ static void smc_protect(i686_ctx_t *ctx, uint32_t eip)
 {
     uint32_t page = eip & ~(SMC_PAGE - 1U);
 
+    if (ctx->vm_host_page > SMC_PAGE) {
+        return;
+    }
     if (!smc_page_marked(page)) {
         void *host = i686_guest_ptr(ctx, page);
         if (mprotect(host, SMC_PAGE, PROT_READ) == 0) {
@@ -341,7 +351,7 @@ void i686_dbt_flush_all(void)
 
 static uint32_t dbt_hash(uint32_t eip)
 {
-    return (eip >> 2U) & (DBT_HT_SIZE - 1U);
+    return (eip ^ (eip >> 12U)) & (DBT_HT_SIZE - 1U);
 }
 
 /* RC-U3 stack-site index: the ring slice [start, end) (sequence numbers
@@ -495,15 +505,26 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
         e->len = 0U;
     }
     for (;;) {
+#ifdef __APPLE__
+        uint8_t *code = mmap(NULL, cap, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+#else
         uint8_t *code = mmap(NULL, cap, PROT_READ | PROT_WRITE | PROT_EXEC,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
         size_t len;
         size_t ring_before;
         if (code == MAP_FAILED) {
             return NULL;
         }
+#ifdef __APPLE__
+        pthread_jit_write_protect_np(0);
+#endif
         ring_before = i686_aot_ring_count();
         len = i686_dbt_translate(ctx, eip, code, cap);
+#ifdef __APPLE__
+        pthread_jit_write_protect_np(1);
+#endif
         if (len == 0U) {
             munmap(code, cap);
             dbt_sites_clear_hash(dbt_hash(eip));
@@ -511,6 +532,9 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
         }
         if (len < cap) {
             uint32_t h = dbt_hash(eip);
+#ifdef __APPLE__
+            sys_icache_invalidate(code, len);
+#endif
             e->eip = eip;
             e->len = (uint32_t)len;
             e->code = code;

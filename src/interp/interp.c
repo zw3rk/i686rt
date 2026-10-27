@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#if defined(__linux__) && defined(__aarch64__)
+#if (defined(__linux__) || defined(__APPLE__)) && defined(__aarch64__)
 #include <sys/ucontext.h>
 #endif
 
@@ -71,6 +71,13 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
     {
         ucontext_t *uc = (ucontext_t *)uc_;
         s_fault_host_pc = (uc != NULL) ? (uint64_t)uc->uc_mcontext.pc : 0u;
+    }
+#elif defined(__APPLE__) && defined(__aarch64__)
+    {
+        ucontext_t *uc = (ucontext_t *)uc_;
+        s_fault_host_pc = (uc != NULL && uc->uc_mcontext != NULL)
+                              ? (uint64_t)uc->uc_mcontext->__ss.__pc
+                              : 0u;
     }
 #else
     (void)uc_;

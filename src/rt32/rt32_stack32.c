@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 #include "rt32.h"
 
+#include "os/backend.h"
 #include "os/proc.h"
 #include "os/vdso.h"
 
@@ -20,7 +21,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#ifdef __linux__
 #include <sys/random.h>
+#endif
 #include <unistd.h>
 
 #define RT32_STACK_TOP  0xE0000000U
@@ -92,7 +95,7 @@ int rt32_stack_setup(i686_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     uint32_t sp = RT32_STACK_TOP - 64U;
 
     uint8_t rand_bytes[16];
-    if (getrandom(rand_bytes, sizeof(rand_bytes), 0) != (ssize_t)sizeof(rand_bytes)) {
+    if (rt_host_getrandom(rand_bytes, sizeof(rand_bytes), 0) != (ssize_t)sizeof(rand_bytes)) {
         for (size_t i = 0; i < sizeof(rand_bytes); i++) {
             rand_bytes[i] = (uint8_t)(0xA5U ^ (uint8_t)(i * 17U));
         }

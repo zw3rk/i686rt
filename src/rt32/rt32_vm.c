@@ -629,6 +629,14 @@ int rt32_vm_init(i686_ctx_t *ctx, uint64_t requested_window)
                 }
             }
             if (!found) {
+                void *res = mmap(NULL, (size_t)RT32_WINDOW_SIZE, PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (res != MAP_FAILED) {
+                    ctx->guest_base = (uint64_t)(uintptr_t)res;
+                    found = true;
+                }
+            }
+            if (!found) {
                 fprintf(stderr, "i686rt: unable to find free 4 GiB guest window\n");
                 return -1;
             }

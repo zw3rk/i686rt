@@ -312,7 +312,11 @@ static int run_guest(i686_ctx_t *ctx)
 #endif
 
     if (ctx->engine < 0) {
-        ctx->engine = I686_ENGINE_INTERP; /* default oracle (D2) */
+#ifdef I686RT_NO_DBT
+        ctx->engine = I686_ENGINE_INTERP;
+#else
+        ctx->engine = I686_ENGINE_DBT;
+#endif
     }
     {
         extern void i686_threads_main_init(i686_ctx_t *);

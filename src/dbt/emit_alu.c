@@ -352,6 +352,11 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
 
     if (kind == ALUK_ADD) {
         a64_emit_add_reg_w(b, true, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
+        /* Invert C so NZCV holds C = !CF (natural SUBS polarity). */
+        a64_emit_mrs_nzcv(b, SCR_T0);
+        a64_emit_movz_w(b, SCR_T1, 0x2000U, 1U);
+        a64_emit_eor_reg_w(b, SCR_T0, SCR_T0, SCR_T1, A64_SHIFT_LSL, 0U);
+        a64_emit_msr_nzcv(b, SCR_T0);
     } else if (kind == ALUK_SUB || kind == ALUK_CMP) {
         a64_emit_sub_reg_w(b, true, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
     } else {
@@ -363,8 +368,8 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
         } else { /* ALUK_XOR */
             a64_emit_eor_reg_w(b, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
         }
-        /* x86 logic flags: C = V = 0, N/Z from the (shifted) result. */
-        a64_emit_add_imm_w(b, true, 31U, SCR_RES, 0U, 0U);
+        /* x86 logic flags: CF = OF = 0 (so SUBS C = !CF = 1), N/Z from result. */
+        a64_emit_sub_imm_w(b, true, 31U, SCR_RES, 0U, 0U);
     }
 
     if (sh != 0U) { /* un-shift A, B, RES back to width-masked values */

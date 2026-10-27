@@ -1827,6 +1827,7 @@ static int sse_emit_psubb(i686_emit_ctx_t *e, const x86_insn_t *insn)
  * 66/F2/F3 forms are undefined x86 (decline to the oracle's UNDEF). */
 static int sse_emit_prefetch(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
+    (void)e;
     if (insn->pfx_opsize != 0U || insn->pfx_rep != 0U) {
         return -1;
     }

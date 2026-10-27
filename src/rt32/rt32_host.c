@@ -32,6 +32,7 @@ void rt32_host_probe(i686_ctx_t *ctx)
         return;
     }
 
+#ifdef __linux__
     int fd = open(A32H_DEV_PATH, O_RDWR | O_CLOEXEC);
     if (fd < 0 && (errno == EACCES || errno == EPERM || errno == EROFS)) {
         fd = open(A32H_DEV_PATH, O_RDONLY | O_CLOEXEC);
@@ -48,4 +49,5 @@ void rt32_host_probe(i686_ctx_t *ctx)
     }
 
     close(fd);
+#endif
 }

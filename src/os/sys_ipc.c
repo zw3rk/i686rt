@@ -626,9 +626,14 @@ static int64_t ipc_semop(i686_ctx_t *ctx, uint32_t semid, uint32_t sops_va,
         tsp = &ts;
     }
 
+#ifdef __APPLE__
+    (void)tsp;
+    long r = semop((int)semid, sops, (size_t)nsops);
+#else
     long r = (tsp != NULL)
                  ? semtimedop((int)semid, sops, (size_t)nsops, tsp)
                  : semop((int)semid, sops, (size_t)nsops);
+#endif
     free(sops);
     return host_ret(r);
 }

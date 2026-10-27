@@ -82,6 +82,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "os/backend.h"
 #include "os/marshal.h"
 #include "os/proc.h"
 #include "os/threads.h"
@@ -90,9 +91,11 @@
 #include <sys/mman.h> /* msync(2) */
 #include <sys/resource.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/syscall.h>
 /* syscall(2) hidden under strict _POSIX_C_SOURCE in musl */
 long syscall(long, ...);
+#endif
 #ifndef __APPLE__
 /* pipe2 is GNU, hidden under strict _POSIX_C_SOURCE in musl; verbatim
  * prototype (same declare-verbatim convention as wait4 in syscalls.c).
@@ -1334,7 +1337,9 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
     struct timespec ts;
     void *arg4;
     void *huaddr2 = NULL;
+#ifdef __linux__
     long r;
+#endif
 
     if (guest_ptr_bad(uaddr)) {
         return -EFAULT;
@@ -1359,12 +1364,44 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
         }
         huaddr2 = i686_guest_ptr(ctx, uaddr2_va);
     }
+#ifdef __linux__
     r = (long)syscall(SYS_futex, i686_guest_ptr(ctx, uaddr), (unsigned int)op,
                       (unsigned int)val, arg4, huaddr2, (unsigned int)val3);
     if (r < 0) {
         return (errno == EWOULDBLOCK) ? -EAGAIN : -errno;
     }
     return r;
+#else
+    {
+        _Atomic uint32_t *hp = (_Atomic uint32_t *)i686_guest_ptr(ctx, uaddr);
+        switch (cmd) {
+        case FUTEX_WAIT_:
+        case FUTEX_WAIT_BITSET_: {
+            uint32_t bitset = (cmd == FUTEX_WAIT_BITSET_) ? val3 : 0xFFFFFFFFu;
+            int abs_time = (cmd == FUTEX_WAIT_BITSET_) ? 1 : 0;
+            int clk_rt = ((op & 256u) != 0u) ? 1 : 0;
+            return (long)rt_host_futex_wait_bitset(
+                hp, NULL, val, (arg4 != NULL) ? &ts : NULL,
+                abs_time, clk_rt, bitset, NULL, 0u);
+        }
+        case FUTEX_WAKE_:
+        case FUTEX_WAKE_BITSET_: {
+            uint32_t bitset = (cmd == FUTEX_WAKE_BITSET_) ? val3 : 0xFFFFFFFFu;
+            return (long)rt_host_futex_wake_bitset(hp, NULL, (int)val, bitset);
+        }
+        case FUTEX_REQUEUE_:
+        case FUTEX_CMP_REQUEUE_: {
+            _Atomic uint32_t *hp2 = (_Atomic uint32_t *)huaddr2;
+            uint32_t *cmp = (cmd == FUTEX_CMP_REQUEUE_) ? &val3 : NULL;
+            return (long)rt_host_futex_requeue(
+                hp, NULL, (int)val, hp2, NULL,
+                (int)ctx->gpr[I686_REG_ESI], cmp);
+        }
+        default:
+            return -ENOSYS;
+        }
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------ */

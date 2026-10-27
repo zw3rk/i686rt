@@ -35,9 +35,7 @@
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/syscall.h>
 #include <unistd.h>
-long syscall(long, ...);
 
 #include "i686rt.h"
 #include "os/syscalls_i386.h"

@@ -726,11 +726,40 @@ static int64_t sys_nanosleep(i686_ctx_t *ctx, uint32_t req_va, uint32_t rem_va)
     return -(long)errno;
 }
 
+static clockid_t host_clk_id(uint32_t clk, int *valid)
+{
+    *valid = 1;
+#ifdef __APPLE__
+    switch (clk) {
+    case 0U: /* CLOCK_REALTIME */
+    case 5U: /* CLOCK_REALTIME_COARSE */
+        return CLOCK_REALTIME;
+    case 1U: /* CLOCK_MONOTONIC */
+    case 6U: /* CLOCK_MONOTONIC_COARSE */
+    case 7U: /* CLOCK_BOOTTIME */
+        return CLOCK_MONOTONIC;
+    case 2U: /* CLOCK_PROCESS_CPUTIME_ID */
+        return CLOCK_PROCESS_CPUTIME_ID;
+    case 3U: /* CLOCK_THREAD_CPUTIME_ID */
+        return CLOCK_THREAD_CPUTIME_ID;
+    case 4U: /* CLOCK_MONOTONIC_RAW */
+        return CLOCK_MONOTONIC_RAW;
+    default:
+        *valid = 0;
+        return (clockid_t)-1;
+    }
+#else
+    return (clockid_t)(int32_t)clk;
+#endif
+}
+
 /* Shared core for clock_gettime(265)/clock_getres(266) — 32-bit tp. */
 static int64_t clock_get_common(i686_ctx_t *ctx, uint32_t clk, uint32_t tp_va,
                                 int is_res)
 {
     struct timespec ts;
+    int valid = 1;
+    clockid_t hclk;
 
     if (is_res == 0 && bad_ptr(tp_va, sizeof(i686_timespec_t))) {
         return -I686_EFAULT; /* clock_gettime dereferences tp */
@@ -739,8 +768,12 @@ static int64_t clock_get_common(i686_ctx_t *ctx, uint32_t clk, uint32_t tp_va,
         bad_ptr(tp_va, sizeof(i686_timespec_t))) {
         return -I686_EFAULT; /* clock_getres tolerates NULL tp */
     }
-    int r = (is_res != 0) ? clock_getres((clockid_t)(int32_t)clk, &ts)
-                          : clock_gettime((clockid_t)(int32_t)clk, &ts);
+    hclk = host_clk_id(clk, &valid);
+    if (!valid) {
+        return -(long)EINVAL;
+    }
+    int r = (is_res != 0) ? clock_getres(hclk, &ts)
+                          : clock_gettime(hclk, &ts);
     if (r != 0) {
         return -(long)errno;
     }
@@ -755,6 +788,8 @@ static int64_t clock_get_common64(i686_ctx_t *ctx, uint32_t clk, uint32_t tp_va,
                                   int is_res)
 {
     struct timespec ts;
+    int valid = 1;
+    clockid_t hclk;
 
     if (is_res == 0 && bad_ptr(tp_va, sizeof(i686_ts64_t))) {
         return -I686_EFAULT;
@@ -762,8 +797,12 @@ static int64_t clock_get_common64(i686_ctx_t *ctx, uint32_t clk, uint32_t tp_va,
     if (is_res != 0 && tp_va != 0U && bad_ptr(tp_va, sizeof(i686_ts64_t))) {
         return -I686_EFAULT;
     }
-    int r = (is_res != 0) ? clock_getres((clockid_t)(int32_t)clk, &ts)
-                          : clock_gettime((clockid_t)(int32_t)clk, &ts);
+    hclk = host_clk_id(clk, &valid);
+    if (!valid) {
+        return -(long)EINVAL;
+    }
+    int r = (is_res != 0) ? clock_getres(hclk, &ts)
+                          : clock_gettime(hclk, &ts);
     if (r != 0) {
         return -(long)errno;
     }

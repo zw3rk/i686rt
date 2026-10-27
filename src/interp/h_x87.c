@@ -1317,7 +1317,7 @@ static void op_fprem(i686_ctx_t *ctx, int ieee)
             /* #IA indefinite.  C2 stays clear (hardware leaves it 0;
              * musl's fmod/remainder loops spin while C2 is set).  The
              * exception flag follows the SDM: quiet-NaN inputs
-             * propagate silently (musl's special/*.h vectors expect no
+             * propagate silently (musl's special-header vectors expect no
              * flag); only SNaN operands, an infinite dividend, or a
              * zero divisor raise #IA — v1 treats every NaN as quiet. */
             if (!isnan(a) && !isnan(b)) {

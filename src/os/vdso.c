@@ -359,18 +359,20 @@ uint32_t i686_vdso_map(i686_ctx_t *ctx)
         return 0U;
     }
 
+    uint32_t gran = (ctx->vm_host_page > I686_PAGE_SIZE) ? ctx->vm_host_page : I686_PAGE_SIZE;
     uint32_t span = g_vdso.span;
+    uint32_t map_len = (span + gran - 1U) & ~(gran - 1U);
     uint32_t base = 0U;
-    uint32_t cand = VDSO_SHELF_TOP - span;
+    uint32_t cand = (VDSO_SHELF_TOP - map_len) & ~(gran - 1U);
     for (;;) {
-        if (!vdso_range_overlaps(ctx, cand, cand + span)) {
+        if (!vdso_range_overlaps(ctx, cand, cand + map_len)) {
             base = cand;
             break;
         }
-        if (cand < VDSO_SHELF_BOTTOM + I686_PAGE_SIZE) {
+        if (cand < VDSO_SHELF_BOTTOM + gran) {
             break;
         }
-        cand -= I686_PAGE_SIZE;
+        cand -= gran;
     }
     if (base == 0U) {
         fprintf(stderr, "i686rt: [vdso]: no free slot in [0x%x, 0x%x)\n",
@@ -379,11 +381,11 @@ uint32_t i686_vdso_map(i686_ctx_t *ctx)
     }
 
     void *host = i686_guest_ptr(ctx, base);
-    void *res  = mmap(host, span, PROT_READ | PROT_WRITE,
+    void *res  = mmap(host, map_len, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (res == MAP_FAILED) {
         fprintf(stderr, "i686rt: [vdso]: mmap of [0x%x, 0x%x) failed\n",
-                base, base + span);
+                base, base + map_len);
         return 0U;
     }
 
@@ -404,17 +406,17 @@ uint32_t i686_vdso_map(i686_ctx_t *ctx)
 
     /* Guest view r-x like the kernel's vdso mapping; host prot drops
      * the exec bit (window is data, D11). */
-    if (mprotect(host, span, i686_host_prot(ctx, PROT_READ | PROT_EXEC)) != 0) {
+    if (mprotect(host, map_len, i686_host_prot(ctx, PROT_READ | PROT_EXEC)) != 0) {
         fprintf(stderr, "i686rt: [vdso]: mprotect of [0x%x, 0x%x) failed\n",
-                base, base + span);
-        (void)mprotect(host, span, PROT_NONE);
+                base, base + map_len);
+        (void)mprotect(host, map_len, PROT_NONE);
         return 0U;
     }
     if (rt32_vm_record_region(ctx, base, base + span,
                               (uint32_t)(PROT_READ | PROT_EXEC), 0x22U,
                               "[vdso]") != 0) {
         fprintf(stderr, "i686rt: [vdso]: failed to record region\n");
-        (void)mprotect(host, span, PROT_NONE);
+        (void)mprotect(host, map_len, PROT_NONE);
         return 0U;
     }
 

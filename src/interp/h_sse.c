@@ -2005,6 +2005,88 @@ static int h_emms(i686_ctx_t *ctx, const x86_insn_t *insn)
     return sse_done(ctx, insn);
 }
 
+/* UNPCKLPS/PD (0F 14) and UNPCKHPS/PD (0F 15) */
+static int h_unpckps(i686_ctx_t *ctx, const x86_insn_t *insn, int hi)
+{
+    uint8_t d[16], s[16], out[16];
+    if (insn->pfx_rep != 0U) {
+        return I686_EXIT_UNDEF;
+    }
+    sse_get_xmm(ctx, insn->modrm_reg, d);
+    src128(ctx, insn, s);
+    if (insn->pfx_opsize != 0U) { /* 66: UNPCKLPD / UNPCKHPD */
+        unsigned off = hi ? 8U : 0U;
+        memcpy(out + 0, d + off, 8);
+        memcpy(out + 8, s + off, 8);
+    } else { /* UNPCKLPS / UNPCKHPS */
+        unsigned off = hi ? 8U : 0U;
+        memcpy(out + 0,  d + off + 0, 4);
+        memcpy(out + 4,  s + off + 0, 4);
+        memcpy(out + 8,  d + off + 4, 4);
+        memcpy(out + 12, s + off + 4, 4);
+    }
+    sse_set_xmm(ctx, insn->modrm_reg, out);
+    return sse_done(ctx, insn);
+}
+
+static int h_unpcklps(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return h_unpckps(ctx, insn, 0);
+}
+
+static int h_unpckhps(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    return h_unpckps(ctx, insn, 1);
+}
+
+/* PACKUSWB (0F 67): signed 16-bit words -> unsigned saturated 8-bit bytes */
+static int h_packuswb(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    uint8_t d[16], s[16], out[16];
+    int xmm;
+    unsigned half, i;
+
+    if (insn->pfx_rep != 0U) {
+        return I686_EXIT_UNDEF;
+    }
+    xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int_vec_dst_fetch(ctx, insn, d, xmm);
+    half = xmm ? 8U : 4U;
+    memset(out, 0, sizeof out);
+    for (i = 0U; i < half; i++) {
+        int16_t w0 = (int16_t)((uint16_t)d[2U * i] | ((uint16_t)d[2U * i + 1U] << 8));
+        int16_t w1 = (int16_t)((uint16_t)s[2U * i] | ((uint16_t)s[2U * i + 1U] << 8));
+        out[i]        = (w0 < 0) ? 0U : ((w0 > 255) ? 255U : (uint8_t)w0);
+        out[half + i] = (w1 < 0) ? 0U : ((w1 > 255) ? 255U : (uint8_t)w1);
+    }
+    int_vec_dst(ctx, insn, out, xmm);
+    return sse_done(ctx, insn);
+}
+
+/* SHUFPS / SHUFPD (0F C6) */
+static int h_shufps(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    uint8_t d[16], s[16], out[16];
+    unsigned imm = insn->imm & 0xFFu;
+
+    if (insn->pfx_rep != 0U) {
+        return I686_EXIT_UNDEF;
+    }
+    sse_get_xmm(ctx, insn->modrm_reg, d);
+    src128(ctx, insn, s);
+    if (insn->pfx_opsize != 0U) { /* 66: SHUFPD */
+        memcpy(out + 0, d + 8U * ((imm >> 0) & 1U), 8);
+        memcpy(out + 8, s + 8U * ((imm >> 1) & 1U), 8);
+    } else { /* SHUFPS */
+        memcpy(out + 0,  d + 4U * ((imm >> 0) & 3U), 4);
+        memcpy(out + 4,  d + 4U * ((imm >> 2) & 3U), 4);
+        memcpy(out + 8,  s + 4U * ((imm >> 4) & 3U), 4);
+        memcpy(out + 12, s + 4U * ((imm >> 6) & 3U), 4);
+    }
+    sse_set_xmm(ctx, insn->modrm_reg, out);
+    return sse_done(ctx, insn);
+}
+
 /* ------------------------------------------------------------------ */
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
@@ -2067,4 +2149,8 @@ void i686_interp_sse_init(void)
     i686_interp_register(I686_OP_LDMXCSR, h_ldmxcsr);
     i686_interp_register(I686_OP_STMXCSR, h_stmxcsr);
     i686_interp_register(I686_OP_EMMS, h_emms);
+    i686_interp_register(470 /* UNPCKLPS/PD */, h_unpcklps);
+    i686_interp_register(471 /* UNPCKHPS/PD */, h_unpckhps);
+    i686_interp_register(472 /* PACKUSWB */, h_packuswb);
+    i686_interp_register(473 /* SHUFPS/PD */, h_shufps);
 }

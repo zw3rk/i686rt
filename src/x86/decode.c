@@ -66,7 +66,11 @@ enum {
     I686_OP7_LSS    = 466, /* 0F B2 Gv,mp                             */
     I686_OP7_LFS    = 467, /* 0F B4 Gv,mp                             */
     I686_OP7_LGS    = 468, /* 0F B5 Gv,mp                             */
-    I686_OP7_PRIV   = 469  /* E4-E7/EC-EF, 0F 20-23 (16-bit code)     */
+    I686_OP7_PRIV   = 469, /* E4-E7/EC-EF, 0F 20-23 (16-bit code)     */
+    I686_OP7_UNPCKLPS = 470, /* 0F 14 Vps,Wps / 66 Vpd,Wpd            */
+    I686_OP7_UNPCKHPS = 471, /* 0F 15 Vps,Wps / 66 Vpd,Wpd            */
+    I686_OP7_PACKUSWB = 472, /* 0F 67 Pq,Qd / 66 Vdq,Wdq              */
+    I686_OP7_SHUFPS   = 473  /* 0F C6 Vps,Wps,Ib / 66 Vpd,Wpd,Ib      */
 };
 
 static uint8_t fetch8(i686_ctx_t *ctx, uint32_t va)
@@ -410,6 +414,34 @@ static int far_op_decode(i686_ctx_t *ctx, uint8_t b1, uint8_t b2,
     case 0x0FB5u:
         out->op = I686_OP7_LGS;
         decode_modrm(ctx, pc, out, cs_base);
+        break;
+    case 0x0F14u:
+        out->op = I686_OP7_UNPCKLPS;
+        out->opnd[0] = I686_OPND_R32;
+        out->opnd[1] = I686_OPND_RM32;
+        decode_modrm(ctx, pc, out, cs_base);
+        break;
+    case 0x0F15u:
+        out->op = I686_OP7_UNPCKHPS;
+        out->opnd[0] = I686_OPND_R32;
+        out->opnd[1] = I686_OPND_RM32;
+        decode_modrm(ctx, pc, out, cs_base);
+        break;
+    case 0x0F67u:
+        out->op = I686_OP7_PACKUSWB;
+        out->opnd[0] = I686_OPND_R32;
+        out->opnd[1] = I686_OPND_RM32;
+        decode_modrm(ctx, pc, out, cs_base);
+        break;
+    case 0x0FC6u:
+        out->op = I686_OP7_SHUFPS;
+        out->opnd[0] = I686_OPND_R32;
+        out->opnd[1] = I686_OPND_RM32;
+        out->opnd[2] = I686_OPND_I8;
+        decode_modrm(ctx, pc, out, cs_base);
+        out->imm = fetch8(ctx, cs_base + *pc);
+        out->imm_size = 1u;
+        (*pc)++;
         break;
     case 0x0F20u: /* MOV Cd,Rd / MOV Rd,Cd families: privileged */
     case 0x0F21u:

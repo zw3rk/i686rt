@@ -11,6 +11,7 @@
 
 #define _GNU_SOURCE
 #include "rt32.h"
+#include "vm/vm32.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -109,12 +110,20 @@ static int pread_full(int fd, void *buf, size_t count, off_t offset)
 static int protect_and_record_seg(i686_ctx_t *ctx, uint32_t start, uint32_t end,
                                   uint32_t guest_prot, const char *label)
 {
+    rt32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
+    if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > I686_PAGE_SIZE) {
+        if (i686_vm32_union_prot(ctx, start, end) != 0) {
+            fprintf(stderr, "i686rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
+                    label, start, end, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
     if (mprotect(i686_guest_ptr(ctx, start), end - start, i686_host_prot(ctx, guest_prot)) != 0) {
         fprintf(stderr, "i686rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
                 label, start, end, strerror(errno));
         return -1;
     }
-    rt32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
     return 0;
 }
 
@@ -286,23 +295,39 @@ static int load_elf32_image(i686_ctx_t *ctx, int fd, uint32_t default_pie_base,
 
         uint32_t shared_end  = (map_end < map_start) ? map_end : map_start;
         uint32_t merged_prot = highest_mapped_prot | guest_prot;
-        if (page_start < map_start) {
-            if (mprotect(i686_guest_ptr(ctx, page_start), shared_end - page_start,
+        if (ctx->vm_host_page > I686_PAGE_SIZE) {
+            uint32_t h    = ctx->vm_host_page;
+            uint32_t h_lo = page_start & ~(h - 1U);
+            uint32_t h_hi = (uint32_t)(((uint64_t)map_end + (uint64_t)(h - 1U)) &
+                                       ~(uint64_t)(h - 1U));
+            if (mprotect(i686_guest_ptr(ctx, h_lo), h_hi - h_lo,
                          PROT_READ | PROT_WRITE) != 0) {
-                fprintf(stderr, "i686rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
-                        label, page_start, shared_end, strerror(errno));
+                fprintf(stderr, "i686rt: %s: mprotect RW failed on [0x%x, 0x%x): %s\n",
+                        label, h_lo, h_hi, strerror(errno));
                 return -1;
             }
-        }
+            if (map_end > map_start) {
+                memset(i686_guest_ptr(ctx, map_start), 0, map_end - map_start);
+            }
+        } else {
+            if (page_start < map_start) {
+                if (mprotect(i686_guest_ptr(ctx, page_start), shared_end - page_start,
+                             PROT_READ | PROT_WRITE) != 0) {
+                    fprintf(stderr, "i686rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
+                            label, page_start, shared_end, strerror(errno));
+                    return -1;
+                }
+            }
 
-        if (map_end > map_start) {
-            void *res = mmap(i686_guest_ptr(ctx, map_start), map_end - map_start,
-                             PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-            if (res == MAP_FAILED) {
-                fprintf(stderr, "i686rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
-                        label, map_start, map_end, strerror(errno));
-                return -1;
+            if (map_end > map_start) {
+                void *res = mmap(i686_guest_ptr(ctx, map_start), map_end - map_start,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (res == MAP_FAILED) {
+                    fprintf(stderr, "i686rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
+                            label, map_start, map_end, strerror(errno));
+                    return -1;
+                }
             }
         }
 

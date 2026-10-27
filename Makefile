@@ -257,25 +257,33 @@ check-line-limits: ## Enforce the <= 900-line rule on lane-owned files
 	if [ "$$fail" -ne 0 ]; then echo "FAIL: files over 900 lines"; exit 1; fi; \
 	echo "check-line-limits: all lane-owned files <= 900 lines"
 
-# Darwin-portable Wave U3 TU set. The full _build/i686rt-darwin-arm64
-# translator binary additionally needs the syscall marshal lane
-# (src/os/sys_*.c uses Linux-only headers); until that lane lands,
-# build-darwin compiles every lane TU warning-clean under the host
-# toolchain and links + runs the portable host check below.
-U3_DARWIN_SRCS := src/vm/vm32.c src/vm/vm_file.c \
-        src/os/backend_linux.c src/os/backend_linux_sys.c \
-        src/os/backend_darwin.c src/os/backend_darwin_io.c \
-        src/os/backend_darwin_net.c \
-        src/dbt/aot/aot.c \
-        src/interp/h_alu.c src/interp/h_shift.c src/dbt/emit_mov.c \
-        src/rt32/rt32_vm.c src/x86/decode.c
-U3_DARWIN_OBJS := $(patsubst src/%.c,$(OBJ_DIR)-darwin/%.o,$(U3_DARWIN_SRCS))
+# Native macOS arm64 standalone translator build (_build/i686rt-darwin +
+# _build/i686rt-darwin-arm64 symlink). Compiles every translator TU and
+# src/trampoline.S warning-clean under the host toolchain and runs the
+# Wave U3 host check.
+DARWIN_OS_SRCS := $(filter-out src/os/backend_linux.c src/os/backend_linux_sys.c,$(wildcard src/os/*.c))
+DARWIN_C_SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
+        $(wildcard src/interp/*.c) $(DARWIN_OS_SRCS) \
+        $(wildcard src/vm/*.c) \
+        $(wildcard src/dbt/*.c) $(wildcard src/dbt/aot/*.c)
+DARWIN_OBJS := $(patsubst src/%.c,$(OBJ_DIR)-darwin/%.o,$(DARWIN_C_SRCS)) \
+        $(OBJ_DIR)-darwin/trampoline.o
+I686RT_DARWIN := $(BUILD_DIR)/i686rt-darwin
 
-$(OBJ_DIR)-darwin/%.o: src/%.c
+$(OBJ_DIR)-darwin/%.o: src/%.c $(HDRS)
 	@mkdir -p $(dir $@)
 	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -c $< -o $@
 
-build-darwin: $(U3_DARWIN_OBJS) test-u3 ## Compile the Wave U3 TU set for macOS arm64 + run the host check
+$(OBJ_DIR)-darwin/%.o: src/%.S $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -c $< -o $@
+
+$(I686RT_DARWIN): $(DARWIN_OBJS)
+	@printf "\033[32m▸ Linking\033[0m $@\n"
+	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) $(DARWIN_OBJS) -pthread -o $@
+	@ln -sf i686rt-darwin $(BUILD_DIR)/i686rt-darwin-arm64
+
+build-darwin: $(I686RT_DARWIN) test-u3 ## Build native macOS arm64 i686rt translator + run the host check
 
 # Portable host check: layout pins, AOT round-trip, Provider A promotion,
 # regime selection, and the dual-backend smoke set. Uses the host

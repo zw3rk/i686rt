@@ -826,7 +826,6 @@ static int64_t h_getdents(i686_ctx_t *ctx)
 static int64_t h_statx(i686_ctx_t *ctx)
 {
     char path[L2A_PATH_MAX];
-    _Alignas(8) uint8_t stx[512];
     int dirfd = xlate_dirfd(ctx->gpr[I686_REG_EBX]);
     uint32_t flags = ctx->gpr[I686_REG_EDX];
     uint32_t mask = ctx->gpr[I686_REG_ESI];
@@ -851,6 +850,7 @@ static int64_t h_statx(i686_ctx_t *ctx)
     (void)mask;
     return -ENOSYS;
 #else
+    _Alignas(8) uint8_t stx[512];
     memset(stx, 0, sizeof(stx));
     /* Absolute guest paths resolve under --sysroot first (stat_path
      * model), AT_FDCWD only. */

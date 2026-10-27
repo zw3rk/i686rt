@@ -53,10 +53,21 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+long syscall(long, ...);
+#endif
 #include <unistd.h>
 
-long syscall(long, ...);
+static int ldt_host_gettid(void)
+{
+#ifdef __linux__
+    return (int)syscall(SYS_gettid);
+#else
+    return (int)getpid();
+#endif
+}
+
 #include "i686rt.h"
 
 /* seg.h (frozen) re-spells its fault-code macro I686_SEG_SS (3) over
@@ -337,7 +348,7 @@ long i686_sys_set_thread_area(i686_ctx_t *ctx, uint32_t ua)
         if (i686_sigtrace_on()) {
             (void)fprintf(stderr,
                           "STA tid=%d entry=%u base=%08x present=%u\n",
-                          (int)syscall(SYS_gettid), entry, d.base,
+                          ldt_host_gettid(), entry, d.base,
                           (unsigned)((d.flags & I686_DESC_PRESENT) != 0u));
         }
     }
@@ -382,7 +393,7 @@ long i686_ldt_clone_settls(i686_ctx_t *ctx, uint32_t ua)
                 (void)fprintf(stderr,
                               "TLSSET tid=%d ua=%08x desc=%08x %08x %08x "
                               "%08x gs=%04x REJECTED\n",
-                              (int)syscall(SYS_gettid), ua, le32(ud),
+                              ldt_host_gettid(), ua, le32(ud),
                               le32(ud + 4u), le32(ud + 8u), le32(ud + 12u),
                               (unsigned)ctx->seg_sel[I686_SEG_GS]);
             }
@@ -414,7 +425,7 @@ long i686_ldt_clone_settls(i686_ctx_t *ctx, uint32_t ua)
         if (i686_sigtrace_on()) {
             (void)fprintf(stderr,
                           "TLSSET tid=%d entry=%u base=%08x\n",
-                          (int)syscall(SYS_gettid), entry, d.base);
+                          ldt_host_gettid(), entry, d.base);
         }
     }
     return 0;

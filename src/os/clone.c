@@ -26,13 +26,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/syscall.h>
 long syscall(long, ...);
+#endif
 #include <unistd.h>
 
 #include "i686rt.h"
+#include "os/backend.h"
 #include "os/marshal.h"
 #include "os/threads.h"
+
+static uint32_t clone_host_gettid(void)
+{
+#ifdef __linux__
+    return (uint32_t)syscall(SYS_gettid);
+#elif defined(__APPLE__)
+    uint64_t tid = 0;
+    (void)pthread_threadid_np(NULL, &tid);
+    return (uint32_t)tid;
+#else
+    return (uint32_t)getpid();
+#endif
+}
 
 static i686_ctx_t *s_thread_ctx; /* per-host-thread ctx (TLS via host) */
 static pthread_key_t s_ctx_key;
@@ -280,8 +296,12 @@ void i686_thread_registry_wake(i686_ctx_t *target)
     }
     (void)pthread_mutex_unlock(&s_registry_lock);
     if (host_tid > 0) {
+#ifdef __linux__
         (void)syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)host_tid,
                       I686RT_HOST_WAKE_SIG);
+#else
+        (void)rt_host_tgkill((int)getpid(), host_tid, I686RT_HOST_WAKE_SIG);
+#endif
     }
 }
 
@@ -326,7 +346,7 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
     }
     hp = i686_guest_ptr(ctx, futex_va);
     for (tries = 0; tries < 8; tries++) {
-        _Atomic uint32_t cur = uval;
+        uint32_t cur = uval;
         if (atomic_compare_exchange_strong((_Atomic uint32_t *)hp, &cur,
                                            uval | FUTEX_OWNER_DIED_BIT_)) {
             break;
@@ -337,8 +357,13 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
         uint32_t after;
         if (robust_fetch_u32(ctx, futex_va, &after) == 0 &&
             (after & FUTEX_WAITERS_BIT_) != 0u) {
+#ifdef __linux__
             long hcmd = 1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/;
             (void)syscall(SYS_futex, (void *)hp, hcmd, 1, NULL, NULL, 0);
+#else
+            (void)rt_host_futex_wake_bitset((_Atomic uint32_t *)hp, NULL, 1,
+                                            0xFFFFFFFFu);
+#endif
         }
     }
 }
@@ -404,7 +429,7 @@ static void *thread_entry(void *arg)
      * (shared TLS, visible to the child); glibc's is CHILD_SETTID.
      * The pre-start synthetic registry key is replaced in the same
      * step. */
-    tid = (uint32_t)syscall(SYS_gettid);
+    tid = clone_host_gettid();
     i686_thread_registry_set_host_tid(pre_tid, (int)tid);
     if (parent_tid_va != 0U) {
         (void)i686_copy_to_guest(ctx, parent_tid_va, &tid, 4U);
@@ -456,7 +481,7 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
         return;
     }
     s_done = 1;
-    tid = (uint32_t)syscall(SYS_gettid);
+    tid = clone_host_gettid();
     robust_exit_walk(ctx, tid);
     /* CLONE_CHILD_CLEARTID: clear the tid word and futex-wake it
      * (kernel exit_mm/exit_notify behavior).  The registry entry is
@@ -474,6 +499,7 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
              * wake left glibc's pthread_join blocked forever.  The
              * kernel's mm_release cleartid wake is a shared wake, which
              * is why both libcs work on real Linux. */
+#ifdef __linux__
             (void)syscall(SYS_futex,
                           i686_guest_ptr(ctx, ctx->clear_child_tid),
                           1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/, 1,
@@ -481,6 +507,11 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
             (void)syscall(SYS_futex,
                           i686_guest_ptr(ctx, ctx->clear_child_tid),
                           1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
+#else
+            (void)rt_host_futex_wake_bitset(
+                (_Atomic uint32_t *)i686_guest_ptr(ctx, ctx->clear_child_tid),
+                NULL, 1, 0xFFFFFFFFu);
+#endif
         }
         ctx->clear_child_tid = 0U;
     }
@@ -519,7 +550,7 @@ static int64_t r_clone(i686_ctx_t *ctx)
             (void)fprintf(stderr,
                           "CLN tid=%d flags=%08x newsp=%08x tls=%08x "
                           "gs_sel=%04x gs_base=%08x eip=%08x\n",
-                          (int)syscall(SYS_gettid), flags, newsp, tls_va,
+                          (int)clone_host_gettid(), flags, newsp, tls_va,
                           ctx->seg_sel[I686_SEG_GS],
                           ctx->seg_base[I686_SEG_GS], child_eip);
         }
