@@ -76,6 +76,9 @@ static int parse_args(i686_ctx_t *ctx, int argc, char **argv)
     int i = 1;
 
     while (i < argc && strcmp(argv[i], "--") != 0) {
+        if (argv[i][0] != '-') {
+            return i;
+        }
         if (strcmp(argv[i], "--help") == 0) {
             usage(stdout);
             exit(0);
