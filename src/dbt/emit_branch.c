@@ -436,6 +436,101 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
         return 0;
     }
 
+    case I686_OP_CALL_Ev: {
+        uint32_t next;
+        uint16_t bytes = insn->pfx_opsize != 0U ? 2U : 4U;
+        dbt_mem_site_t site;
+        uint32_t seq;
+        uint32_t seq_ld;
+        uint32_t mem;
+
+        if (insn->pfx_rep != 0U || insn->pfx_lock != 0U) {
+            return -1;
+        }
+        if (!l3c_pc_of(e, insn, &pc)) {
+            return -1;
+        }
+        next = pc + (uint32_t)insn->len;
+        /* Load the call target into w10 FIRST, before ESP moves: with
+         * [%esp + disp] addressing the EA uses the pre-call ESP, and a
+         * fault on the target load leaves ESP unmodified. */
+        if (insn->modrm_mod == 3U || !insn->ea_has) { /* register form */
+            unsigned rm = i686_w(insn->modrm_rm);
+            if (insn->pfx_opsize != 0U) {
+                a64_emit_ubfm_w(b, L3C_W10, rm, 0U, 15U); /* zero-extend */
+            } else {
+                a64_emit_mov_w(b, L3C_W10, rm);
+            }
+        } else { /* memory form: ldr w10, [x20, w21 uxtw] */
+            l3c_ea_w21(e, insn);
+            seq_ld = (uint32_t)((uint64_t)b->count * 4u);
+            if (insn->pfx_opsize != 0U) {
+                a64_emit_guest_ldrh_w(b, L3C_W10, L3C_EA);
+            } else {
+                a64_emit_guest_ldr_w(b, L3C_W10, L3C_EA);
+            }
+            /* Load site: the fault leaves ESP intact (still pre-call),
+             * so no rollback (sp_rollback_delta = 0, flags = 0); width
+             * stays 0 so the replay walk accounts no ESP effect before
+             * the push site below. */
+            memset(&site, 0, sizeof(site));
+            site.seq_start_offset = (uint16_t)seq_ld;
+            site.host_insn_offset = (uint16_t)seq_ld;
+            site.cont_insn_offset = (uint16_t)((uint64_t)b->count * 4u);
+            site.guest_pc_delta =
+                (pc >= e->guest_eip && pc - e->guest_eip <= 0xFFF0U)
+                    ? (uint16_t)(pc - e->guest_eip)
+                    : I686_SITE_PC_UNKNOWN;
+            site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                             ((uint32_t)insn->pfx_lock << 16);
+            site.sp_rollback_delta = 0;
+            site.npc_mode = (uint8_t)I686_NPC_DYNAMIC_CTX;
+            site.npc_delta = 0;
+            site.width = 0U;
+            site.flags = 0u; /* load, SP intact on fault */
+            site.val_or_dst_reg = (uint8_t)L3C_W10;
+            site.addr_base_reg = 21U; /* EA */
+            (void)i686_aot_note_stack_site(&site);
+        }
+        /* push return EIP: ESP wraps in 32 bits (w4 arithmetic).
+         * w10 stays live across the push: only w11 and ESP are used. */
+        seq = (uint32_t)((uint64_t)b->count * 4u);
+        a64_emit_sub_imm_w(b, false, I686_REG_ESP, I686_REG_ESP, bytes, 0U);
+        a64_emit_mov_imm32(b, L3C_W11, next);
+        /* RC-U3-r2 P1 #2: host_insn_offset must identify the faulting
+         * store (the STR below), recorded after the MOVZ/MOVK pair, so
+         * the engine's exact-offset recovery matches CALL faults. */
+        mem = (uint32_t)((uint64_t)b->count * 4u);
+        if (bytes == 2U) {
+            a64_emit_guest_strh_w(b, L3C_W11, I686_REG_ESP);
+        } else {
+            a64_emit_guest_str_w(b, L3C_W11, I686_REG_ESP);
+        }
+        /* RC-U3 stack site: ESP commits before the store can fault.
+         * The resume target is dynamic (w10 into the exit dest). */
+        memset(&site, 0, sizeof(site));
+        site.seq_start_offset = (uint16_t)seq;
+        site.host_insn_offset = (uint16_t)mem;
+        site.cont_insn_offset = (uint16_t)((uint64_t)b->count * 4u);
+        site.guest_pc_delta =
+            (pc >= e->guest_eip && pc - e->guest_eip <= 0xFFF0U)
+                ? (uint16_t)(pc - e->guest_eip)
+                : I686_SITE_PC_UNKNOWN;
+        site.npc_delta = 0;
+        site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                         ((uint32_t)insn->pfx_lock << 16);
+        site.sp_rollback_delta = (int16_t)(-(int32_t)bytes);
+        site.npc_mode = (uint8_t)I686_NPC_DYNAMIC_CTX;
+        site.width = (uint8_t)bytes;
+        site.flags =
+            (uint8_t)(I686_SITE_STORE | I686_SITE_PRE_COMMITTED_SP);
+        site.val_or_dst_reg = (uint8_t)L3C_W11;
+        site.addr_base_reg = 4U; /* ESP */
+        (void)i686_aot_note_stack_site(&site);
+        l3c_exit_dest_w10(e, I686_EXIT_BRANCH, 0U);
+        return 0;
+    }
+
     case I686_OP_RET:
     case I686_OP_RET_Iw: {
         uint16_t bytes = insn->pfx_opsize != 0U ? 2U : 4U;
