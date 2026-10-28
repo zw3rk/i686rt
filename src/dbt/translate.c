@@ -11,15 +11,18 @@
  * Lane P3 (Wave P) pre-scan: before emitting, the block's instructions
  * are decoded into an array and classified for the fault-barrier-safe
  * skip analysis.  A fused lazy producer (ADD/SUB/CMP/AND/OR/XOR/TEST/
- * NEG, register-only, no LOCK) gets skip[i] when a later full flag
+ * NEG, register or memory, no LOCK) gets skip[i] when a later full flag
  * writer (fused, imm-shift with nonzero count, or register IMUL)
- * overwrites OSZAPC before any barrier.  Barriers: every memory access
- * (fault), DIV/IDIV (#DE), helper calls, partial flag writers
- * (INC/DEC, ROL/ROR, CL-count shifts/SHLD/SHRD, 1-op MUL/IMUL), flag
- * readers (consumers), traps and exits.  Whitelisted instructions
- * provably never decline and never close the block, so a skip can only
- * span emitted code.  The emit phase below is otherwise byte-identical
- * to the v1 flow (same exits, same order, same UNDEF shapes).
+ * overwrites OSZAPC before any barrier.  Barriers: DIV/IDIV (#DE),
+ * helper calls, CL-count shifts/SHLD/SHRD, 1-op MUL/IMUL, ADC/SBB
+ * (carry readers), flag readers (consumers), traps and exits.  Memory
+ * MOV/MOVZX/MOVSX never touch flags (transparent); memory ALU, TEST,
+ * NEG, INC/DEC, ROL/ROR and nonzero shifts join the skip analysis
+ * because the fault path recovers only eip/esp (GPRs and lazy flags
+ * materialize at block exit).  Whitelisted instructions provably never
+ * decline and never close the block, so a skip can only span emitted
+ * code.  The emit phase below is otherwise byte-identical to the v1
+ * flow (same exits, same order, same UNDEF shapes).
  */
 
 #include <stdint.h>
@@ -37,8 +40,7 @@ enum {
     TRC_PARTICIPANT = 1, /* fused full writer: skippable, valid j */
     TRC_JONLY = 2,       /* full writer, never skipped: valid j */
     TRC_TRANSPARENT = 3, /* no flags, never declines/closes */
-    TRC_PARTIAL = 4,     /* partial writer (ROL/ROR/INC/DEC): skippable if seen_j */
-    TRC_MEM_FUSED = 5    /* memory-operand fused writer: skippable if seen_j, then barrier */
+    TRC_PARTIAL = 4      /* partial writer (ROL/ROR/INC/DEC): skippable if seen_j */
 };
 
 static int tr_is_regonly(const x86_insn_t *insn)
@@ -93,17 +95,20 @@ static unsigned tr_classify(const x86_insn_t *insn)
     unsigned op = insn->op;
     int regonly = tr_is_regonly(insn);
 
-    /* Fused full writers (register-only, no LOCK): skippable, valid j.
-     * Memory-operand fused writers (no LOCK) are skippable if seen_j,
-     * then act as a barrier for earlier instructions. */
+    /* Fused full writers (no LOCK): skippable, valid j.  Register and
+     * memory forms alike: a faulting memory op recovers only eip/esp
+     * (engine.c fault path; GPRs and lazy flags materialize at block
+     * exit), so a skipped lazy store is never observed. */
     if (insn->pfx_lock == 0U &&
         (tr_is_fused9(op) != 0 ||
          op == (unsigned)I686_OP_NEG_Eb || op == (unsigned)I686_OP_NEG_Ev)) {
-        return regonly != 0 ? TRC_PARTICIPANT : TRC_MEM_FUSED;
+        return TRC_PARTICIPANT;
     }
-    /* Eager full writers with a static nonzero count (register-only,
-     * no LOCK): valid j, never skipped (their stores always run). */
-    if (insn->pfx_lock == 0U && regonly != 0) {
+    /* Eager full writers with a static nonzero count (no LOCK): valid j,
+     * never skipped (their stores always run).  SHL/SHR/SAR by 1 or by a
+     * nonzero imm count are full writers for register and memory dests
+     * alike (LOCKed memory declines to the interpreter). */
+    if (insn->pfx_lock == 0U) {
         switch (op) {
         case I686_OP_SHL_Eb1: case I686_OP_SHL_Ev1:
         case I686_OP_SHR_Eb1: case I686_OP_SHR_Ev1:
@@ -119,7 +124,10 @@ static unsigned tr_classify(const x86_insn_t *insn)
         case I686_OP_IMUL_GvEv:
         case I686_OP_IMUL_GvEvIz:
         case I686_OP_IMUL_GvEvIb:
-            return TRC_JONLY;
+            if (regonly != 0) {
+                return TRC_JONLY;
+            }
+            break;
         default:
             break;
         }
@@ -132,7 +140,7 @@ static unsigned tr_classify(const x86_insn_t *insn)
         if (((insn->imm & 0xFFU) & 31U) == 0U) {
             return TRC_TRANSPARENT;
         }
-        if (insn->pfx_lock == 0U && regonly != 0) {
+        if (insn->pfx_lock == 0U) {
             return TRC_PARTIAL;
         }
         break;
@@ -142,14 +150,15 @@ static unsigned tr_classify(const x86_insn_t *insn)
     case I686_OP_ROR_EbCL: case I686_OP_ROR_EvCL:
     case I686_OP_INC_Eb: case I686_OP_INC_Ev:
     case I686_OP_DEC_Eb: case I686_OP_DEC_Ev:
-        if (insn->pfx_lock == 0U && regonly != 0) {
+        if (insn->pfx_lock == 0U) {
             return TRC_PARTIAL;
         }
         break;
     default:
         break;
     }
-    /* Flag-transparent, provably never declining/closing. */
+    /* Flag-transparent, provably never declining/closing.  MOV (all
+     * forms, register or memory) and MOVZX/MOVSX never touch flags. */
     switch (op) {
     case I686_OP_NOP:
     case I686_OP_WAIT:
@@ -164,10 +173,13 @@ static unsigned tr_classify(const x86_insn_t *insn)
         break;
     case I686_OP_MOV_EbGb: case I686_OP_MOV_EvGv:
     case I686_OP_MOV_GbEb: case I686_OP_MOV_GvEv:
+    case I686_OP_MOV_ALOb: case I686_OP_MOV_eAXOv:
+    case I686_OP_MOV_ObAL: case I686_OP_MOV_OveAX:
     case I686_OP_MOV_EbIb: case I686_OP_MOV_EvIz:
     case I686_OP_MOV_GbIb: case I686_OP_MOV_GvIv:
     case I686_OP_MOVZX_GvEb: case I686_OP_MOVZX_GvEw:
     case I686_OP_MOVSX_GvEb: case I686_OP_MOVSX_GvEw:
+        return TRC_TRANSPARENT;
     case I686_OP_XCHG_EbGb: case I686_OP_XCHG_EvGv:
     case I686_OP_XCHG_eAXGv:
         if (regonly != 0) {
@@ -178,9 +190,9 @@ static unsigned tr_classify(const x86_insn_t *insn)
         break;
     }
     /* Everything else is a fault/reader/partial/exit barrier:
-     * memory forms, DIV/IDIV, ADC/SBB (carry readers), INC/DEC and
-     * ROL/ROR (partial writers), CL-count shifts, MUL/IMUL-1op, all
-     * branches/syscalls/traps/string/SSE/x87/unknown rows. */
+     * DIV/IDIV, ADC/SBB (carry readers), CL-count shifts, MUL/IMUL-1op,
+     * LOCKed forms, all branches/syscalls/traps/string/SSE/x87/unknown
+     * rows, and any remaining memory access. */
     return TRC_BARRIER;
 }
 
@@ -235,13 +247,6 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
         unsigned char seen_j = 0;
         for (i = m; i-- > 0U;) {
             if (cls[i] == (unsigned char)TRC_BARRIER) {
-                seen_j = 0;
-                continue;
-            }
-            if (cls[i] == (unsigned char)TRC_MEM_FUSED) {
-                if (seen_j != 0) {
-                    skip[i] = 1U;
-                }
                 seen_j = 0;
                 continue;
             }

@@ -355,14 +355,23 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
     }
 
     if (kind == ALUK_ADD) {
-        a64_emit_add_reg_w(b, true, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
-        /* Invert C so NZCV holds C = !CF (natural SUBS polarity). */
-        a64_emit_mrs_nzcv(b, SCR_T0);
-        a64_emit_movz_w(b, SCR_T1, 0x2000U, 1U);
-        a64_emit_eor_reg_w(b, SCR_T0, SCR_T0, SCR_T1, A64_SHIFT_LSL, 0U);
-        a64_emit_msr_nzcv(b, SCR_T0);
-    } else if (kind == ALUK_SUB || kind == ALUK_CMP) {
-        a64_emit_sub_reg_w(b, true, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
+        a64_emit_add_reg_w(b, e->skip_lazy == 0U, SCR_RES, SCR_A, SCR_B,
+                           A64_SHIFT_LSL, 0U);
+        if (e->skip_lazy == 0U) {
+            /* Invert C so NZCV holds C = !CF (natural SUBS polarity). */
+            a64_emit_mrs_nzcv(b, SCR_T0);
+            a64_emit_movz_w(b, SCR_T1, 0x2000U, 1U);
+            a64_emit_eor_reg_w(b, SCR_T0, SCR_T0, SCR_T1, A64_SHIFT_LSL, 0U);
+            a64_emit_msr_nzcv(b, SCR_T0);
+        }
+    } else if (kind == ALUK_SUB) {
+        a64_emit_sub_reg_w(b, e->skip_lazy == 0U, SCR_RES, SCR_A, SCR_B,
+                           A64_SHIFT_LSL, 0U);
+    } else if (kind == ALUK_CMP) {
+        if (e->skip_lazy == 0U) {
+            a64_emit_sub_reg_w(b, true, SCR_RES, SCR_A, SCR_B,
+                               A64_SHIFT_LSL, 0U);
+        }
     } else {
         if (kind == ALUK_AND || kind == ALUK_TEST) {
             a64_emit_and_reg_w(b, false, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL,
@@ -372,8 +381,10 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
         } else { /* ALUK_XOR */
             a64_emit_eor_reg_w(b, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
         }
-        /* x86 logic flags: CF = OF = 0 (so SUBS C = !CF = 1), N/Z from result. */
-        a64_emit_sub_imm_w(b, true, 31U, SCR_RES, 0U, 0U);
+        if (e->skip_lazy == 0U) {
+            /* x86 logic flags: CF = OF = 0 (so SUBS C = !CF = 1), N/Z from result. */
+            a64_emit_sub_imm_w(b, true, 31U, SCR_RES, 0U, 0U);
+        }
     }
 
     if (sh != 0U) { /* un-shift A, B, RES back to width-masked values */
@@ -400,8 +411,14 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
         emit_lazy(e, I686_FOP_LOGIC, SCR_RES, SCR_RES, 31U, width);
     }
     /* Fused image live in NZCV (natural SUBS polarity): a later
-     * same-block consumer may fuse on it directly (emit.h seam). */
-    e->flags_src = I686_FLAGS_NZCV;
+     * same-block consumer may fuse on it directly (emit.h seam).
+     * A skipped producer emits no NZCV image, so downgrade (DEAD is
+     * always correct): the overwriting j re-establishes the proof. */
+    if (e->skip_lazy != 0U) {
+        e->flags_src = I686_FLAGS_DEAD;
+    } else {
+        e->flags_src = I686_FLAGS_NZCV;
+    }
 
     e->insn_count++;
     return 0;
@@ -572,56 +589,62 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
     /* Eager flags, exactly h_shift.c + i686_flags_logiczx: clear
      * CF PF AF ZF SF OF, then set Z/S/P from the result, CF from the last
      * bit shifted out, OF only when cnt == 1 (SHL: CF^MSB(res), SHR:
-     * MSB(operand), SAR: 0). */
-    a64_emit_ldr_imm_w(b, SCR_T0, 19U, 36U);
-    a64_emit_movz_w(b, SCR_T1, 0x08D5U, 0U); /* CF|PF|AF|ZF|SF|OF */
-    a64_emit_bic_reg_w(b, false, SCR_T0, SCR_T0, SCR_T1, A64_SHIFT_LSL, 0U);
+     * MSB(operand), SAR: 0).  Skipped when the pre-scan proved a later
+     * full writer overwrites the flags first (JONLY producers are never
+     * skipped themselves, so this arm is normally untaken). */
+    if (e->skip_lazy == 0U) {
+        a64_emit_ldr_imm_w(b, SCR_T0, 19U, 36U);
+        a64_emit_movz_w(b, SCR_T1, 0x08D5U, 0U); /* CF|PF|AF|ZF|SF|OF */
+        a64_emit_bic_reg_w(b, false, SCR_T0, SCR_T0, SCR_T1, A64_SHIFT_LSL, 0U);
 
-    a64_emit_sub_imm_w(b, true, 31U, SCR_RES, 0U, 0U); /* cmp res, #0 */
-    emit_cset_w(b, SCR_T2, A64_COND_EQ);               /* ZF */
-    emit_bfi_w(b, SCR_T0, SCR_T2, 6U, 1U);
+        a64_emit_sub_imm_w(b, true, 31U, SCR_RES, 0U, 0U); /* cmp res, #0 */
+        emit_cset_w(b, SCR_T2, A64_COND_EQ);               /* ZF */
+        emit_bfi_w(b, SCR_T0, SCR_T2, 6U, 1U);
 
-    a64_emit_ubfm_w(b, SCR_T2, SCR_RES, msb, msb);     /* SF */
-    emit_bfi_w(b, SCR_T0, SCR_T2, 7U, 1U);
+        a64_emit_ubfm_w(b, SCR_T2, SCR_RES, msb, msb);     /* SF */
+        emit_bfi_w(b, SCR_T0, SCR_T2, 7U, 1U);
 
-    emit_and_imm_w(b, SCR_T3, SCR_RES, 0xFFU);         /* PF: even parity */
-    a64_emit_eor_reg_w(b, SCR_T3, SCR_T3, SCR_T3, A64_SHIFT_LSR, 4U);
-    a64_emit_eor_reg_w(b, SCR_T3, SCR_T3, SCR_T3, A64_SHIFT_LSR, 2U);
-    a64_emit_eor_reg_w(b, SCR_T3, SCR_T3, SCR_T3, A64_SHIFT_LSR, 1U);
-    a64_emit_ubfm_w(b, SCR_T3, SCR_T3, 0U, 0U);        /* odd parity bit */
-    emit_eor_imm1_w(b, SCR_T4, SCR_T3);                /* -> even parity */
-    emit_bfi_w(b, SCR_T0, SCR_T4, 2U, 1U);
+        emit_and_imm_w(b, SCR_T3, SCR_RES, 0xFFU);         /* PF: even parity */
+        a64_emit_eor_reg_w(b, SCR_T3, SCR_T3, SCR_T3, A64_SHIFT_LSR, 4U);
+        a64_emit_eor_reg_w(b, SCR_T3, SCR_T3, SCR_T3, A64_SHIFT_LSR, 2U);
+        a64_emit_eor_reg_w(b, SCR_T3, SCR_T3, SCR_T3, A64_SHIFT_LSR, 1U);
+        a64_emit_ubfm_w(b, SCR_T3, SCR_T3, 0U, 0U);        /* odd parity bit */
+        emit_eor_imm1_w(b, SCR_T4, SCR_T3);                /* -> even parity */
+        emit_bfi_w(b, SCR_T0, SCR_T4, 2U, 1U);
 
-    if (kind == SHK_SHL) {
-        if (cnt <= width) {
-            a64_emit_ubfm_w(b, SCR_T3, SCR_A, width - cnt, width - cnt);
-            emit_bfi_w(b, SCR_T0, SCR_T3, 0U, 1U); /* CF */
-        } /* cnt > width: CF stays 0 */
-    } else if (kind == SHK_SHR) {
-        a64_emit_ubfm_w(b, SCR_T3, SCR_A, cnt - 1U, cnt - 1U);
-        emit_bfi_w(b, SCR_T0, SCR_T3, 0U, 1U);
-    } else {
-        unsigned bit = (cnt <= width) ? cnt - 1U : msb;
-        a64_emit_ubfm_w(b, SCR_T3, SCR_A, bit, bit);
-        emit_bfi_w(b, SCR_T0, SCR_T3, 0U, 1U);
-    }
-
-    if (cnt == 1U) {
         if (kind == SHK_SHL) {
-            /* OF = CF ^ MSB(result): w13 = MSB(res), w14 = CF. */
-            a64_emit_eor_reg_w(b, SCR_T4, SCR_T2, SCR_T3, A64_SHIFT_LSL, 0U);
-            emit_bfi_w(b, SCR_T0, SCR_T4, 11U, 1U);
+            if (cnt <= width) {
+                a64_emit_ubfm_w(b, SCR_T3, SCR_A, width - cnt, width - cnt);
+                emit_bfi_w(b, SCR_T0, SCR_T3, 0U, 1U); /* CF */
+            } /* cnt > width: CF stays 0 */
         } else if (kind == SHK_SHR) {
-            a64_emit_ubfm_w(b, SCR_T4, SCR_A, msb, msb); /* MSB(operand) */
-            emit_bfi_w(b, SCR_T0, SCR_T4, 11U, 1U);
-        } /* SAR count 1: OF = 0, already cleared */
-    }
+            a64_emit_ubfm_w(b, SCR_T3, SCR_A, cnt - 1U, cnt - 1U);
+            emit_bfi_w(b, SCR_T0, SCR_T3, 0U, 1U);
+        } else {
+            unsigned bit = (cnt <= width) ? cnt - 1U : msb;
+            a64_emit_ubfm_w(b, SCR_T3, SCR_A, bit, bit);
+            emit_bfi_w(b, SCR_T0, SCR_T3, 0U, 1U);
+        }
 
-    a64_emit_str_imm_w(b, SCR_T0, 19U, 36U);
-    a64_emit_str_imm_w(b, 31U, 19U, 76U); /* lazy_op = NONE */
-    /* Eager-eflags producer (h_shift.c shape): ctx->eflags current,
-     * NZCV holds the internal `cmp res, #0` -> rebuild path only. */
-    e->flags_src = I686_FLAGS_EFLAGS;
+        if (cnt == 1U) {
+            if (kind == SHK_SHL) {
+                /* OF = CF ^ MSB(result): w13 = MSB(res), w14 = CF. */
+                a64_emit_eor_reg_w(b, SCR_T4, SCR_T2, SCR_T3, A64_SHIFT_LSL, 0U);
+                emit_bfi_w(b, SCR_T0, SCR_T4, 11U, 1U);
+            } else if (kind == SHK_SHR) {
+                a64_emit_ubfm_w(b, SCR_T4, SCR_A, msb, msb); /* MSB(operand) */
+                emit_bfi_w(b, SCR_T0, SCR_T4, 11U, 1U);
+            } /* SAR count 1: OF = 0, already cleared */
+        }
+
+        a64_emit_str_imm_w(b, SCR_T0, 19U, 36U);
+        a64_emit_str_imm_w(b, 31U, 19U, 76U); /* lazy_op = NONE */
+        /* Eager-eflags producer (h_shift.c shape): ctx->eflags current,
+         * NZCV holds the internal `cmp res, #0` -> rebuild path only. */
+        e->flags_src = I686_FLAGS_EFLAGS;
+    } else {
+        e->flags_src = I686_FLAGS_DEAD;
+    }
 
     emit_store_rm(e, insn, SCR_RES, width);
     e->insn_count++;

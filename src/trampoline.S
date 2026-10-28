@@ -71,11 +71,8 @@ _i686_jit_run_block:
      * pointers before the next dispatch, so a cleared or collided slot
      * falls through to the C epilogue, which recompiles. */
 .Lstore_gprs:
-    stp     w0,  w1,  [x19, #0]
-    stp     w2,  w3,  [x19, #8]
-    stp     w4,  w5,  [x19, #16]
-    stp     w6,  w7,  [x19, #24]
-
+    /* w0..w7 already hold the live guest GPRs (eax..edi): no spill or
+     * reload on the chaining path, only when exiting to C below. */
     ldr     w8,  [x19, #120]        /* ctx->exit_reason */
     cmp     w8,  #1                 /* I686_EXIT_BRANCH: only plain
                                        branches chain; syscall, UNDEF,
@@ -90,10 +87,6 @@ _i686_jit_run_block:
     ldr     x23, [x11, #2544]       /* slot->host_code (key@0, epoch@4,
                                        host_code@8) */
     cbz     x23, .Lexit             /* cleared slot -> C epilogue */
-    ldp     w0,  w1,  [x19, #0]     /* reload guest GPRs */
-    ldp     w2,  w3,  [x19, #8]
-    ldp     w4,  w5,  [x19, #16]
-    ldp     w6,  w7,  [x19, #24]
     ldr     x12, [x19, #464]        /* ctx->ibtc_hits++ */
     add     x12, x12, #1
     str     x12, [x19, #464]
@@ -104,6 +97,10 @@ _i686_jit_run_block:
     b       .Lstore_gprs
 
 .Lexit:
+    stp     w0,  w1,  [x19, #0]     /* spill live GPRs on exit to C */
+    stp     w2,  w3,  [x19, #8]
+    stp     w4,  w5,  [x19, #16]
+    stp     w6,  w7,  [x19, #24]
     ldp     d8,  d9,  [sp, #96]
     ldp     d10, d11, [sp, #112]
     ldp     d12, d13, [sp, #128]

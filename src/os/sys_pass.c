@@ -580,9 +580,10 @@ static long open_guest(const i686_ctx_t *ctx, const char *path, int flags,
     if (path[0] == '/' && ctx->sysroot != NULL &&
         ctx->sysroot[0] != '\0') {
         size_t n = strlen(ctx->sysroot);
-        if (n + strlen(path) < sizeof buf) {
+        size_t pl = strlen(path);
+        if (n + pl < sizeof buf) {
             memcpy(buf, ctx->sysroot, n);
-            strcpy(buf + n, path);
+            memcpy(buf + n, path, pl + 1U);
             {
                 int fd = open(buf, flags, mode);
                 if (fd >= 0) {
@@ -738,10 +739,11 @@ static long sys_readlink(i686_ctx_t *ctx, uint32_t link_va, uint32_t buf_va,
     if (linkp[0] == '/' && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
         char sp[PATH_BUF];
         size_t sl = strlen(ctx->sysroot);
+        size_t ll = strlen(linkp);
 
-        if (sl + strlen(linkp) < sizeof sp) {
+        if (sl + ll < sizeof sp) {
             memcpy(sp, ctx->sysroot, sl);
-            strcpy(sp + sl, linkp);
+            memcpy(sp + sl, linkp, ll + 1U);
             n = readlink(sp, target, sizeof target - 1U);
             if (n >= 0) {
                 if ((size_t)n > bufsiz) {
@@ -846,10 +848,11 @@ static long sys_access(i686_ctx_t *ctx, uint32_t path_va, uint32_t mode)
     if (path[0] == '/' && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
         char sp[PATH_BUF];
         size_t sl = strlen(ctx->sysroot);
+        size_t pl = strlen(path);
 
-        if (sl + strlen(path) < sizeof sp) {
+        if (sl + pl < sizeof sp) {
             memcpy(sp, ctx->sysroot, sl);
-            strcpy(sp + sl, path);
+            memcpy(sp + sl, path, pl + 1U);
             if (access(sp, (int)mode) == 0) {
                 return 0;
             }
@@ -878,10 +881,11 @@ static long sys_faccessat(i686_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
             ctx->sysroot[0] != '\0') {
             char sp[PATH_BUF];
             size_t sl = strlen(ctx->sysroot);
+            size_t pl = strlen(path);
 
-            if (sl + strlen(path) < sizeof sp) {
+            if (sl + pl < sizeof sp) {
                 memcpy(sp, ctx->sysroot, sl);
-                strcpy(sp + sl, path);
+                memcpy(sp + sl, path, pl + 1U);
                 if (faccessat(AT_FDCWD, sp, (int)mode, 0) == 0) {
                     return 0;
                 }

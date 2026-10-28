@@ -512,10 +512,11 @@ static int64_t stat_path(i686_ctx_t *ctx, int dirfd, uint32_t path_va,
         ctx->sysroot[0] != '\0') {
         char sp[L2A_PATH_MAX];
         size_t sl = strlen(ctx->sysroot);
+        size_t pl = strlen(path);
 
-        if (sl + strlen(path) < sizeof sp) {
+        if (sl + pl < sizeof sp) {
             memcpy(sp, ctx->sysroot, sl);
-            strcpy(sp + sl, path);
+            memcpy(sp + sl, path, pl + 1U);
             if (fstatat(AT_FDCWD, sp, &st, flags) == 0) {
                 goto have_stat;
             }
@@ -858,10 +859,11 @@ static int64_t h_statx(i686_ctx_t *ctx)
         ctx->sysroot[0] != '\0') {
         char sp[L2A_PATH_MAX];
         size_t sl = strlen(ctx->sysroot);
+        size_t pl = strlen(path);
 
-        if (sl + strlen(path) < sizeof sp) {
+        if (sl + pl < sizeof sp) {
             memcpy(sp, ctx->sysroot, sl);
-            strcpy(sp + sl, path);
+            memcpy(sp + sl, path, pl + 1U);
             if (syscall(SYS_statx, dirfd, sp, (unsigned int)flags,
                         (unsigned int)mask, stx) == 0) {
                 goto have_statx;

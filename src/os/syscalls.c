@@ -488,11 +488,12 @@ int i686_exec_open(const i686_ctx_t *ctx, const char *path)
 
     if (path[0] == '/' && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
         size_t n = strlen(ctx->sysroot);
-        if (n + strlen(path) < sizeof buf) {
+        size_t pl = strlen(path);
+        if (n + pl < sizeof buf) {
             int fd;
 
             memcpy(buf, ctx->sysroot, n);
-            strcpy(buf + n, path);
+            memcpy(buf + n, path, pl + 1U);
             fd = open(buf, O_RDONLY | O_CLOEXEC);
             if (fd >= 0) {
                 return fd;
