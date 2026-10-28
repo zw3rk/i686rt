@@ -46,23 +46,9 @@ _Static_assert((I686_CTX_FLAGS_ELIDED_OFFSET >> 3) <= 0xFFFFU,
 
 void i686_dbt_emit_elide_bump(i686_emit_ctx_t *e)
 {
-    a64_buf_t *b = &e->buf;
-
-    /* MOVZ W11, #(offset>>3): W form zeroes the upper half (wanted). */
-    a64_emit_movz_w(b, 11U, (uint16_t)(I686_CTX_FLAGS_ELIDED_OFFSET >> 3),
-                    0U);
-    /* ADD X12, X19, X11, LSL #3: x12 = &ctx->flags_elided.  The address
-     * MUST live in a register distinct from the loaded value: a naive
-     * `str x11, [x19, x11, lsl #3]` after the increment would index the
-     * store with the NEW counter value (observed: a stray write to
-     * ctx->gpr[2] masked by the trampoline store-back, counter stuck). */
-    a64_emit(b, 0x8B0B0E6CU);
-    /* LDR X11, [X12]. */
-    a64_emit(b, 0xF940018BU);
-    /* ADD X11, X11, #1. */
-    a64_emit(b, 0x9100056BU);
-    /* STR X11, [X12]. */
-    a64_emit(b, 0xF900018BU);
+    if (e != NULL && e->ctx != NULL) {
+        e->ctx->flags_elided++;
+    }
 }
 
 /* Rebuild NZCV from ctx->eflags (natural SUBS polarity: C := !CF).
