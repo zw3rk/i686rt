@@ -111,49 +111,79 @@ static unsigned ea_seg_index(const x86_insn_t *insn)
 void i686_emit_ea(i686_emit_ctx_t *e, const x86_insn_t *insn, int add_seg)
 {
     a64_buf_t *b = &e->buf;
-    int started = 0;
-    unsigned s;
 
-    if (insn->ea_disp != 0U ||
-        (insn->ea_base == 0xFFU && insn->ea_index == 0xFFU)) {
-        a64_emit_mov_imm32(b, 21U, insn->ea_disp);
-        started = 1;
-    }
     if (insn->ea_base != 0xFFU) {
+        /* Fast path: fold a small displacement into a single ADD/SUB
+         * immediate off the base (every 32-bit W-register write already
+         * zero-extends X21, so no UXTW is needed anywhere here). */
         unsigned wb = insn->ea_base & 7U;
-        if (started != 0) {
+        int32_t disp = (int32_t)insn->ea_disp;
+        if (insn->ea_disp == 0U) {
+            if (insn->ea_index != 0xFFU) {
+                a64_emit_add_reg_w(b, false, 21U, wb, insn->ea_index & 7U,
+                                   A64_SHIFT_LSL, insn->ea_scale & 3U);
+            } else {
+                a64_emit_mov_w(b, 21U, wb);
+            }
+        } else if (disp > 0 && disp <= 4095) {
+            a64_emit_add_imm_w(b, false, 21U, wb, (uint16_t)disp, 0U);
+            if (insn->ea_index != 0xFFU) {
+                a64_emit_add_reg_w(b, false, 21U, 21U, insn->ea_index & 7U,
+                                   A64_SHIFT_LSL, insn->ea_scale & 3U);
+            }
+        } else if (disp < 0 && -(int64_t)disp <= 4095) {
+            a64_emit_sub_imm_w(b, false, 21U, wb, (uint16_t)(-disp), 0U);
+            if (insn->ea_index != 0xFFU) {
+                a64_emit_add_reg_w(b, false, 21U, 21U, insn->ea_index & 7U,
+                                   A64_SHIFT_LSL, insn->ea_scale & 3U);
+            }
+        } else {
+            a64_emit_mov_imm32(b, 21U, insn->ea_disp);
             a64_emit_add_reg_w(b, false, 21U, 21U, wb, A64_SHIFT_LSL, 0U);
-        } else {
-            a64_emit_mov_w(b, 21U, wb);
+            if (insn->ea_index != 0xFFU) {
+                /* ea_scale is the shift amount itself (0..3 => x1/x2/x4/x8,
+                 * decode.h); the shifted-ADD amount is a shift. */
+                a64_emit_add_reg_w(b, false, 21U, 21U, insn->ea_index & 7U,
+                                   A64_SHIFT_LSL, insn->ea_scale & 3U);
+            }
+        }
+    } else {
+        int started = 0;
+        unsigned s;
+        if (insn->ea_disp != 0U || insn->ea_index == 0xFFU) {
+            a64_emit_mov_imm32(b, 21U, insn->ea_disp);
             started = 1;
         }
-    }
-    if (insn->ea_index != 0xFFU) {
-        unsigned wi = insn->ea_index & 7U;
-        /* ea_scale is the shift amount itself (0..3 => x1/x2/x4/x8,
-         * decode.h); the shifted-ADD amount is a shift, not a multiplier. */
-        s = insn->ea_scale & 3U;
-        if (started != 0) {
-            a64_emit_add_reg_w(b, false, 21U, 21U, wi, A64_SHIFT_LSL, s);
-        } else if (s != 0U) {
-            a64_emit_ubfm_w(b, 21U, wi, (32U - s) & 31U, 31U - s); /* lsl #s */
-            started = 1;
-        } else {
-            a64_emit_mov_w(b, 21U, wi);
-            started = 1;
+        if (insn->ea_index != 0xFFU) {
+            unsigned wi = insn->ea_index & 7U;
+            s = insn->ea_scale & 3U;
+            if (started != 0) {
+                a64_emit_add_reg_w(b, false, 21U, 21U, wi, A64_SHIFT_LSL, s);
+            } else if (s != 0U) {
+                a64_emit_ubfm_w(b, 21U, wi, (32U - s) & 31U,
+                                31U - s); /* lsl #s */
+                started = 1;
+            } else {
+                a64_emit_mov_w(b, 21U, wi);
+                started = 1;
+            }
+        }
+        if (started == 0) {
+            a64_emit_movz_w(b, 21U, 0U, 0U);
         }
     }
-    if (started == 0) {
-        a64_emit_movz_w(b, 21U, 0U, 0U);
-    }
-    a64_emit_ubfm_w(b, 21U, 21U, 0U, 31U); /* uxtw w21, w21 */
 
     if (add_seg != 0) {
         unsigned seg = ea_seg_index(insn);
         if (seg < I686_SEG_COUNT) {
-            a64_emit_ldr_imm_w(b, 22U, 19U, 40U + 4U * seg);
-            a64_emit_add_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL, 0U);
-            a64_emit_ubfm_w(b, 21U, 21U, 0U, 31U);
+            /* Flat non-FS/GS segments read as zero at emit time: skip
+             * the base load and add entirely. */
+            if (e->ctx == NULL || seg == I686_SEG_FS ||
+                seg == I686_SEG_GS || e->ctx->seg_base[seg] != 0U) {
+                a64_emit_ldr_imm_w(b, 22U, 19U, 40U + 4U * seg);
+                a64_emit_add_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL,
+                                   0U);
+            }
         }
     }
 }

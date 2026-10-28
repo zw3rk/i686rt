@@ -280,40 +280,11 @@ static void l3c_emit_cset_w11(i686_emit_ctx_t *e, unsigned cond)
                  (31U << 5) | L3C_W11);
 }
 
-/* ---- guest EA into w21 (mirrors x86_ea_compute + seg default) ----- */
+/* ---- guest EA into w21: the shared L3a fast helper (add_seg=1) --- */
 
 static void l3c_ea_w21(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
-    a64_buf_t *b = &e->buf;
-    unsigned seg;
-
-    if (insn->ea_base != L3C_NONE) {
-        a64_emit_mov_w(b, L3C_EA, i686_w(insn->ea_base));
-        if (insn->ea_disp != 0U) {
-            a64_emit_mov_imm32(b, L3C_W11, insn->ea_disp);
-            a64_emit_add_reg_w(b, false, L3C_EA, L3C_EA, L3C_W11,
-                               A64_SHIFT_LSL, 0U);
-        }
-    } else {
-        a64_emit_mov_imm32(b, L3C_EA, insn->ea_disp);
-    }
-    if (insn->ea_index != L3C_NONE) {
-        a64_emit_add_reg_w(b, false, L3C_EA, L3C_EA,
-                           i686_w(insn->ea_index), A64_SHIFT_LSL,
-                           insn->ea_scale);
-    }
-    /* Segment base: prefix override, else SS for BP/SP-based, else DS.
-     * Loaded at runtime: seg bases are runtime state (D8). */
-    seg = insn->pfx_seg != L3C_NONE
-              ? (unsigned)insn->pfx_seg
-              : ((insn->modrm_mod != 0U &&
-                  (insn->ea_base == I686_REG_EBP ||
-                   insn->ea_base == I686_REG_ESP))
-                     ? (unsigned)I686_SEG_SS
-                     : (unsigned)I686_SEG_DS);
-    a64_emit_ldr_imm_w(b, L3C_W11, A64_XCTX, 40U + 4U * seg);
-    a64_emit_add_reg_w(b, false, L3C_EA, L3C_EA, L3C_W11, A64_SHIFT_LSL,
-                       0U);
+    i686_emit_ea(e, insn, 1);
 }
 
 /* ------------------------------------------------------------------ */

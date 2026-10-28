@@ -114,29 +114,82 @@ void i686_emit_ea(i686_emit_ctx_t *e, const x86_insn_t *insn, int add_seg)
 {
     a64_buf_t *b = &e->buf;
 
-    a64_emit_mov_imm32(b, 21U, insn->ea_disp);
     if (insn->ea_base != NONE) {
-        a64_emit_add_reg_w(b, false, 21U, 21U, i686_w(insn->ea_base),
-                           A64_SHIFT_LSL, 0U);
-    }
-    if (insn->ea_index != NONE) {
-        if (insn->ea_scale != 0U) {
-            a64_emit_ubfm_w(b, 22U, i686_w(insn->ea_index),
-                            (32U - insn->ea_scale) & 31U,
-                            31U - insn->ea_scale); /* w22 = index << scale */
-            a64_emit_add_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL, 0U);
+        /* Fast path (mirrors src/dbt/emit_exit.c): fold a small
+         * displacement into a single ADD/SUB immediate off the base;
+         * every 32-bit W-register write already zero-extends X21. */
+        unsigned wb = i686_w(insn->ea_base);
+        int32_t disp = (int32_t)insn->ea_disp;
+        if (insn->ea_disp == 0U) {
+            if (insn->ea_index != NONE) {
+                a64_emit_add_reg_w(b, false, 21U, wb,
+                                   i686_w(insn->ea_index), A64_SHIFT_LSL,
+                                   insn->ea_scale & 3U);
+            } else {
+                a64_emit_mov_w(b, 21U, wb);
+            }
+        } else if (disp > 0 && disp <= 4095) {
+            a64_emit_add_imm_w(b, false, 21U, wb, (uint16_t)disp, 0U);
+            if (insn->ea_index != NONE) {
+                a64_emit_add_reg_w(b, false, 21U, 21U,
+                                   i686_w(insn->ea_index), A64_SHIFT_LSL,
+                                   insn->ea_scale & 3U);
+            }
+        } else if (disp < 0 && -(int64_t)disp <= 4095) {
+            a64_emit_sub_imm_w(b, false, 21U, wb, (uint16_t)(-disp), 0U);
+            if (insn->ea_index != NONE) {
+                a64_emit_add_reg_w(b, false, 21U, 21U,
+                                   i686_w(insn->ea_index), A64_SHIFT_LSL,
+                                   insn->ea_scale & 3U);
+            }
         } else {
-            a64_emit_add_reg_w(b, false, 21U, 21U, i686_w(insn->ea_index),
-                               A64_SHIFT_LSL, 0U);
+            a64_emit_mov_imm32(b, 21U, insn->ea_disp);
+            a64_emit_add_reg_w(b, false, 21U, 21U, wb, A64_SHIFT_LSL, 0U);
+            if (insn->ea_index != NONE) {
+                a64_emit_add_reg_w(b, false, 21U, 21U,
+                                   i686_w(insn->ea_index), A64_SHIFT_LSL,
+                                   insn->ea_scale & 3U);
+            }
+        }
+    } else {
+        int started = 0;
+        if (insn->ea_disp != 0U || insn->ea_index == NONE) {
+            a64_emit_mov_imm32(b, 21U, insn->ea_disp);
+            started = 1;
+        }
+        if (insn->ea_index != NONE) {
+            if (insn->ea_scale != 0U) {
+                a64_emit_ubfm_w(b, 22U, i686_w(insn->ea_index),
+                                (32U - insn->ea_scale) & 31U,
+                                31U - insn->ea_scale); /* w22 = index << scale */
+                a64_emit_add_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL,
+                                   0U);
+            } else if (started != 0) {
+                a64_emit_add_reg_w(b, false, 21U, 21U,
+                                   i686_w(insn->ea_index),
+                                   A64_SHIFT_LSL, 0U);
+            } else {
+                a64_emit_mov_w(b, 21U, i686_w(insn->ea_index));
+                started = 1;
+            }
+        }
+        if (started == 0) {
+            a64_emit_movz_w(b, 21U, 0U, 0U);
         }
     }
     if (add_seg != 0) {
         uint8_t seg = (insn->pfx_seg != NONE) ? insn->pfx_seg
                                               : ea_def_seg(insn);
         if (seg < I686_SEG_COUNT) {
-            a64_emit_ldr_imm_w(b, 22U, A64_XCTX,
-                               40U + 4U * (unsigned)seg);
-            a64_emit_add_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL, 0U);
+            /* Flat non-FS/GS segments read as zero at emit time: skip
+             * the base load and add entirely. */
+            if (e->ctx == NULL || seg == I686_SEG_FS ||
+                seg == I686_SEG_GS || e->ctx->seg_base[seg] != 0U) {
+                a64_emit_ldr_imm_w(b, 22U, A64_XCTX,
+                                   40U + 4U * (unsigned)seg);
+                a64_emit_add_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL,
+                                   0U);
+            }
         }
     }
 }

@@ -17,9 +17,10 @@
  * x24 = dispatch-loop block budget (Lane P3, Wave P: reloaded to 4096
  * on every engine entry; the chaining path decrements it per linked
  * block and falls out of the loop at zero so async signals cannot
- * starve behind an unbounded IBTC chain). Emitted code never touches
- * x24 (A64 temps are x15-x17/x21-x23), and the prologue/epilogue
- * preserve it for the C caller.
+ * starve behind an unbounded IBTC chain). x25 accumulates the chained
+ * ctx->ibtc_hits delta (bumped per link, flushed once at .Lexit).
+ * Emitted code never touches x24/x25 (A64 temps are x15-x17/x21-x23),
+ * and the prologue/epilogue preserve them for the C caller.
  */
 
     .text
@@ -60,6 +61,8 @@ _i686_jit_run_block:
 
     movz    x24, #0x1000            /* block budget: 4096 chained blocks
                                        per engine entry (Lane P3) */
+    mov     x25, xzr                 /* chain-hit delta: flushed once at
+                                       .Lexit instead of per link */
     blr     x23                     /* call emitted code (stashed ptr) */
 
     /* C6b dispatch loop: store GPRs back, then link a BRANCH exit
@@ -87,9 +90,7 @@ _i686_jit_run_block:
     ldr     x23, [x11, #2544]       /* slot->host_code (key@0, epoch@4,
                                        host_code@8) */
     cbz     x23, .Lexit             /* cleared slot -> C epilogue */
-    ldr     x12, [x19, #464]        /* ctx->ibtc_hits++ */
-    add     x12, x12, #1
-    str     x12, [x19, #464]
+    add     x25, x25, #1            /* one chained link: flush at .Lexit */
     subs    x24, x24, #1            /* block budget: chaining ends at zero
                                        so async signals cannot starve */
     b.eq    .Lexit
@@ -97,6 +98,11 @@ _i686_jit_run_block:
     b       .Lstore_gprs
 
 .Lexit:
+    cbz     x25, 1f                 /* flush the accumulated ibtc_hits */
+    ldr     x12, [x19, #464]
+    add     x12, x12, x25
+    str     x12, [x19, #464]
+1:
     stp     w0,  w1,  [x19, #0]     /* spill live GPRs on exit to C */
     stp     w2,  w3,  [x19, #8]
     stp     w4,  w5,  [x19, #16]
