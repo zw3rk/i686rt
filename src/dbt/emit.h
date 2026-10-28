@@ -64,6 +64,16 @@ typedef struct i686_emit_ctx {
         I686_FLAGS_EFLAGS = 1,
         I686_FLAGS_NZCV = 2
     } flags_src;
+    /* Lane P3 (Wave P) per-insn carrier, set by translate.c before each
+     * emitter runs.  insn_pc is the insn's guest PC (mid-block fault
+     * exits such as DIV/IDIV need it for the UNDEF exit dest).
+     * skip_lazy lets the fault-barrier-safe pre-scan suppress dead
+     * emit_lazy() stores in register-only ALU sequences: only fused
+     * lazy-descriptor producers consult it (ADD/SUB/CMP/AND/OR/XOR/
+     * TEST/NEG); eager producers (shifts, IMUL, ADC/SBB, INC/DEC,
+     * rotates, MUL/DIV, SHLD/SHRD, COMIS) always store. */
+    uint32_t insn_pc;
+    uint8_t  skip_lazy;
 } i686_emit_ctx_t;
 
 /* Lifecycle (translate.c owns; frozen for lanes). */

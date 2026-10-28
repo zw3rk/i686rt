@@ -35,11 +35,12 @@
  *   - NOT and the cnt==0 shift write no flag state at all -> the
  *     previous proof still holds, leave e->flags_src untouched.
  *
- * Declined in v1 (returning -1 is always D2-safe; translate.c emits the
- * UNDEF fallback and the engine interpret-one): ADC/SBB and INC/DEC (both
- * need the materialize-old-flags helper ABI, coordinator-owned
- * src/dbt/flags_dbt.h), one-operand MUL/IMUL/DIV/IDIV, rotates/RCL/RCR,
- * CL-count and memory shifts, memory forms of NEG/NOT.
+ * Lowered since v1 (Lane P3, Wave P): NEG/NOT and SHL/SHR/SAR cover
+ * register and memory destinations; the remaining new rows (ROL/ROR,
+ * INC/DEC, CL-shifts, one-operand MUL/IMUL/DIV/IDIV, ADC/SBB, SHLD/
+ * SHRD) live in src/dbt/emit_alu_ext.c and dispatch from i686_emit_alu
+ * below.  RCL/RCR still decline (returning -1 is always D2-safe;
+ * translate.c emits the UNDEF fallback and the engine interprets one).
  *
  * Scratch map (w0..w7 guest GPRs, x19 ctx, x20 xG per D7; w21/w22 belong
  * to i686_emit_ea): w8 = A (dest value), w9 = B (src/imm), w10 = result,
@@ -237,6 +238,9 @@ static void emit_lazy(i686_emit_ctx_t *e, uint32_t fop, unsigned res,
 {
     a64_buf_t *b = &e->buf;
 
+    if (e->skip_lazy != 0U) {
+        return; /* Lane P3 pre-scan proved this store dead. */
+    }
     a64_emit_movz_w(b, SCR_T0, (uint16_t)fop, 0U);
     a64_emit_str_imm_w(b, SCR_T0, 19U, 76U);  /* lazy_op   */
     a64_emit_str_imm_w(b, res, 19U, 80U);     /* lazy_res  */
@@ -393,7 +397,7 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
     } else if (kind == ALUK_SUB || kind == ALUK_CMP) {
         emit_lazy(e, I686_FOP_SUB, SCR_RES, SCR_A, SCR_B, width);
     } else {
-        emit_lazy(e, I686_FOP_LOGIC, SCR_RES, 31U, 31U, width);
+        emit_lazy(e, I686_FOP_LOGIC, SCR_RES, SCR_RES, 31U, width);
     }
     /* Fused image live in NZCV (natural SUBS polarity): a later
      * same-block consumer may fuse on it directly (emit.h seam). */
@@ -412,11 +416,14 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
                          ? 8U
                          : (insn->pfx_opsize != 0U ? 16U : 32U);
     unsigned sh = (width == 32U) ? 0U : 32U - width;
+    int is_mem = insn->modrm_mod != 3U && insn->ea_has != 0U;
 
-    if (insn->modrm_mod != 3U) {
-        return -1; /* v1: register forms only (mem is D2-safe to decline) */
+    if (is_mem != 0 && insn->pfx_lock != 0U) {
+        /* LOCKed memory: the interpreter's atomic path (lane atomic
+         * module does not cover NEG/NOT). */
+        return -1;
     }
-    emit_load_reg(b, SCR_A, insn->modrm_rm, width);
+    emit_load_rm(e, insn, SCR_A, width);
     if (sh != 0U) {
         emit_lsl_imm_w(b, SCR_A, SCR_A, sh);
     }
@@ -428,7 +435,7 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
             emit_lsr_imm_w(b, SCR_A, SCR_A, sh);
             emit_lsr_imm_w(b, SCR_RES, SCR_RES, sh);
         }
-        emit_store_reg(b, SCR_RES, insn->modrm_rm, width);
+        emit_store_rm(e, insn, SCR_RES, width);
         emit_lazy(e, I686_FOP_NEG, SCR_RES, SCR_A, 31U, width);
         /* SUBS wzr-derived image is live in NZCV (natural polarity). */
         e->flags_src = I686_FLAGS_NZCV;
@@ -437,7 +444,7 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
         if (sh != 0U) {
             emit_lsr_imm_w(b, SCR_RES, SCR_RES, sh);
         }
-        emit_store_reg(b, SCR_RES, insn->modrm_rm, width);
+        emit_store_rm(e, insn, SCR_RES, width);
         /* NOT sets no flags: descriptor, eflags and the previous
          * flags_src proof all stay untouched. */
     }
@@ -522,14 +529,17 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
                          : (insn->pfx_opsize != 0U ? 16U : 32U);
     unsigned msb = width - 1U;
     uint32_t cnt;
+    int is_mem = insn->modrm_mod != 3U && insn->ea_has != 0U;
 
-    if (insn->modrm_mod != 3U) {
-        return -1; /* v1: register forms */
+    if (is_mem != 0 && insn->pfx_lock != 0U) {
+        /* LOCKed memory: the interpreter's atomic path (lane atomic
+         * module does not cover shifts). */
+        return -1;
     }
     if (insn->opnd[1] == I686_OPND_ONE) {
         cnt = 1U;
     } else {
-        cnt = insn->imm & 0xFFU; /* CL forms never reach here (declined) */
+        cnt = insn->imm & 0xFFU; /* CL forms live in emit_alu_ext.c */
     }
     cnt &= 31U;                  /* i386 5-bit count mask */
     if (cnt == 0U) {
@@ -538,7 +548,7 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
         return 0;
     }
 
-    emit_load_reg(b, SCR_A, insn->modrm_rm, width);
+    emit_load_rm(e, insn, SCR_A, width);
 
     if (kind == SHK_SHL) {
         emit_lsl_imm_w(b, SCR_RES, SCR_A, cnt);
@@ -613,7 +623,7 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
      * NZCV holds the internal `cmp res, #0` -> rebuild path only. */
     e->flags_src = I686_FLAGS_EFLAGS;
 
-    emit_store_reg(b, SCR_RES, insn->modrm_rm, width);
+    emit_store_rm(e, insn, SCR_RES, width);
     e->insn_count++;
     return 0;
 }
@@ -678,9 +688,13 @@ int i686_emit_alu(i686_emit_ctx_t *e, const x86_insn_t *insn)
     case I686_OP_SAR_EvIb:
         return emit_shift_imm(e, insn, SHK_SAR);
 
-    default:
-        /* ADC/SBB, INC/DEC (need the flags_dbt.h materializer ABI),
-         * one-operand MUL/DIV, rotates, CL/memory shifts: declined. */
-        return -1;
+    default: {
+        /* Lane P3 (Wave P): ROL/ROR, INC/DEC, CL-shifts, one-operand
+         * MUL/IMUL/DIV/IDIV, ADC/SBB and SHLD/SHRD live in
+         * emit_alu_ext.c; RCL/RCR still decline (D2-safe). */
+        extern int i686_emit_alu_ext(i686_emit_ctx_t *,
+                                     const x86_insn_t *);
+        return i686_emit_alu_ext(e, insn);
+    }
     }
 }

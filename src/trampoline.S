@@ -13,7 +13,13 @@
  *   `ret` after storing exits into ctx. ABI-locked offsets per
  * src/i686rt.h: gpr@0, eip@32, eflags@36, exit_reason@120, exit_arg@124,
  * exit_dest@132, guest_base@112, ibtc_hits@464, ibtc@2536 (C6b; engine.c
- * _Static_asserts pin what this loop assumes).
+ * _Static_asserts pin what this loop assumes). Trampoline scratch:
+ * x24 = dispatch-loop block budget (Lane P3, Wave P: reloaded to 4096
+ * on every engine entry; the chaining path decrements it per linked
+ * block and falls out of the loop at zero so async signals cannot
+ * starve behind an unbounded IBTC chain). Emitted code never touches
+ * x24 (A64 temps are x15-x17/x21-x23), and the prologue/epilogue
+ * preserve it for the C caller.
  */
 
     .text
@@ -52,6 +58,8 @@ _i686_jit_run_block:
     ldp     w4,  w5,  [x19, #16]
     ldp     w6,  w7,  [x19, #24]
 
+    movz    x24, #0x1000            /* block budget: 4096 chained blocks
+                                       per engine entry (Lane P3) */
     blr     x23                     /* call emitted code (stashed ptr) */
 
     /* C6b dispatch loop: store GPRs back, then link a BRANCH exit
@@ -89,6 +97,9 @@ _i686_jit_run_block:
     ldr     x12, [x19, #464]        /* ctx->ibtc_hits++ */
     add     x12, x12, #1
     str     x12, [x19, #464]
+    subs    x24, x24, #1            /* block budget: chaining ends at zero
+                                       so async signals cannot starve */
+    b.eq    .Lexit
     blr     x23
     b       .Lstore_gprs
 
