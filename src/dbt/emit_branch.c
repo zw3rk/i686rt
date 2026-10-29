@@ -267,6 +267,10 @@ static void l3c_flags_consume(i686_emit_ctx_t *e)
     }
     default: /* I686_FLAGS_DEAD: conservative full sequence */
         l3c_flags_to_nzcv(e);
+        /* The helper BLR above can clobber caller-saved v16..v23, and
+         * SETcc/CMOVcc continue the block after this consume: the Lane
+         * P13-6 XMM cache dies here. */
+        e->xmm_valid = 0u;
         break;
     }
     e->flags_src = I686_FLAGS_NZCV;

@@ -74,6 +74,16 @@ typedef struct i686_emit_ctx {
      * rotates, MUL/DIV, SHLD/SHRD, COMIS) always store. */
     uint32_t insn_pc;
     uint8_t  skip_lazy;
+    /* Lane P13-6 write-through XMM register cache: bit reg set means
+     * v(16+reg) holds ctx->xmm[reg] (a full 128-bit copy).  Cleared by
+     * the i686_emit_begin memset at block entry (which also covers the
+     * FXRSTOR case: unemittable insns always end the block, so the next
+     * block starts with a zero mask), after sse_flags_sync C helper
+     * calls, and after the branch flags-sync helper call (both BLRs
+     * can clobber caller-saved v16..v23 mid-block).  Every XMM write
+     * stores through to ctx->xmm[reg] in memory, so ctx->xmm[] stays
+     * coherent on faults, signals, FXSAVE and helper exits. */
+    uint8_t  xmm_valid;
 } i686_emit_ctx_t;
 
 /* Lifecycle (translate.c owns; frozen for lanes). */
@@ -123,5 +133,11 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn);
  * jcc/setcc/cmovcc fuse on NZCV when lazy_op == that constant, else
  * call the flags.c materializer via helper. Frozen in src/dbt/flags_dbt.h
  * (coordinator-owned). */
+
+/* SSE/SSE2 emitters (Phase 5 lane L5a, split in Lane P13-6 for the line
+ * discipline: emit_sse.c owns moves/logic/arithmetic, emit_sse2.c owns
+ * compares/converts/misc; both share emit_sse_shared.h). */
+int i686_emit_sse(i686_emit_ctx_t *e, const x86_insn_t *insn);
+int i686_emit_sse2(i686_emit_ctx_t *e, const x86_insn_t *insn);
 
 #endif /* I686RT_DBT_EMIT_H */

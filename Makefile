@@ -248,9 +248,13 @@ U3_OWNED := src/vm/vm32.c src/vm/vm32.h src/vm/vm_file.c src/vm/vm_file.h \
         src/dbt/aot/aot.h src/dbt/aot/aot.c \
         src/interp/h_alu.c src/interp/h_shift.c src/dbt/emit_mov.c \
         src/i686rt.h tests/unit/test_u3_sites.c
+# Lane P13-6 split of the SSE emitter (emit_sse.c + emit_sse2.c sharing
+# emit_sse_shared.h) plus the dbt header carrying the XMM cache mask.
+P13_OWNED := src/dbt/emit_sse.c src/dbt/emit_sse2.c \
+        src/dbt/emit_sse_shared.h src/dbt/emit.h
 check-line-limits: ## Enforce the <= 900-line rule on lane-owned files
 	@fail=0; \
-	for f in $(U3_OWNED); do \
+	for f in $(U3_OWNED) $(P13_OWNED); do \
 	  n=$$(wc -l < "$$f"); \
 	  if [ "$$n" -gt 900 ]; then echo "OVER LIMIT: $$f ($$n lines)"; fail=1; fi; \
 	done; \
