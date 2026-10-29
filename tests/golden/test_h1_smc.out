@@ -1,0 +1,4 @@
+smc-patch-imm ok
+smc-rewrite-stub ok
+smc-same-page ok
+PASS
