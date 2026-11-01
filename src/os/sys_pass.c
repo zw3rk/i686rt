@@ -563,6 +563,18 @@ int i686_gsig_is_ignored(int signum)
     return (signum >= 1 && signum <= 64 && s_sigact[signum].handler == 1U);
 }
 
+/* Async-signal-safe disposition probe for the host SIGALRM bridge
+ * (signals_i386.c): a single 4-byte load, no static-buffer copy, so it
+ * is safe inside a host signal handler. 0 = SIG_DFL, 1 = SIG_IGN. */
+uint32_t i686_gsig_handler_raw(int signum);
+uint32_t i686_gsig_handler_raw(int signum)
+{
+    if (signum < 1 || signum > 64) {
+        return 0U;
+    }
+    return s_sigact[signum].handler;
+}
+
 
 /* prctl PR_{GET,SET}_NAME: TASK_COMM_LEN = 16 NUL-padded bytes. */
 static char s_comm[16];
@@ -1233,8 +1245,12 @@ static long sys_sigaltstack(i686_ctx_t *ctx, uint32_t ss_va, uint32_t old_ss_va)
      * altstack fields (never handed to the host). */
     if (old_ss_va != 0U) {
         uint8_t old[SS_];
+        uint32_t oflags = ctx->altstack_flags;
+        if (ctx->altstack_onstack != 0U) {
+            oflags |= 0x1U; /* SS_ONSTACK: caller runs on the alt stack */
+        }
         wr_le32(old + 0U, ctx->altstack_sp);
-        wr_le32(old + 4U, ctx->altstack_flags);
+        wr_le32(old + 4U, oflags);
         wr_le32(old + 8U, ctx->altstack_size);
         if (guest_ptr_bad(old_ss_va) ||
             i686_copy_to_guest(ctx, old_ss_va, old, sizeof old) != 0) {

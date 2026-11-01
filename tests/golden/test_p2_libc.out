@@ -1,0 +1,5 @@
+p2_libc printf 42 ok
+p2_libc qsort 1 2 3 5 6 7 8 9
+p2_libc malloc 1 9
+p2_libc fileio fileio 1234
+p2_libc ALL OK

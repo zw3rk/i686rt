@@ -45,6 +45,12 @@ T_FULL = re.compile(
 # Syscall lines: "S <nr> -> <rv>", "S <nr>(<a1>) -> <rv>",
 # "S <nr>(<a1>,<a2>,<a3>) -> <rv>" (args are decimal or hex, unused here).
 S_FULL = re.compile(r"^S (-?\d+)(?:\([^)]*\))? -> (-?\d+)$")
+# Syscalls whose return value is a run-local OS identity (host pid/tid):
+# the two engine runs are separate processes, so these values always
+# differ run to run. Like the T-event pid skip above, compare only the
+# sequence (nr), not the identity value. The tid registry is
+# engine-shared code, so no engine-specific behavior is masked.
+RUN_LOCAL_RV = frozenset((20, 64, 224, 258))  # getpid, getppid, gettid, set_tid_address
 # Bare-token fallbacks so hand-written or deliberately corrupted traces
 # still compare event-by-event ("T 1" vs "T 9" must diverge, not parse-error).
 T_SHORT = re.compile(r"^T (\S+)$")
@@ -91,7 +97,9 @@ def parse_file(path):
             elif raw.startswith("S "):
                 match = S_FULL.match(raw)
                 if match is not None:
-                    key = (int(match.group(1)), int(match.group(2)))
+                    nr = int(match.group(1))
+                    rv = 0 if nr in RUN_LOCAL_RV else int(match.group(2))
+                    key = (nr, rv)
                 else:
                     match = S_SHORT.match(raw)
                     if match is None:

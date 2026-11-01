@@ -17,7 +17,9 @@
 #define I686RT_DBT_EMIT_ALU_IMPL_H
 
 #include <stdint.h>
+#include <string.h>
 
+#include "dbt/aot/aot.h"
 #include "dbt/emit.h"
 
 #define XALU_A    8U  /* destination operand value (width-masked) */
@@ -196,6 +198,48 @@ static inline void xalu_patch_b(a64_buf_t *b, size_t patch_idx, size_t target_id
 
 /* ---- guest memory (w21 = EA from i686_emit_ea) ------------------------ */
 
+/* RC-U3 recovery site for a non-LOCK ALU memory access (shared with
+ * emit_alu.c's load/store-rm pair).  Without it a fault in a load or
+ * store resumes at the block base and re-executes the (non-idempotent)
+ * prefix, corrupting registers the same way the missing atomic sites
+ * did (C2-2 flock).  mem is the LDR/STR offset itself (+4 into the TSO
+ * pair when e->tso, mirroring emit_mov.c).  Delta comes from
+ * translate.c's per-insn e->insn_pc. */
+static inline void xalu_note_mem_site(i686_emit_ctx_t *e,
+                                      const x86_insn_t *insn, uint32_t seq,
+                                      uint32_t mem, uint32_t cont,
+                                      unsigned width, unsigned val_reg,
+                                      unsigned is_store)
+{
+    dbt_mem_site_t site;
+
+    if (e->tso) {
+        mem += 4U;
+    }
+    memset(&site, 0, sizeof(site));
+    site.seq_start_offset = (uint16_t)seq;
+    site.host_insn_offset = (uint16_t)mem;
+    site.cont_insn_offset = (uint16_t)cont;
+    if (e->insn_pc >= e->guest_eip &&
+        e->insn_pc - e->guest_eip <= 0xFFF0U) {
+        site.guest_pc_delta = (uint16_t)(e->insn_pc - e->guest_eip);
+    } else {
+        site.guest_pc_delta = I686_SITE_PC_UNKNOWN;
+    }
+    site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                     ((uint32_t)insn->pfx_lock << 16);
+    site.sp_rollback_delta = 0;
+    site.npc_mode = (uint8_t)I686_NPC_SEQUENTIAL;
+    site.width = (uint8_t)width;
+    site.flags = is_store != 0U ? (uint8_t)I686_SITE_STORE : 0u;
+    site.val_or_dst_reg = (uint8_t)val_reg;
+    /* 0xFF sentinel in the frozen x86_insn_t (ea_base none). */
+    site.addr_base_reg = (uint8_t)(insn->ea_base != 0xFFU
+                                       ? i686_w(insn->ea_base)
+                                       : 0xFFu);
+    (void)i686_aot_note_stack_site(&site);
+}
+
 static inline void xalu_guest_load(i686_emit_ctx_t *e, unsigned rt, unsigned width)
 {
     a64_buf_t *b = &e->buf;
@@ -270,8 +314,17 @@ static inline void xalu_load_rm(i686_emit_ctx_t *e, const x86_insn_t *insn,
         xalu_load_reg(&e->buf, dst, insn->modrm_rm, width);
         return;
     }
-    i686_emit_ea(e, insn, 1);
-    xalu_guest_load(e, dst, width);
+    {
+        a64_buf_t *b = &e->buf;
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        i686_emit_ea(e, insn, 1);
+        mem = (uint32_t)((uint64_t)b->count * 4u);
+        xalu_guest_load(e, dst, width);
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        xalu_note_mem_site(e, insn, seq, mem, cont, width, dst, 0U);
+    }
 }
 
 static inline void xalu_store_rm(i686_emit_ctx_t *e, const x86_insn_t *insn,
@@ -282,7 +335,15 @@ static inline void xalu_store_rm(i686_emit_ctx_t *e, const x86_insn_t *insn,
         return;
     }
     /* Nothing between load and store touched w21. */
-    xalu_guest_store(e, src, width);
+    {
+        a64_buf_t *b = &e->buf;
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t cont;
+        xalu_guest_store(e, src, width);
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        xalu_note_mem_site(e, insn, seq, mem, cont, width, src, 1U);
+    }
 }
 
 /* ---- pending-flags materialization (no-op when already EFLAGS) ------- */

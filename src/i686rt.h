@@ -279,6 +279,11 @@ typedef struct i686_ctx {
     uint32_t dbt_fault_nzcv;     /* NZCV word spilled by the fault landing pad */
     uint32_t dbt_fault_w21;      /* w21 (faulting EA scratch) spilled by the landing pad */
     uint64_t vm_reserved[2];
+    /* C2-2: kernel sigaltstack SS_ONSTACK query state.  Set when a
+     * handler is entered on the alternate stack, cleared by sigreturn.
+     * A siglongjmp out of the handler intentionally leaves it set,
+     * matching the kernel (longjmp never clears on-stack state). */
+    uint32_t altstack_onstack;   /* 1 = executing on the alternate stack */
 } i686_ctx_t;
 
 /* ABI-locked offsets (src/trampoline.S, Phase 3, must agree). */

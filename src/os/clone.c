@@ -114,6 +114,15 @@ void i686_thread_registry_main(i686_ctx_t *ctx)
     (void)pthread_mutex_unlock(&s_registry_lock);
 }
 
+/* Main-ctx accessor for the async host-signal bridge (signals_i386.c):
+ * the bridge targets process-directed host timers at the main thread.
+ * Set once at startup before any clone; plain load is race-free. */
+i686_ctx_t *i686_thread_registry_main_ctx(void);
+i686_ctx_t *i686_thread_registry_main_ctx(void)
+{
+    return s_main_ctx;
+}
+
 /* r_exit runs the thread-exit teardown only for cloned threads; the
  * main thread's SYS_exit stays a process exit. */
 int i686_thread_is_main(i686_ctx_t *ctx);
@@ -420,17 +429,19 @@ static void *thread_entry(void *arg)
     s_thread_ctx = ctx;
     (void)pthread_once(&s_wake_once, wake_sig_install);
 
-    /* Adopt the host tid as the guest tid BEFORE any guest code runs
-     * (the kernel writes the true tid through CHILD_SETTID before the
-     * first instruction): PI futex ops write the kernel tid into the
-     * futex word and robust-list recovery compares against it, so the
-     * guest's tid view (set_tid_address/gettid, musl mutex words) must
-     * be the same number.  musl's self->tid is the PARENT_SETTID word
-     * (shared TLS, visible to the child); glibc's is CHILD_SETTID.
-     * The pre-start synthetic registry key is replaced in the same
-     * step. */
+    /* Publish the synthetic registry tid through PARENT_SETTID /
+     * CHILD_SETTID BEFORE any guest code runs (the kernel writes the
+     * true tid through CHILD_SETTID before the first instruction).
+     * This is the same number clone(2) returned to the parent and
+     * gettid/set_tid_address report, and the number musl/glibc mutex
+     * words and robust-list recovery compare against (C2 robust walk
+     * uses the r_clone-allocated registry tid).  The host tid is
+     * recorded in the registry alongside for internal wake/kill use.
+     * musl's self->tid is the PARENT_SETTID word (shared TLS, visible
+     * to the child); glibc's is CHILD_SETTID. */
     tid = clone_host_gettid();
     i686_thread_registry_set_host_tid(pre_tid, (int)tid);
+    tid = pre_tid;
     if (parent_tid_va != 0U) {
         (void)i686_copy_to_guest(ctx, parent_tid_va, &tid, 4U);
     }
@@ -474,23 +485,48 @@ static void *thread_entry(void *arg)
  * thread must never write guest memory again. */
 void i686_thread_exit_teardown(i686_ctx_t *ctx)
 {
-    static __thread int s_done;
+    /* C2-2: split the idempotence guard per phase.  The cleartid
+     * memcpy can host-fault (widened guard page); the fault path
+     * emulates it via interpret-one, which re-runs the exit syscall
+     * and re-enters this function.  A single s_done set before the
+     * clear would skip the clear AND the joiner wake on re-entry,
+     * hanging the joiner forever.  Robust recovery stays at-most-once
+     * (a faulted walk simply degrades, as before); the clear+wake is
+     * idempotent and retried until it completes. */
+    static __thread int s_robust_done;
+    static __thread int s_clear_done;
     uint32_t tid;
 
-    if (s_done != 0) {
-        return;
+    if (s_robust_done == 0) {
+        s_robust_done = 1;
+        tid = clone_host_gettid();
+        robust_exit_walk(ctx, tid);
+    } else {
+        tid = clone_host_gettid();
     }
-    s_done = 1;
-    tid = clone_host_gettid();
-    robust_exit_walk(ctx, tid);
     /* CLONE_CHILD_CLEARTID: clear the tid word and futex-wake it
      * (kernel exit_mm/exit_notify behavior).  The registry entry is
      * removed first, so a concurrent tkill sees -ESRCH for this dead
      * tid rather than signaling a ctx no thread will ever poll. */
     i686_thread_registry_remove(tid);
-    if (ctx->clear_child_tid != 0U) {
+    if (ctx->clear_child_tid != 0U && s_clear_done == 0) {
         uint32_t zero = 0U;
-        memcpy(i686_guest_ptr(ctx, ctx->clear_child_tid), &zero, 4U);
+        /* C2-2: pin the tid word's host page open across the clear+wake.
+         * The page may be widened-NONE (thread-stack guard cover); the
+         * clear would fault (handled, retried) but the host-side wake
+         * on a NONE page fails EFAULT and the joiner is lost.  Union
+         * here, re-widen after.  Single-threaded teardown (the joiner
+         * is blocked in the kernel) so the transient open is safe. */
+        extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t, uint32_t);
+        extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
+        {
+            uint32_t hps = (ctx->vm_host_page != 0u) ?
+                ctx->vm_host_page : 4096u;
+            uint32_t cpage = ctx->clear_child_tid & ~(hps - 1u);
+            (void)i686_vm32_union_prot(ctx, cpage, cpage + hps);
+            memcpy(i686_guest_ptr(ctx, ctx->clear_child_tid), &zero, 4U);
+            s_clear_done = 1;
+        }
         {
             /* Wake the joiner.  musl waits private (FUTEX_WAIT|PRIVATE)
              * but glibc's joiner waits SHARED (observed C10:
@@ -512,6 +548,12 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
                 (_Atomic uint32_t *)i686_guest_ptr(ctx, ctx->clear_child_tid),
                 NULL, 1, 0xFFFFFFFFu);
 #endif
+        }
+        {
+            uint32_t hps = (ctx->vm_host_page != 0u) ?
+                ctx->vm_host_page : 4096u;
+            uint32_t cpage = ctx->clear_child_tid & ~(hps - 1u);
+            (void)i686_vm32_widen_prot(ctx, cpage, cpage + hps);
         }
         ctx->clear_child_tid = 0U;
     }
@@ -544,16 +586,6 @@ static int64_t r_clone(i686_ctx_t *ctx)
     uint32_t child_eip = ctx->eip; /* engine sets exit_dest at clone */
 
     {
-        /* Thread-forensics (RC7b T4b): who clones what, and which TLS. */
-        extern int i686_sigtrace_on(void);
-        if (i686_sigtrace_on()) {
-            (void)fprintf(stderr,
-                          "CLN tid=%d flags=%08x newsp=%08x tls=%08x "
-                          "gs_sel=%04x gs_base=%08x eip=%08x\n",
-                          (int)clone_host_gettid(), flags, newsp, tls_va,
-                          ctx->seg_sel[I686_SEG_GS],
-                          ctx->seg_base[I686_SEG_GS], child_eip);
-        }
     }
 
     if ((flags & I686_CLONE_VM) == 0U) {
@@ -598,6 +630,15 @@ static int64_t r_clone(i686_ctx_t *ctx)
         return -ENOMEM;
     }
     memcpy(child, ctx, sizeof(*child));
+    /* C2-2: the parent's IBTC/RAS cache host pointers must not leak into
+     * the child.  The child owns a separate __thread translation cache
+     * and IBTC epoch space; an inherited {key, host_code, entry} tuple
+     * would dispatch the child into a parent block that a later parent
+     * eviction munmaps (and the host address may be reused for an
+     * unrelated block).  Start the child with cold predictor state. */
+    memset(child->ibtc, 0, sizeof(child->ibtc));
+    memset(child->ras, 0, sizeof(child->ras));
+    child->ras_top = 0U;
     child->is_thread_clone = true;
     child->gpr[I686_REG_ESP] = newsp;
     child->gpr[I686_REG_EAX] = 0U;
@@ -615,25 +656,6 @@ static int64_t r_clone(i686_ctx_t *ctx)
         if (terr != 0) {
             free(child); free(ca);
             return terr;
-        }
-    }
-    {
-        /* Thread-forensics (RC7b T4b): child state at hand-off. */
-        extern int i686_sigtrace_on(void);
-        if (i686_sigtrace_on()) {
-            uint32_t p_sys = 0U;
-
-            if (ctx->seg_base[I686_SEG_GS] != 0U) {
-                memcpy(&p_sys,
-                       i686_guest_ptr(ctx, ctx->seg_base[I686_SEG_GS] + 0x10U),
-                       sizeof(p_sys));
-            }
-            (void)fprintf(stderr,
-                          "CLNCHILD gs_sel=%04x gs_base=%08x eip=%08x "
-                          "esp=%08x parent_sys=%08x\n",
-                          child->seg_sel[I686_SEG_GS],
-                          child->seg_base[I686_SEG_GS], child->eip,
-                          child->gpr[I686_REG_ESP], p_sys);
         }
     }
     {
@@ -662,10 +684,14 @@ static int64_t r_clone(i686_ctx_t *ctx)
     ca->ctx = child;
     ca->tid = r_val;
     i686_thread_registry_add(child, r_val);
-    if (pthread_create(&th, NULL, thread_entry, ca) != 0) {
-        i686_thread_registry_remove(r_val);
-        free(child); free(ca);
-        return -ENOMEM;
+    {
+        int crc;
+        crc = pthread_create(&th, NULL, thread_entry, ca);
+        if (crc != 0) {
+            i686_thread_registry_remove(r_val);
+            free(child); free(ca);
+            return -ENOMEM;
+        }
     }
     pthread_detach(th);
     return (int64_t)r_val; /* parent sees the positive tid */

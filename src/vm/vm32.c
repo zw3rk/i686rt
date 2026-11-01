@@ -172,3 +172,33 @@ int i686_vm32_union_prot(i686_ctx_t *ctx, uint32_t start, uint32_t end)
     }
     return 0;
 }
+
+/* Most-restrictive cover: the host page denies whatever any sub-page
+ * denies.  Untracked (never-mapped) sub-pages read prot 0 and therefore
+ * restrict, which keeps munmap-created holes trapping (C2-2). */
+int i686_vm32_widen_prot(i686_ctx_t *ctx, uint32_t start, uint32_t end)
+{
+    uint64_t host_page;
+    uint64_t hva_start;
+    uint64_t hva_end;
+    uint64_t page;
+    if (ctx == NULL || end <= start) {
+        return -1;
+    }
+    host_page = (ctx->vm_host_page != 0u) ? (uint64_t)ctx->vm_host_page : 4096u;
+    hva_start = ctx->guest_base + (uint64_t)(start & ~(uint32_t)(host_page - 1u));
+    hva_end = ctx->guest_base + (((uint64_t)end + host_page - 1u) & ~(host_page - 1u));
+    for (page = hva_start; page < hva_end; page += host_page) {
+        int prot = 0x03;
+        uint32_t a;
+        for (a = 0u; (uint64_t)a < host_page; a += 0x1000u) {
+            uint32_t gva = (uint32_t)((page + (uint64_t)a) - ctx->guest_base);
+            prot &= (int)(i686_vm_file_prot(gva) & 0x03u);
+        }
+        /* AND of sub-page protections; EXEC is never mapped (W^X). */
+        if (rt_host_protect((void *)(uintptr_t)page, (size_t)host_page, prot) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}

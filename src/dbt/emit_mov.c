@@ -139,8 +139,50 @@ static uint16_t site_pc_delta(i686_emit_ctx_t *e, const x86_insn_t *insn)
     return (uint16_t)(pc - e->guest_eip);
 }
 
+/* RC-U3: record one guest-memory access site for fault recovery.  MOV
+ * loads and stores previously recorded nothing, so a faulting MOV
+ * recovered eip to the block base and the heal path emulated the wrong
+ * insn (fatal with stale GPRs).  Single-access insns call exactly once
+ * per emission so the (op,len) cursor attributes the right guest PC;
+ * mem is the faulting access offset itself (single-word accesses, or
+ * +4 into the TSO add+ldar pair when e->tso). */
+static void em_note_mem_site(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                             uint32_t seq, uint32_t mem, uint32_t cont,
+                             unsigned width, unsigned val_reg,
+                             unsigned base_reg, unsigned is_store)
+{
+    dbt_mem_site_t site;
+
+    if (e->tso) {
+        mem += 4U;
+    }
+    memset(&site, 0, sizeof(site));
+    site.seq_start_offset = (uint16_t)seq;
+    site.host_insn_offset = (uint16_t)mem;
+    site.cont_insn_offset = (uint16_t)cont;
+    site.guest_pc_delta = site_pc_delta(e, insn);
+    site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                     ((uint32_t)insn->pfx_lock << 16);
+    site.sp_rollback_delta = 0;
+    site.npc_mode = (uint8_t)I686_NPC_SEQUENTIAL;
+    site.width = (uint8_t)width;
+    site.flags = is_store != 0U ? (uint8_t)I686_SITE_STORE : 0u;
+    site.val_or_dst_reg = (uint8_t)val_reg;
+    site.addr_base_reg = (uint8_t)base_reg;
+    (void)i686_aot_note_stack_site(&site);
+}
+
+/* EA base for site records; defined after NONE below. */
+static unsigned em_site_base(const x86_insn_t *insn);
+
 /* 0xFF sentinel in the frozen x86_insn_t (ea_base/ea_index/pfx_seg none). */
 #define NONE 0xFFU
+
+/* EA base for site records (0xFF when the address is disp-only). */
+static unsigned em_site_base(const x86_insn_t *insn)
+{
+    return insn->ea_base != NONE ? i686_w(insn->ea_base) : 0xFFu;
+}
 
 /* v/z operand size in BYTES: 66 selects the 16-bit form. */
 static unsigned v_bytes(const x86_insn_t *insn)
@@ -244,12 +286,23 @@ static int em_mov_ebgb(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_buf_t *b = &e->buf;
 
     if (rm_is_mem(insn)) {
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        unsigned base = em_site_base(insn);
         emit_ea(e, insn);
         if (insn->modrm_reg < 4U) {
-            a64_emit_guest_strb_w(b, i686_w(insn->modrm_reg), 21U);
+            unsigned src = i686_w(insn->modrm_reg);
+            mem = (uint32_t)((uint64_t)b->count * 4u);
+            a64_emit_guest_strb_w(b, src, 21U);
+            cont = (uint32_t)((uint64_t)b->count * 4u);
+            em_note_mem_site(e, insn, seq, mem, cont, 1U, src, base, 1U);
         } else {
             emit_read_b8(b, SCR0, insn->modrm_reg);
+            mem = (uint32_t)((uint64_t)b->count * 4u);
             a64_emit_guest_strb_w(b, SCR0, 21U);
+            cont = (uint32_t)((uint64_t)b->count * 4u);
+            em_note_mem_site(e, insn, seq, mem, cont, 1U, SCR0, base, 1U);
         }
     } else {
         emit_read_b8(b, SCR0, insn->modrm_reg);
@@ -265,12 +318,20 @@ static int em_mov_evgv(i686_emit_ctx_t *e, const x86_insn_t *insn)
     unsigned src = i686_w(insn->modrm_reg);
 
     if (rm_is_mem(insn)) {
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        unsigned width = v_bytes(insn);
+        unsigned base = em_site_base(insn);
         emit_ea(e, insn);
-        if (v_bytes(insn) == 4U) {
+        mem = (uint32_t)((uint64_t)b->count * 4u);
+        if (width == 4U) {
             a64_emit_guest_str_w(b, src, 21U);
         } else {
             a64_emit_guest_strh_w(b, src, 21U);
         }
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        em_note_mem_site(e, insn, seq, mem, cont, width, src, base, 1U);
     } else if (v_bytes(insn) == 4U) {
         a64_emit_mov_w(b, i686_w(insn->modrm_rm), src);
     } else {
@@ -285,8 +346,15 @@ static int em_mov_gbeb(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_buf_t *b = &e->buf;
 
     if (rm_is_mem(insn)) {
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        unsigned base = em_site_base(insn);
         emit_ea(e, insn);
+        mem = (uint32_t)((uint64_t)b->count * 4u);
         a64_emit_guest_ldrb_w(b, SCR0, 21U); /* zero-extends */
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        em_note_mem_site(e, insn, seq, mem, cont, 1U, SCR0, base, 0U);
         emit_write_b8(b, insn->modrm_reg, SCR0);
     } else {
         emit_read_b8(b, SCR0, insn->modrm_rm);
@@ -301,11 +369,23 @@ static int em_mov_gvev(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_buf_t *b = &e->buf;
 
     if (rm_is_mem(insn)) {
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        unsigned width = v_bytes(insn);
+        unsigned base = em_site_base(insn);
         emit_ea(e, insn);
-        if (v_bytes(insn) == 4U) {
-            a64_emit_guest_ldr_w(b, i686_w(insn->modrm_reg), 21U);
+        mem = (uint32_t)((uint64_t)b->count * 4u);
+        if (width == 4U) {
+            unsigned dst = i686_w(insn->modrm_reg);
+            a64_emit_guest_ldr_w(b, dst, 21U);
+            cont = (uint32_t)((uint64_t)b->count * 4u);
+            em_note_mem_site(e, insn, seq, mem, cont, width, dst, base, 0U);
         } else {
             a64_emit_guest_ldrh_w(b, SCR0, 21U);
+            cont = (uint32_t)((uint64_t)b->count * 4u);
+            em_note_mem_site(e, insn, seq, mem, cont, width, SCR0, base,
+                             0U);
             emit_write_w16(b, i686_w(insn->modrm_reg), SCR0);
         }
     } else if (v_bytes(insn) == 4U) {
@@ -347,8 +427,15 @@ static int em_mov_ebib(i686_emit_ctx_t *e, const x86_insn_t *insn)
 
     a64_emit_movz_w(b, SCR0, (uint16_t)(insn->imm & 0xFFU), 0U);
     if (rm_is_mem(insn)) {
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        unsigned base = em_site_base(insn);
         emit_ea(e, insn);
+        mem = (uint32_t)((uint64_t)b->count * 4u);
         a64_emit_guest_strb_w(b, SCR0, 21U);
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        em_note_mem_site(e, insn, seq, mem, cont, 1U, SCR0, base, 1U);
     } else {
         emit_write_b8(b, insn->modrm_rm, SCR0);
     }
@@ -361,14 +448,25 @@ static int em_mov_eviz(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_buf_t *b = &e->buf;
 
     if (rm_is_mem(insn)) {
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        unsigned width = v_bytes(insn);
+        unsigned base = em_site_base(insn);
         emit_ea(e, insn);
-        if (v_bytes(insn) == 4U) {
+        if (width == 4U) {
             a64_emit_mov_imm32(b, SCR0, insn->imm);
-            a64_emit_guest_str_w(b, SCR0, 21U);
         } else {
             a64_emit_movz_w(b, SCR0, (uint16_t)(insn->imm & 0xFFFFU), 0U);
+        }
+        mem = (uint32_t)((uint64_t)b->count * 4u);
+        if (width == 4U) {
+            a64_emit_guest_str_w(b, SCR0, 21U);
+        } else {
             a64_emit_guest_strh_w(b, SCR0, 21U);
         }
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        em_note_mem_site(e, insn, seq, mem, cont, width, SCR0, base, 1U);
     } else if (v_bytes(insn) == 4U) {
         a64_emit_mov_imm32(b, i686_w(insn->modrm_rm), insn->imm);
     } else {
@@ -395,7 +493,13 @@ static int em_extend(i686_emit_ctx_t *e, const x86_insn_t *insn,
     unsigned dst = i686_w(insn->modrm_reg);
 
     if (rm_is_mem(insn)) {
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        unsigned width = src_bits / 8U;
+        unsigned base = em_site_base(insn);
         emit_ea(e, insn);
+        mem = (uint32_t)((uint64_t)b->count * 4u);
         if (src_bits == 8U) {
             if (sext != 0) {
                 a64_emit_guest_ldrsb_w(b, SCR0, 21U);
@@ -409,6 +513,8 @@ static int em_extend(i686_emit_ctx_t *e, const x86_insn_t *insn,
                 a64_emit_guest_ldrh_w(b, SCR0, 21U);
             }
         }
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        em_note_mem_site(e, insn, seq, mem, cont, width, SCR0, base, 0U);
     } else if (src_bits == 8U) {
         if (sext != 0) {
             emit_sbfx_w(b, SCR0, i686_w(b8_base(insn->modrm_rm)),

@@ -48,8 +48,22 @@ extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
  * armed it last, resuming on a foreign stack: RC7b T4d). */
 static __thread sigjmp_buf *s_fault_jmp;
 static volatile sig_atomic_t s_in_run;
-static volatile uint64_t s_fault_addr;
-static volatile uint64_t s_fault_host_pc;
+/* C2-2: all fault capture state is per-thread.  It was process-global,
+ * so two threads faulting concurrently clobbered each other's
+ * addr/host_pc/esp/regs/sig/code and recovered with the wrong thread's
+ * values (heap corruption under thread contention).  The handler runs
+ * on the faulting thread and the checkpoint is per-thread, so
+ * __thread is exactly right. */
+static __thread volatile uint64_t s_fault_addr;
+static __thread volatile uint64_t s_fault_host_pc;
+/* Live guest ESP (host w4/x4) at the fault: in DBT-emitted code w4 is
+ * the dedicated guest-ESP register, while ctx->gpr[ESP] is only synced
+ * on clean exits to C and goes stale across chained blocks.  Captured
+ * for every fault; meaningful only when the fault PC is inside a
+ * translated block (helper/C faults leave w4 as host scratch). */
+static __thread volatile uint64_t s_fault_esp;
+/* Live host x0..x28 at fault (DBT site recovery reads w0..w7). */
+__thread volatile uint64_t g_fault_x[29];
 
 /* Pre-instruction ESP/EBP checkpoint (RC-U3): a faulting stack op must
  * not leave ESP/EBP mutated (No-Double-Side-Effect).  Only stack ops
@@ -61,8 +75,8 @@ static __thread uint32_t s_saved_ebp;
  * The delivery path resets it to "none", so a later transient may heal. */
 static __thread uint64_t s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
 
-static volatile sig_atomic_t s_fault_sig;
-static volatile sig_atomic_t s_fault_code;
+static __thread volatile sig_atomic_t s_fault_sig;
+static __thread volatile sig_atomic_t s_fault_code;
 
 static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
 {
@@ -70,30 +84,59 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
 #if defined(__linux__) && defined(__aarch64__)
     {
         ucontext_t *uc = (ucontext_t *)uc_;
+        int r;
         s_fault_host_pc = (uc != NULL) ? (uint64_t)uc->uc_mcontext.pc : 0u;
+        s_fault_esp = (uc != NULL) ? (uint64_t)uc->uc_mcontext.regs[4] : 0u;
+        for (r = 0; r < 29; r++) {
+            g_fault_x[r] =
+                (uc != NULL) ? (uint64_t)uc->uc_mcontext.regs[r] : 0u;
+        }
     }
 #elif defined(__APPLE__) && defined(__aarch64__)
     {
         ucontext_t *uc = (ucontext_t *)uc_;
+        int r;
         s_fault_host_pc = (uc != NULL && uc->uc_mcontext != NULL)
                               ? (uint64_t)uc->uc_mcontext->__ss.__pc
                               : 0u;
+        s_fault_esp = (uc != NULL && uc->uc_mcontext != NULL)
+                              ? (uint64_t)uc->uc_mcontext->__ss.__x[4]
+                              : 0u;
+        for (r = 0; r < 29; r++) {
+            g_fault_x[r] = (uc != NULL && uc->uc_mcontext != NULL)
+                               ? (uint64_t)uc->uc_mcontext->__ss.__x[r]
+                               : 0u;
+        }
     }
 #else
     (void)uc_;
     s_fault_host_pc = 0u;
+    s_fault_esp = 0u;
 #endif
+    /* D11 SMC: a write to a DBT code-protected window page.  The
+     * engine drops the page's blocks and restores RW; returning
+     * re-executes the store.  Linux raises SIGSEGV+SEGV_ACCERR; Darwin
+     * raises SIGBUS for the same store (verified on arm64: a write to
+     * a PROT_READ private page arrives as SIGBUS, code BUS_ADRALN).
+     * The marking check inside i686_dbt_smc_write_fault keeps this
+     * precise: unmarked pages return 0 and fall through to guest
+     * delivery below. */
     if (sig == SIGSEGV && si->si_code == SEGV_ACCERR) {
 #ifndef I686RT_NO_DBT
-        /* D11 SMC: a write to a DBT code-protected window page.  The
-         * engine drops the page's blocks and restores RW; returning
-         * re-executes the store. */
         extern int i686_dbt_smc_write_fault(uint64_t host_addr);
         if (i686_dbt_smc_write_fault((uint64_t)(uintptr_t)si->si_addr)) {
             return;
         }
 #endif
     }
+#if defined(__APPLE__) && !defined(I686RT_NO_DBT)
+    if (sig == SIGBUS) {
+        extern int i686_dbt_smc_write_fault(uint64_t host_addr);
+        if (i686_dbt_smc_write_fault((uint64_t)(uintptr_t)si->si_addr)) {
+            return;
+        }
+    }
+#endif
     if (s_in_run && jb != NULL) {
         s_fault_jmp = NULL; /* disarm: a nested fault must not re-jump */
         s_fault_addr = (uint64_t)(uintptr_t)si->si_addr;
@@ -110,6 +153,14 @@ void i686_fault_arm(sigjmp_buf *jb)
 {
     s_fault_jmp = jb;
     s_in_run = 1;
+}
+
+/* Outer checkpoint for syscall-copy fault tolerance (marshal.c): a
+ * copy runs its own inner checkpoint and restores this on every
+ * outcome, re-raising genuine faults to it. */
+sigjmp_buf *i686_fault_save(void)
+{
+    return s_fault_jmp;
 }
 
 void i686_diag_fault(i686_ctx_t *ctx)
@@ -185,6 +236,24 @@ uint64_t i686_fault_host_pc(void)
     return (uint64_t)s_fault_host_pc;
 }
 
+/* Live guest ESP captured from the faulting host register state
+ * (DBT site recovery in engine.c; meaningful only for faults inside
+ * translated blocks). */
+uint64_t i686_fault_esp(void)
+{
+    return (uint64_t)s_fault_esp;
+}
+
+/* Live guest GPRs (host w0..w7) captured at a checkpointed fault (DBT
+ * site recovery in engine.c; meaningful only when the fault PC is
+ * inside a translated block, like i686_fault_esp).  Blocks spill GPRs
+ * to ctx only at clean exits, so on a mid-block fault ctx predates the
+ * block; the heal/emulate/deliver paths all read ctx and need live. */
+uint64_t i686_fault_gpr(unsigned r)
+{
+    return (r < 29u) ? (uint64_t)g_fault_x[r] : 0u;
+}
+
 /* C3f: synthetic fault exits (h_muldiv's #DE) pin the channel the same
  * way the host handler does, so deliver_sync classifies them by signal
  * instead of by a stale ctx->exit_arg. */
@@ -233,6 +302,11 @@ void i686_interp_register(uint16_t op, i686_interp_fn fn)
 }
 
 static int s_trace;
+/* Per-insn T lines flood heavy guests (p3 FP loop: 1e8+ insns) while
+ * difftest only compares the S sequence (compare_native: the DBT side
+ * never emits T).  I686RT_TRACE_NO_T keeps S lines and drops T lines
+ * so long-loop guests stay feasible under differential tracing. */
+static int s_trace_no_t;
 
 void i686_interp_init_all(void)
 {
@@ -242,6 +316,7 @@ void i686_interp_init_all(void)
     }
     s_done = 1;
     s_trace = getenv("I686RT_TRACE") != NULL;
+    s_trace_no_t = getenv("I686RT_TRACE_NO_T") != NULL;
     i686_interp_alu_init();
     i686_interp_mov_init();
     i686_interp_branch_init();
@@ -375,28 +450,41 @@ int i686_interp_run(i686_ctx_t *ctx)
         } else {
             ctx->fault_addr = (uint32_t)fa;
         }
-        /* RC-U3-r2 P1 #4: validate-then-map. A SEGV_MAPERR inside a
-         * mapped region means the host mapping (not the guest tables)
-         * went stale — a racing mm op or a disturbed A2 union — so
-         * re-assert the table-driven union protection and retry the
-         * instruction once. A backing-file SIGBUS (truncation beyond
-         * EOF) is excluded from the remap and delivered, as is every
-         * fault outside all regions. The s_last_remap_ga guard bounds
-         * a non-healing fault to a single retry. */
-        if (i686_fault_sig() == SIGSEGV &&
-            i686_fault_code() == SEGV_MAPERR &&
-            fa >= ctx->guest_base &&
+        /* C2-2 mirror-consulting fault classification (replaces the
+         * RC-U3-r2 SEGV_MAPERR-only validate-then-map).  On Regime A2
+         * the host mapping is widened (most-restrictive), and on Darwin
+         * protection faults arrive as SIGBUS, so si_code alone cannot
+         * classify: consult the fine-grained mirror instead.
+         *  - Mapped page, mirror fully R|W: the host cover went stale
+         *    (or the touch is a spurious widen neighbour).  Emulate
+         *    via interpret-one (unprotect, step, re-widen); when the
+         *    step takes its own exit, fall through to the plain
+         *    widen-and-retry below, bounded once by s_last_remap_ga.
+         *  - Mapped page, mirror denies: genuine PROT_NONE/RO fault.
+         *  - Unmapped: genuine unmapped fault (backing-file SIGBUS
+         *    truncation included).  Both deliver below.
+         * The s_last_remap_ga guard bounds a non-healing fault to a
+         * single retry. */
+        if (fa >= ctx->guest_base &&
             fa < ctx->guest_base + 0x100000000ULL) {
-            extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t,
+            extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t,
                                             uint32_t);
+            extern int i686_spurious_emulate(i686_ctx_t *, uint32_t);
+            extern int i686_spurious_allow(i686_ctx_t *, uint32_t);
             uint32_t rga = (uint32_t)(fa - ctx->guest_base);
             if (rga != (uint32_t)s_last_remap_ga &&
                 i686_fault_region_prot(ctx, rga, NULL, NULL) != 0 &&
-                i686_vm32_union_prot(ctx, rga & ~0xFFFU,
-                                     (rga & ~0xFFFU) + 0x1000U) == 0) {
-                s_last_remap_ga = (uint64_t)rga;
-                i686_fault_arm(&fault_jmp); /* re-arm: the retry may fault */
-                goto run_loop; /* mapping re-asserted; retry */
+                i686_spurious_allow(ctx, rga) != 0) {
+                if (i686_spurious_emulate(ctx, rga) == 0) {
+                    i686_fault_arm(&fault_jmp); /* re-arm: resume may fault */
+                    goto run_loop; /* emulated; resume past the insn */
+                }
+                if (i686_vm32_widen_prot(ctx, rga & ~0xFFFU,
+                                        (rga & ~0xFFFU) + 0x1000U) == 0) {
+                    s_last_remap_ga = (uint64_t)rga;
+                    i686_fault_arm(&fault_jmp);
+                    goto run_loop; /* cover re-asserted; retry */
+                }
             }
         }
         /* A fault that reaches delivery clears the remap guard, so a
@@ -443,7 +531,7 @@ run_loop:
             diag("unimplemented opcode", ctx, insn.op);
             return I686_EXIT_UNDEF;
         }
-        if (s_trace) {
+        if (s_trace && !s_trace_no_t) {
             uint32_t b;
             char tl[80];
             int tn = 0;

@@ -48,8 +48,11 @@
  */
 
 #include <stdint.h>
+#include <string.h>
 
+#include "dbt/aot/aot.h"
 #include "dbt/emit.h"
+#include "dbt/emit_alu_impl.h"
 
 #define SCR_A    8U  /* destination operand value (width-masked) */
 #define SCR_B    9U  /* source operand value / immediate         */
@@ -208,7 +211,9 @@ static void emit_store_reg(a64_buf_t *b, unsigned src, uint8_t reg,
 }
 
 /* r/m operand: mod==3 (or no EA) is a register, else guest memory via
- * i686_emit_ea; w21 survives the load for the matching store. */
+ * i686_emit_ea; w21 survives the load for the matching store.  Recovery
+ * sites come from the shared xalu_note_mem_site (emit_alu_impl.h) so the
+ * base and extended ALU families record the identical shape. */
 static void emit_load_rm(i686_emit_ctx_t *e, const x86_insn_t *insn,
                          unsigned dst, unsigned width)
 {
@@ -216,8 +221,17 @@ static void emit_load_rm(i686_emit_ctx_t *e, const x86_insn_t *insn,
         emit_load_reg(&e->buf, dst, insn->modrm_rm, width);
         return;
     }
-    i686_emit_ea(e, insn, 1);
-    emit_guest_load(e, dst, width);
+    {
+        a64_buf_t *b = &e->buf;
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem;
+        uint32_t cont;
+        i686_emit_ea(e, insn, 1);
+        mem = (uint32_t)((uint64_t)b->count * 4u);
+        emit_guest_load(e, dst, width);
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        xalu_note_mem_site(e, insn, seq, mem, cont, width, dst, 0U);
+    }
 }
 
 static void emit_store_rm(i686_emit_ctx_t *e, const x86_insn_t *insn,
@@ -228,7 +242,15 @@ static void emit_store_rm(i686_emit_ctx_t *e, const x86_insn_t *insn,
         return;
     }
     /* Nothing between load and store touched w21. */
-    emit_guest_store(e, src, width);
+    {
+        a64_buf_t *b = &e->buf;
+        uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t mem = (uint32_t)((uint64_t)b->count * 4u);
+        uint32_t cont;
+        emit_guest_store(e, src, width);
+        cont = (uint32_t)((uint64_t)b->count * 4u);
+        xalu_note_mem_site(e, insn, seq, mem, cont, width, src, 1U);
+    }
 }
 
 /* ---- lazy descriptor (bit-identical to flags.c's set_lazy) ---------- */

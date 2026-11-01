@@ -96,6 +96,16 @@ void i686_vm32_tlb_invalidate(i686_ctx_t *ctx, uint32_t start, uint32_t end);
  * (fable M3: RELRO + .data share one host page without trap storms). */
 int i686_vm32_union_prot(i686_ctx_t *ctx, uint32_t start, uint32_t end);
 
+/* Widened (most-restrictive) host protection of every host page covering
+ * guest [start, end): each host page carries the AND of its sub-page
+ * mirror protections, so a guest PROT_NONE/PROT_READ sub-page traps on
+ * the host even when RW neighbours share the page (C2-2: p3/tcg
+ * mprotect/munmap immediacy on 16 KiB hosts).  Neighbour sub-pages that
+ * stay guest-accessible fault spuriously; the fault paths emulate those
+ * via interpret-one and re-widen, so widening is never a silent
+ * permission loss.  Never PROT_EXEC. */
+int i686_vm32_widen_prot(i686_ctx_t *ctx, uint32_t start, uint32_t end);
+
 /* Canonical host address of a guest VA (HVA = arena_base + gva; stable
  * across COW promotion, fable C2). */
 static inline void *i686_vm32_hva(const i686_ctx_t *ctx, uint32_t gva)

@@ -1,5 +1,5 @@
 #!/bin/sh
-# tests/parity_suite.sh — Wave C1 catalogue parity gate for i686rt.
+# tests/parity_suite.sh — Wave C2 uniform 10-category parity gate for i686rt.
 #
 # Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
@@ -7,16 +7,29 @@
 # Keeps the Wave U3 lane checks (check-line-limits, build-darwin,
 # test_u3_sites, lane file ownership) and adds guest execution parity
 # rows (--engine interp / --engine dbt, plus --difftest via
-# tools/difftest.sh) on prebuilt guests in _build/ (hello, test_p1_isa,
-# test_p5_fpu_sse, test_h1_smc, ../rt-series/_build/bench/bench-i686
-# --smoke) compared against committed goldens under tests/golden/,
-# plus an AOT round-trip reload check and the XMM cache signal check.
-# Finishes with parity_summary (0 FAIL, 0 GAP).
+# tools/difftest.sh) on prebuilt guests in _build/ compared against
+# committed goldens under tests/golden/, plus an AOT round-trip reload
+# check and the XMM cache signal check. Finishes with parity_summary
+# (0 FAIL, 0 GAP, 0 SKIP).
 #
-# Known DBT gaps are recorded as SKIP (PARITY_ALLOW_SKIP=1), never FAIL:
-# test_p5_fpu_sse DBT diverges on SSE FTZ/DAZ + cmpps lane order vs the
-# docker/QEMU oracle, and test_h1_smc DBT fails the SMC rewrite legs
-# (interp passes both). Bench --smoke CRCs agree on both engines.
+# 10 uniform categories (Wave C2 catalogue): p1_isa (test_p1_isa),
+# p2_libc (hello + test_p2_libc), p3_fp (test_p5_fpu_sse, default and
+# --x87-80), p3_torture (_build/p3_torture from
+# ../rt-series/tests/p3_torture.c), tcg_smoke (_build/tcg_smoke from
+# ../rt-series/tests/tcg/smoke_tcg.c), p4_threads
+# (test_p4_threads_signals), p5_dyn (_build/test_p5_dyn with the
+# committed tests/sysroot/), h1_smc (test_h1_smc), h4_cxx
+# (_build/test_h4_cxx, C++17), bench_smoke + aot_reload.
+#
+# Wave C2 DBT fixes closed the former SKIP gaps (SMC invalidation;
+# SSE FTZ/DAZ + cmpps lane order), so PARITY_ALLOW_SKIP stays at its
+# default 0 and every SKIP fails the gate.
+#
+# tcg_smoke note: the shared guest's testthread leg overflows 32-bit
+# long (n=200000; fails on native linux/386 too — Lane C2-1 owns the
+# shared source). Both engines reproduce it identically (6 pass / 1 fail,
+# rc=1 on both), so the golden rows capture that agreement; the difftest
+# row is stdout+rc parity because the teardown order is timing-nondet.
 #
 # Usage:
 #   sh tests/parity_suite.sh
@@ -30,9 +43,6 @@ CONTRACT="$(cd "$(dirname -- "$0")/../../rt-series/tools" && pwd)/parity_contrac
 # shellcheck disable=SC1090
 . "$CONTRACT"
 parity_init "i686rt"
-
-# Documented SKIPs (known DBT gaps below) still exit 0.
-PARITY_ALLOW_SKIP=1
 
 RT_DARWIN="$ROOT/_build/i686rt-darwin"
 RT_LINUX="$ROOT/_build/i686rt"
@@ -155,7 +165,7 @@ run_difftest() {
 # run_p5 <abi> <host> <engine> [x87flag]
 # Compares filtered output against the committed docker/QEMU oracle
 # (tests/golden/p5.txt default minus X87ONLY, p5_x87_80.txt full).
-# DBT divergences are recorded as SKIP (known SSE gap), never FAIL.
+# DBT matches interp and the oracle on both modes (Wave C2 SSE fix).
 run_p5() {
     _abi="$1"; _host="$2"; _eng="$3"; _x87="${4:-}"
     _case="test_p5_fpu_sse"
@@ -193,22 +203,51 @@ run_p5() {
     fi
     if [ "$_rc" -ne 0 ]; then
         _detail="exit $_rc"
-        if [ "$_eng" = "dbt" ]; then
-            parity_row "$_abi" "$_host" "$_case" "$_eng" "SKIP" "$_ms" "known DBT SSE gap ($_detail)"
-        else
-            parity_row "$_abi" "$_host" "$_case" "$_eng" "FAIL" "$_ms" "$_detail"
-        fi
+        parity_row "$_abi" "$_host" "$_case" "$_eng" "FAIL" "$_ms" "$_detail"
     elif ! cmp -s "$_tmp_filt.actual" "$_tmp_filt.golden"; then
         _detail="oracle differs"
-        if [ "$_eng" = "dbt" ]; then
-            parity_row "$_abi" "$_host" "$_case" "$_eng" "SKIP" "$_ms" "known DBT SSE gap"
-        else
-            parity_row "$_abi" "$_host" "$_case" "$_eng" "FAIL" "$_ms" "$_detail"
-        fi
+        parity_row "$_abi" "$_host" "$_case" "$_eng" "FAIL" "$_ms" "$_detail"
     else
         parity_row "$_abi" "$_host" "$_case" "$_eng" "PASS" "$_ms" ""
     fi
     rm -f "$_tmp_out" "$_tmp_filt" "$_tmp_filt.golden" "$_tmp_filt.actual"
+}
+
+# run_diffout <abi> <host> <case> <guest> [guest-arg...]
+# Stdout+exit-code differential (interp vs dbt, no tracing) for guests
+# whose syscall traces are thread-timing nondeterministic: dbt-vs-dbt
+# traces diverge run to run (tcg testthread teardown order, p4 thread
+# signal/futex interleave, h4 cxx thread futex order), so trace EQUAL
+# can never be a stable gate.  Guest stdout is byte-compared and exit
+# codes must agree; the run_engine golden rows above already pin the
+# exact bytes per engine, so this gates interp-vs-dbt agreement
+# directly.  Bench uses the same shape (crc-parity detail).
+run_diffout() {
+    _abi="$1"; _host="$2"; _case="$3"; _guest="$4"
+    shift 4
+    _o1=$(mktemp /tmp/i686dout1.XXXXXX)
+    _o2=$(mktemp /tmp/i686dout2.XXXXXX)
+    _t0=$(parity_now_ms)
+    _rc1=0; _rc2=0
+    if [ "$_host" = "hl" ]; then
+        # shellcheck disable=SC2086
+        perl -e 'alarm 60; exec @ARGV' "$HL_BIN" "$RT_LINUX" --engine interp -- "$_guest" "$@" >"$_o1" 2>/dev/null || _rc1=$?
+        # shellcheck disable=SC2086
+        perl -e 'alarm 60; exec @ARGV' "$HL_BIN" "$RT_LINUX" --engine dbt -- "$_guest" "$@" >"$_o2" 2>/dev/null || _rc2=$?
+    else
+        # shellcheck disable=SC2086
+        perl -e 'alarm 60; exec @ARGV' "$RT_DARWIN" --engine interp -- "$_guest" "$@" >"$_o1" 2>/dev/null || _rc1=$?
+        # shellcheck disable=SC2086
+        perl -e 'alarm 60; exec @ARGV' "$RT_DARWIN" --engine dbt -- "$_guest" "$@" >"$_o2" 2>/dev/null || _rc2=$?
+    fi
+    _t1=$(parity_now_ms); _ms=0
+    if [ "$_t0" != "0" ] && [ "$_t1" != "0" ]; then _ms=$((_t1 - _t0)); fi
+    if [ "$_rc1" -eq "$_rc2" ] && cmp -s "$_o1" "$_o2"; then
+        parity_row "$_abi" "$_host" "$_case" "difftest" "PASS" "$_ms" "stdout+rc parity; trace timing-nondet"
+    else
+        parity_row "$_abi" "$_host" "$_case" "difftest" "FAIL" "$_ms" "rc=$_rc1/$_rc2 or stdout differs"
+    fi
+    rm -f "$_o1" "$_o2"
 }
 
 # --- U3 lane checks as parity rows ---
@@ -285,25 +324,72 @@ if [ -x "$ROOT/_build/test_p1_isa" ]; then
 fi
 if [ -x "$ROOT/_build/test_h1_smc" ]; then
     run_engine "i686" "darwin" "test_h1_smc" "interp" "$ROOT/_build/test_h1_smc" "test_h1_smc"
-    # DBT SMC rewrite legs fail (interp passes); record the known gap as SKIP.
-    _t0=$(parity_now_ms)
-    _tmp_h1=$(mktemp /tmp/i686h1.XXXXXX)
-    _rc=0
-    perl -e 'alarm 20; exec @ARGV' "$RT_DARWIN" --engine dbt -- "$ROOT/_build/test_h1_smc" >"$_tmp_h1" 2>/dev/null || _rc=$?
-    _t1=$(parity_now_ms); _ms=0
-    if [ "$_t0" != "0" ] && [ "$_t1" != "0" ]; then _ms=$((_t1 - _t0)); fi
-    if grep -q "^PASS" "$_tmp_h1" && [ "$_rc" -eq 0 ]; then
-        parity_row "i686" "darwin" "test_h1_smc" "dbt" "PASS" "$_ms" ""
-    else
-        parity_row "i686" "darwin" "test_h1_smc" "dbt" "SKIP" "$_ms" "known DBT SMC gap"
-    fi
-    rm -f "$_tmp_h1"
+    run_engine "i686" "darwin" "test_h1_smc" "dbt" "$ROOT/_build/test_h1_smc" "test_h1_smc"
+    run_difftest "i686" "darwin" "test_h1_smc" "$ROOT/_build/test_h1_smc"
 fi
 if [ -x "$ROOT/_build/test_p5_fpu_sse" ]; then
     run_p5 "i686" "darwin" "interp"
     run_p5 "i686" "darwin" "interp" "--x87-80"
     run_p5 "i686" "darwin" "dbt"
     run_p5 "i686" "darwin" "dbt" "--x87-80"
+    run_difftest "i686" "darwin" "test_p5_fpu_sse" "$ROOT/_build/test_p5_fpu_sse"
+    I686RT_X87=80 run_difftest "i686" "darwin" "test_p5_fpu_sse-x87-80" "$ROOT/_build/test_p5_fpu_sse"
+    unset I686RT_X87
+fi
+# --- Wave C2 uniform categories (darwin legs) ---
+# p2_libc: static libc guest (printf/qsort/malloc/fileio).
+if [ -x "$ROOT/_build/test_p2_libc" ]; then
+    run_engine "i686" "darwin" "test_p2_libc" "interp" "$ROOT/_build/test_p2_libc" "test_p2_libc"
+    run_engine "i686" "darwin" "test_p2_libc" "dbt" "$ROOT/_build/test_p2_libc" "test_p2_libc"
+    run_difftest "i686" "darwin" "test_p2_libc" "$ROOT/_build/test_p2_libc"
+fi
+# p3_torture: shared portable FP torture (rt-series).  Trace difftest is
+# stdout+rc parity: the atomic-race thread teardown order flakes
+# (2/3 EQUAL, 1/3 order swap at the clone/sigreturn boundary), so trace
+# EQUAL cannot gate it.  (I686RT_TRACE_NO_T keeps per-insn T lines out
+# of long-loop traces; the ITIMER_REAL bridge in sys_time.c keeps the
+# guest alarm(1) alive under slow/traced execution.)
+if [ -x "$ROOT/_build/p3_torture" ]; then
+    run_engine "i686" "darwin" "p3_torture" "interp" "$ROOT/_build/p3_torture" "p3_torture"
+    run_engine "i686" "darwin" "p3_torture" "dbt" "$ROOT/_build/p3_torture" "p3_torture"
+    run_diffout "i686" "darwin" "p3_torture" "$ROOT/_build/p3_torture"
+fi
+# tcg_smoke: shared ALU/mul/thread torture (rt-series, arg = page size).
+# Both engines reproduce the shared testthread ILP32 overflow identically
+# (6 pass / 1 fail, rc=1 on both; the overflow fails on native linux/386
+# too and belongs to Lane C2-1).  Trace difftest is stdout+rc parity:
+# the testthread teardown order is thread-timing nondeterministic
+# (proven dbt-vs-dbt divergence), so trace EQUAL cannot gate it.
+if [ -x "$ROOT/_build/tcg_smoke" ]; then
+    run_engine "i686" "darwin" "tcg_smoke" "interp" "$ROOT/_build/tcg_smoke" "tcg_smoke" "4096"
+    run_engine "i686" "darwin" "tcg_smoke" "dbt" "$ROOT/_build/tcg_smoke" "tcg_smoke" "4096"
+    run_diffout "i686" "darwin" "tcg_smoke" "$ROOT/_build/tcg_smoke" "4096"
+fi
+# p4_threads: clone/futex/signals/fork/wait guest.  Trace difftest is
+# stdout+rc parity (catalogue: difftest where single-thread/supported):
+# the thread signal/futex interleave is timing-nondeterministic (proven
+# same-engine divergence), so trace EQUAL cannot gate it.
+if [ -x "$ROOT/_build/test_p4_threads_signals" ]; then
+    run_engine "i686" "darwin" "test_p4_threads_signals" "interp" "$ROOT/_build/test_p4_threads_signals" "test_p4_threads_signals"
+    run_engine "i686" "darwin" "test_p4_threads_signals" "dbt" "$ROOT/_build/test_p4_threads_signals" "test_p4_threads_signals"
+    run_diffout "i686" "darwin" "test_p4_threads_signals" "$ROOT/_build/test_p4_threads_signals"
+fi
+# p5_dyn: dynamic PT_INTERP guest against the committed tests/sysroot/.
+# Sysroot travels via I686RT_SYSROOT (the runner flag --sysroot).
+if [ -x "$ROOT/_build/test_p5_dyn" ] && [ -f "$ROOT/tests/sysroot/lib/ld-musl-i386.so.1" ]; then
+    I686RT_SYSROOT="$ROOT/tests/sysroot" run_engine "i686" "darwin" "test_p5_dyn" "interp" "$ROOT/_build/test_p5_dyn" "test_p5_dyn"
+    I686RT_SYSROOT="$ROOT/tests/sysroot" run_engine "i686" "darwin" "test_p5_dyn" "dbt" "$ROOT/_build/test_p5_dyn" "test_p5_dyn"
+else
+    parity_row "i686" "darwin" "test_p5_dyn" "interp" "GAP" "0" "missing guest or sysroot"
+    parity_row "i686" "darwin" "test_p5_dyn" "dbt" "GAP" "0" "missing guest or sysroot"
+fi
+# h4_cxx: C++17 exceptions/RTTI/threads guest.  Trace difftest is
+# stdout+rc parity: the cxx thread futex order is timing-nondeterministic
+# (proven dbt-vs-dbt divergence), so trace EQUAL cannot gate it.
+if [ -x "$ROOT/_build/test_h4_cxx" ]; then
+    run_engine "i686" "darwin" "test_h4_cxx" "interp" "$ROOT/_build/test_h4_cxx" "test_h4_cxx"
+    run_engine "i686" "darwin" "test_h4_cxx" "dbt" "$ROOT/_build/test_h4_cxx" "test_h4_cxx"
+    run_diffout "i686" "darwin" "test_h4_cxx" "$ROOT/_build/test_h4_cxx"
 fi
 if [ -x "$BENCH_I686" ]; then
     run_engine "i686" "darwin" "bench-i686-smoke" "interp" "$BENCH_I686" "bench-i686-smoke" "--smoke"
@@ -349,6 +435,12 @@ if [ "$DO_HL" -eq 1 ]; then
 fi
 
 # --- AOT cache round-trip reload check ---
+# NOTE (Wave C2): --cache is parsed but has no file backend yet
+# (cache_dir is never read; the block serialize/parse format with
+# magic/version/crc exists in src/dbt/aot/ but nothing writes or
+# reloads files).  This row pins the current contract: both legs run
+# rc=0 with byte-identical guest stdout.  File creation/magic checks
+# wait on the file-backend feature.
 _t0=$(parity_now_ms)
 _AOTDIR=$(mktemp -d /tmp/i686aot_parity.XXXXXX)
 _AOT1=$(mktemp /tmp/i686aot1.XXXXXX)

@@ -76,7 +76,13 @@ typedef struct {
 
 /* In-memory site ring for the running translator (v1: fixed ring; the
  * per-block indexed table arrives with the Soft-TLB emitter lane). */
-#define I686_AOT_SITE_RING 256u
+/* C2-2: 256 entries recycle within a single thread-test binary (tcg
+ * records thousands of sites before its thread-stack stores fault),
+ * losing recovery for older blocks (no-site -> eip=block base ->
+ * emulate-wrong-insn cascade).  16K entries cover the whole uniform
+ * suite with headroom; the per-block indexed table (Wave U6) removes
+ * the bound entirely.  24 B * 16K = 384 KiB per thread. */
+#define I686_AOT_SITE_RING 16384u
 
 /* Unknown guest_pc_delta at emit time: the translator patches it once
  * the faulting PC is assigned (see i686_aot_patch_pc_delta). */

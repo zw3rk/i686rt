@@ -30,13 +30,15 @@
  * listing; shared encoders come from src/rt32/rt32_a64_emit.h.
  *
  * Known v1 deviations (Phase H per SPEC D10/sse.h, documented): MXCSR
- * rounding/FTZ/DAZ are not mapped into FPCR (default NEON rounding),
- * CVTT* NaN/overflow produce NEON saturation instead of x86's integer
- * indefinite 0x80000000, and SSE memory ops stay plain LDR/STR Q in
- * TSO mode (x86 SSE non-atomic stores need TSO ordering only for LOCK
- * RMW, owned by the atomic module).  MMX-writing insns set the x87 tag
- * word to valid (0x0000) and EMMS sets it empty (0xFFFF); fstat.TOP
- * and the x87_st payload otherwise stay untouched.
+ * rounding is not mapped into FPCR (default NEON rounding); FTZ/DAZ
+ * arithmetic and out-of-range scalar CVTTSS2SI/CVTTSD2SI take the D2
+ * interpret-one path instead (exact flags and 0x80000000), while
+ * packed CVTT* NaN/overflow still produce NEON saturation instead of
+ * x86's integer indefinite 0x80000000.  SSE memory ops stay plain
+ * LDR/STR Q in TSO mode (x86 SSE non-atomic stores need TSO ordering
+ * only for LOCK RMW, owned by the atomic module).  MMX-writing insns
+ * set the x87 tag word to valid (0x0000) and EMMS sets it empty
+ * (0xFFFF); fstat.TOP and the x87_st payload otherwise stay untouched.
  */
 
 #ifndef I686RT_DBT_EMIT_SSE_SHARED_H

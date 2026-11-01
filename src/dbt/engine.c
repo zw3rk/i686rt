@@ -41,6 +41,16 @@ extern uint64_t i686_fault_host_pc(void);
 uint32_t i686_jit_run_block(i686_ctx_t *ctx, const void *code_ptr,
                             void *cur_entry, const void *epoch_ptr);
 
+#ifdef __APPLE__
+/* The JIT write-protect toggle is process-global, not per-thread: two
+ * threads translating concurrently would re-protect each other's MAP_JIT
+ * mappings mid-emit (the faulting translator's crash is then
+ * misdelivered as a guest fault — the probe_cxxD pthread_exit LOCK
+ * CMPXCHG crash).  Toggle+emit is serialized on this process-wide
+ * mutex (deliberately NOT __thread). */
+static pthread_mutex_t s_jit_toggle_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 /* C6b: the dispatch loop in src/trampoline.S is hand-assembled against
  * these ABI facts; the C side pins them so a struct or constant drift
  * breaks the build here instead of guest execution. */
@@ -73,7 +83,10 @@ typedef struct dbt_entry {
     size_t cap;
 } dbt_entry_t;
 
-static dbt_entry_t s_ht[DBT_HT_SIZE];
+/* Thread-local (clone/Phase 4): every host thread owns its direct-mapped
+ * cache, so one thread's eviction can never free/reuse a mapping another
+ * thread's IBTC still chains into.  Diagnostics stay process-global. */
+static __thread dbt_entry_t s_ht[DBT_HT_SIZE];
 static int s_trace_dbt;   /* S lines (I686RT_TRACE) */
 static int s_trace_blocks; /* B lines (I686RT_DBTTRACE, diagnostics) */
 
@@ -84,11 +97,11 @@ static int s_trace_blocks; /* B lines (I686RT_DBTTRACE, diagnostics) */
  * of the i686_dbt_run dispatch loop and in i686_dbt_flush_all.  When
  * the graveyard is full the oldest entry is munmapped immediately, so
  * a SMC storm parks at most 255 blocks between two safe points. */
-static struct {
+static __thread struct {
     uint8_t *code;
     size_t cap;
 } s_graveyard[256];
-static size_t s_graveyard_n;
+static __thread size_t s_graveyard_n;
 
 /* D11 SMC (Phase H H1): guest pages the DBT translated from are
  * write-protected in the host window; a guest store faults, we drop
@@ -125,18 +138,71 @@ static void smc_page_unmark(uint32_t guest_page)
     s_code_pages[idx >> 5U] &= ~(1u << (idx & 31U));
 }
 
-/* Called after a block compiled from eip: protect its source page. */
+/* Host page size for SMC protection (the mprotect granule).  On 4 KiB
+ * hosts this is one guest page; on 16 KiB/64 KiB hosts (Darwin arm64)
+ * one host page covers several guest pages and the whole host page is
+ * protected/unprotected as a unit (D11).  Falls back to 4 KiB when the
+ * cached size is unset or not a page power of two. */
+static uint32_t smc_host_page(const i686_ctx_t *ctx)
+{
+    uint32_t h = (ctx != NULL) ? ctx->vm_host_page : 0U;
+
+    if (h < SMC_PAGE || (h & (h - 1U)) != 0U) {
+        h = SMC_PAGE;
+    }
+    return h;
+}
+
+/* Half-open [start, start+len) match that stays exact when the span
+ * touches the top of the 32-bit guest window (end == 2^32 is not a
+ * uint32_t). */
+static int smc_in_span(uint32_t eip, uint32_t start, uint32_t len)
+{
+    uint64_t end64 = (uint64_t)start + (uint64_t)len;
+
+    if (end64 <= UINT64_C(0x100000000)) {
+        return (eip >= start && (uint64_t)eip < end64) ? 1 : 0;
+    }
+    if (eip >= start) {
+        return 1;
+    }
+    return ((uint64_t)eip < end64 - UINT64_C(0x100000000)) ? 1 : 0;
+}
+
+/* Restore RW on the host page at hbase and unmark all its 4 KiB
+ * sub-pages (protection is host-page granular). */
+static void smc_unprotect_host(i686_ctx_t *ctx, uint32_t hbase, uint32_t h)
+{
+    uint64_t host;
+    uint32_t off;
+
+    if (ctx != NULL) {
+        host = ctx->guest_base + (uint64_t)hbase;
+    } else {
+        host = s_smc_window_base + (uint64_t)hbase;
+    }
+    (void)mprotect((void *)(uintptr_t)host, (size_t)h,
+                   PROT_READ | PROT_WRITE);
+    for (off = 0U; off < h; off += SMC_PAGE) {
+        smc_page_unmark(hbase + off);
+    }
+}
+
+/* Called after a block compiled from eip: protect its source host page. */
 static void smc_protect(i686_ctx_t *ctx, uint32_t eip)
 {
-    uint32_t page = eip & ~(SMC_PAGE - 1U);
+    uint32_t h = smc_host_page(ctx);
+    uint32_t hbase = eip & ~(h - 1U);
+    uint32_t off;
 
-    if (ctx->vm_host_page > SMC_PAGE) {
-        return;
+    for (off = 0U; off < h; off += SMC_PAGE) {
+        if (smc_page_marked(hbase + off)) {
+            return; /* host page already protected */
+        }
     }
-    if (!smc_page_marked(page)) {
-        void *host = i686_guest_ptr(ctx, page);
-        if (mprotect(host, SMC_PAGE, PROT_READ) == 0) {
-            smc_page_mark(page);
+    if (mprotect(i686_guest_ptr(ctx, hbase), (size_t)h, PROT_READ) == 0) {
+        for (off = 0U; off < h; off += SMC_PAGE) {
+            smc_page_mark(hbase + off);
         }
     }
 }
@@ -197,18 +263,101 @@ static void dbt_ibtc_sever(i686_ctx_t *ctx, uint32_t eip)
 static void dbt_sites_clear_range(uint32_t start, uint32_t end);
 static void dbt_sites_clear_all(void);
 
+/* Stack-site table (defined beside dbt_get_or_compile); tentative
+ * declarations so the SMC span clearer below can cover eip == top. */
+static __thread uint64_t s_site_start[DBT_HT_SIZE];
+static __thread uint64_t s_site_end[DBT_HT_SIZE];
+static __thread uint32_t s_site_eip[DBT_HT_SIZE];
+
+/* Clear stack-site entries for [hbase, hbase+h), exact when the span
+ * touches the top of the 32-bit guest window. */
+static void smc_sites_clear_span(uint32_t hbase, uint32_t h)
+{
+    uint64_t end64 = (uint64_t)hbase + (uint64_t)h;
+    uint32_t i;
+
+    if (end64 <= UINT64_C(0xFFFFFFFF)) {
+        dbt_sites_clear_range(hbase, (uint32_t)end64);
+        return;
+    }
+    dbt_sites_clear_range(hbase, 0xFFFFFFFFU);
+    if (end64 > UINT64_C(0x100000000)) {
+        dbt_sites_clear_range(0U,
+                              (uint32_t)(end64 - UINT64_C(0x100000000)));
+    }
+    /* eip == 0xFFFFFFFF is the one address neither half covers. */
+    for (i = 0U; i < DBT_HT_SIZE; i++) {
+        if (s_site_end[i] > s_site_start[i] &&
+            s_site_eip[i] == 0xFFFFFFFFU) {
+            s_site_start[i] = 0U;
+            s_site_end[i] = 0U;
+            s_site_eip[i] = 0xFFFFFFFFU;
+        }
+    }
+}
+
+/* Drop every translated block with eip in the host page [hbase, hbase+h)
+ * plus any IBTC/RAS entries chaining into them (wrap-safe at the top of
+ * the guest window).  The mapping itself parks in the graveyard (C7). */
+static void smc_drop_host(i686_ctx_t *ctx, uint32_t hbase, uint32_t h)
+{
+    size_t i;
+
+    smc_sites_clear_span(hbase, h);
+    for (i = 0U; i < DBT_HT_SIZE; i++) {
+        if (s_ht[i].len != 0U && smc_in_span(s_ht[i].eip, hbase, h) != 0) {
+            s_ht[i].eip = 0xFFFFFFFFU;
+            dbt_graveyard_push(s_ht[i].code, s_ht[i].cap);
+            s_ht[i].code = NULL;
+            s_ht[i].cap = 0U;
+            s_ht[i].len = 0U;
+        }
+    }
+    if (ctx != NULL) {
+        for (i = 0U; i < I686_IBTC_SIZE; i++) {
+            if (ctx->ibtc[i].key != 0U &&
+                smc_in_span(ctx->ibtc[i].key, hbase, h) != 0) {
+                ctx->ibtc[i].key = 0U;
+                ctx->ibtc[i].epoch = 0U;
+                ctx->ibtc[i].host_code = NULL;
+                ctx->ibtc[i].entry = NULL;
+            }
+        }
+        for (i = 0U; i < I686_RAS_SIZE; i++) {
+            if (smc_in_span(ctx->ras[i].key, hbase, h) != 0) {
+                ctx->ras[i].key = 0U;
+                ctx->ras[i].epoch = 0U;
+            }
+        }
+    }
+}
+
 void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start, uint32_t end)
 {
     uint32_t page;
+    uint32_t h = smc_host_page(ctx);
+    uint32_t last_hbase = 0U;
+    int have_last = 0;
 
     dbt_sites_clear_range(start, end);
+    /* Unprotect every protected host page intersecting [start, end).
+     * Writability is host-page granular, so the whole host page goes
+     * RW and every block translated from it is dropped (otherwise a
+     * later write to a sibling sub-page would run stale code). */
     for (page = start & ~(SMC_PAGE - 1U); page < end; page += SMC_PAGE) {
+        uint32_t hbase;
+
         if (!smc_page_marked(page)) {
             continue;
         }
-        (void)mprotect(i686_guest_ptr(ctx, page), SMC_PAGE,
-                       PROT_READ | PROT_WRITE);
-        smc_page_unmark(page);
+        hbase = page & ~(h - 1U);
+        if (have_last != 0 && hbase == last_hbase) {
+            continue;
+        }
+        have_last = 1;
+        last_hbase = hbase;
+        smc_unprotect_host(ctx, hbase, h);
+        smc_drop_host(ctx, hbase, h);
     }
     for (size_t i = 0U; i < DBT_HT_SIZE; i++) {
         if (s_ht[i].len != 0U && s_ht[i].eip >= start &&
@@ -254,6 +403,8 @@ void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start, uint32_t end)
 int i686_dbt_smc_write_fault(uint64_t host_addr)
 {
     uint32_t page;
+    uint32_t h;
+    uint32_t hbase;
 
     if (host_addr < s_smc_window_base || host_addr >= s_smc_window_end) {
         return 0;
@@ -262,54 +413,16 @@ int i686_dbt_smc_write_fault(uint64_t host_addr)
     if (!smc_page_marked(page)) {
         return 0;
     }
-    smc_page_unmark(page);
-    dbt_sites_clear_range(page, page + SMC_PAGE);
-    (void)mprotect((void *)(uintptr_t)(s_smc_window_base + page), SMC_PAGE,
-                   PROT_READ | PROT_WRITE);
-    /* Drop this page's translated blocks AND any IBTC/RAS entries that
-     * chain into them, so the next dispatch recompiles from the new
-     * bytes (the stale entries would otherwise be served from s_ht or
-     * chain into freed code). */
-    {
-        uint32_t end = page + SMC_PAGE;
-        for (size_t i = 0U; i < DBT_HT_SIZE; i++) {
-            if (s_ht[i].len != 0U && s_ht[i].eip >= page &&
-                s_ht[i].eip < end) {
-                /* Mark dead WITHOUT freeing: the faulting store may
-                 * itself run inside this block (same-block SMC), and
-                 * the host PC must stay mapped until it exits.  C7:
-                 * the mapping parks in the bounded graveyard instead
-                 * of leaking until direct-mapped eviction. */
-                s_ht[i].eip = 0xFFFFFFFFU;
-                dbt_graveyard_push(s_ht[i].code, s_ht[i].cap);
-                s_ht[i].code = NULL;
-                s_ht[i].cap = 0U;
-                s_ht[i].len = 0U; /* slot empty: eviction and
-                                   * flush_all must not munmap the
-                                   * parked mapping */
-            }
-        }
-        if (s_run_ctx != NULL) {
-            for (size_t i = 0U; i < I686_IBTC_SIZE; i++) {
-                if (s_run_ctx->ibtc[i].key != 0U &&
-                    s_run_ctx->ibtc[i].key >= page &&
-                    s_run_ctx->ibtc[i].key < end) {
-                    s_run_ctx->ibtc[i].key = 0U;
-                    s_run_ctx->ibtc[i].epoch = 0U;
-                    /* C6b: NULL the pointers too (see invalidate_range). */
-                    s_run_ctx->ibtc[i].host_code = NULL;
-                    s_run_ctx->ibtc[i].entry = NULL;
-                }
-            }
-            for (size_t i = 0U; i < I686_RAS_SIZE; i++) {
-                if (s_run_ctx->ras[i].key >= page &&
-                    s_run_ctx->ras[i].key < end) {
-                    s_run_ctx->ras[i].key = 0U;
-                    s_run_ctx->ras[i].epoch = 0U;
-                }
-            }
-        }
-    }
+    /* Protection is host-page granular: restore RW on the whole host
+     * page and drop every block translated from it, so the next
+     * dispatch recompiles from the new bytes (stale entries would
+     * otherwise be served from s_ht or chain into freed code).  The
+     * faulting store may itself run inside a dropped block
+     * (same-block SMC), so mappings park in the graveyard (C7). */
+    h = smc_host_page(s_run_ctx);
+    hbase = page & ~(h - 1U);
+    smc_unprotect_host(s_run_ctx, hbase, h);
+    smc_drop_host(s_run_ctx, hbase, h);
     return 1;
 }
 
@@ -356,10 +469,8 @@ static uint32_t dbt_hash(uint32_t eip)
 
 /* RC-U3 stack-site index: the ring slice [start, end) (sequence numbers
  * from i686_aot_ring_count) recorded by the last translation cached in
- * each direct-mapped slot, plus that block's base EIP. */
-static uint64_t s_site_start[DBT_HT_SIZE];
-static uint64_t s_site_end[DBT_HT_SIZE];
-static uint32_t s_site_eip[DBT_HT_SIZE];
+ * each direct-mapped slot, plus that block's base EIP.  (Storage
+ * tentative-declared beside the SMC helpers above.) */
 
 static void dbt_sites_clear_hash(uint32_t h)
 {
@@ -389,13 +500,17 @@ static void dbt_sites_clear_all(void)
 
 /* Fault recovery (RC-U3 P1): map the faulting host PC to its stack site
  * and recover.  ctx->eip becomes the faulting guest PC (block base +
- * guest_pc_delta) and ctx ESP replays the block's committed stack
- * effects, with the faulting site's pre-commit delta undone through
- * i686_aot_apply_rollback.  ctx GPRs hold block-entry state (the
- * trampoline spills only on clean exits), so block-entry ESP is already
- * the pre-commit value; the explicit rollback documents and enforces
- * the No-Double-Side-Effect invariant.  Without a matching site the
- * state is left untouched. */
+ * guest_pc_delta).  ctx ESP is the LIVE value captured from the
+ * faulting host register state (w4, the dedicated guest-ESP register):
+ * ctx GPRs are only spilled on clean exits to C, so across chained
+ * blocks ctx ESP is stale by the outstanding call depth and replaying
+ * the current block's sites onto it misplaces signal frames and
+ * sigreturn resumes.  The pre-fault sites' effects are already in the
+ * live ESP, so the walk only locates the exact site (for eip and the
+ * pre-commit undo); without a matching site ESP is still corrected
+ * while eip stays at the block base.  Outside translated blocks (helper
+ * or C faults, where w4 is host scratch) the legacy ctx-base replay is
+ * kept as best effort. */
 static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
 {
     uint32_t h = DBT_HT_SIZE;
@@ -408,6 +523,12 @@ static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
     uint32_t fault_off;
     dbt_mem_site_t fault_site;
     bool have_site = false;
+#if (defined(__linux__) || defined(__APPLE__)) && defined(__aarch64__)
+    bool have_live_esp = true;
+#else
+    bool have_live_esp = false;
+#endif
+    uint32_t live_esp = 0U;
 
     if (host_pc == 0U) {
         return;
@@ -423,14 +544,33 @@ static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
     if (h == DBT_HT_SIZE) {
         return;
     }
+    if (have_live_esp) {
+        extern uint64_t i686_fault_esp(void);
+        live_esp = (uint32_t)i686_fault_esp();
+    }
+    /* RC-U3: the fault interrupted a block mid-flight, so ctx GPRs
+     * predate the block (spills happen only at clean exits).  Sync the
+     * live host w0..w7 before the heal/emulate/deliver paths below,
+     * which all read ctx: without this, emulate runs the faulting insn
+     * with stale operands (observed: ECX from the caller, fatal). */
+    {
+        extern uint64_t i686_fault_gpr(unsigned);
+        unsigned r;
+        for (r = 0U; r < 8U; r++) {
+            ctx->gpr[r] = (uint32_t)i686_fault_gpr(r);
+        }
+    }
     base = s_ht[h].eip;
     start = s_site_start[h];
     end = s_site_end[h];
     if (end <= start || s_site_eip[h] != base) {
+        if (have_live_esp) {
+            ctx->gpr[I686_REG_ESP] = live_esp;
+        }
         return;
     }
     fault_off = (uint32_t)(host_pc - (uint64_t)(uintptr_t)s_ht[h].code);
-    esp = ctx->gpr[I686_REG_ESP];
+    esp = have_live_esp ? live_esp : ctx->gpr[I686_REG_ESP];
     memset(&fault_site, 0, sizeof(fault_site));
     for (seq = start; seq < end; seq++) {
         dbt_mem_site_t s;
@@ -438,14 +578,17 @@ static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
             break; /* recycled: stop rather than misapply */
         }
         if ((uint32_t)s.host_insn_offset < fault_off) {
-            /* Committed before the fault: replay the post-success ESP
-             * effect (PUSH/CALL decremented by the delta; POP/RET
-             * bumped by the width). */
-            if ((s.flags & I686_SITE_PRE_COMMITTED_SP) != 0U) {
-                esp = (uint32_t)((int64_t)(int32_t)esp +
-                                 (int64_t)s.sp_rollback_delta);
-            } else {
-                esp += (uint32_t)s.width;
+            /* Committed before the fault.  On the live base their
+             * effects are already in ESP; on the legacy ctx base replay
+             * the post-success effect (PUSH/CALL decremented by the
+             * delta; POP/RET bumped by the width). */
+            if (!have_live_esp) {
+                if ((s.flags & I686_SITE_PRE_COMMITTED_SP) != 0U) {
+                    esp = (uint32_t)((int64_t)(int32_t)esp +
+                                     (int64_t)s.sp_rollback_delta);
+                } else {
+                    esp += (uint32_t)s.width;
+                }
             }
             continue;
         }
@@ -456,17 +599,23 @@ static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
         break;
     }
     if (!have_site) {
+        if (have_live_esp) {
+            ctx->gpr[I686_REG_ESP] = live_esp;
+        }
         return;
     }
     if (fault_site.guest_pc_delta != I686_SITE_PC_UNKNOWN) {
         ctx->eip = base + (uint32_t)fault_site.guest_pc_delta;
     }
     if ((fault_site.flags & I686_SITE_PRE_COMMITTED_SP) != 0U) {
-        /* Live ESP at the fault already included this site's pre-commit
-         * decrement; ctx holds the pre-commit value, so reconstruct the
-         * live value and undo it explicitly. */
-        uint32_t live = (uint32_t)((int64_t)(int32_t)esp +
-                                   (int64_t)fault_site.sp_rollback_delta);
+        /* The faulting access ran after this site's pre-commit
+         * decrement, so the live ESP includes it; undo explicitly to
+         * restore the pre-instruction ESP.  (On the legacy base the
+         * same expression reconstructs then undoes the decrement.) */
+        uint32_t live = have_live_esp
+                            ? live_esp
+                            : (uint32_t)((int64_t)(int32_t)esp +
+                                         (int64_t)fault_site.sp_rollback_delta);
         ctx->gpr[I686_REG_ESP] =
             i686_aot_apply_rollback(live, fault_site.sp_rollback_delta);
     } else {
@@ -518,12 +667,14 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
             return NULL;
         }
 #ifdef __APPLE__
+        (void)pthread_mutex_lock(&s_jit_toggle_mutex);
         pthread_jit_write_protect_np(0);
 #endif
         ring_before = i686_aot_ring_count();
         len = i686_dbt_translate(ctx, eip, code, cap);
 #ifdef __APPLE__
         pthread_jit_write_protect_np(1);
+        (void)pthread_mutex_unlock(&s_jit_toggle_mutex);
 #endif
         if (len == 0U) {
             munmap(code, cap);
@@ -602,6 +753,13 @@ int i686_dbt_run(i686_ctx_t *ctx)
          * DBT interpret-one fallback runs LOCK RMWs inline) must not
          * strand the lock; release it when this thread holds it. */
         i686_split_lock_release_if_held();
+#ifdef __APPLE__
+        /* A fault during translation longjmps past the mutex unlock in
+         * dbt_get_or_compile; release best-effort (not-owned and
+         * not-locked unlocks fail harmlessly) so later compiles in any
+         * thread don't deadlock.  The faulting block is discarded. */
+        (void)pthread_mutex_unlock(&s_jit_toggle_mutex);
+#endif
         i686_fault_arm(&fj); /* re-arm: nested faults disarm */
         if (fa >= ctx->guest_base &&
             fa < ctx->guest_base + 0x100000000ULL) {
@@ -612,24 +770,28 @@ int i686_dbt_run(i686_ctx_t *ctx)
         /* RC-U3 P1: recover the faulting guest PC and ESP from the
          * block's stack-site table (undoes pre-commit SP adjustments). */
         i686_dbt_recover_fault(ctx, i686_fault_host_pc());
-        /* RC-U3-r2 P1 #4: validate-then-map. A SEGV_MAPERR inside a
-         * mapped region means the host mapping went stale, so
-         * re-assert the table-driven union protection and redispatch
-         * once. A backing-file SIGBUS is excluded and delivered, as is
-         * every fault outside all regions. */
-        if (i686_fault_sig() == SIGSEGV &&
-            i686_fault_code() == SEGV_MAPERR &&
-            fa >= ctx->guest_base &&
+        /* C2-2 mirror-consulting classification (interp.c twin): a
+         * fully-R|W-mirrored page faulted spuriously (widen neighbour)
+         * or stale — emulate via interpret-one, else widen-and-retry
+         * once; mirror-denying and unmapped faults deliver below. */
+        if (fa >= ctx->guest_base &&
             fa < ctx->guest_base + 0x100000000ULL) {
-            extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t,
+            extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t,
                                             uint32_t);
+            extern int i686_spurious_emulate(i686_ctx_t *, uint32_t);
+            extern int i686_spurious_allow(i686_ctx_t *, uint32_t);
             uint32_t rga = (uint32_t)(fa - ctx->guest_base);
             if (rga != (uint32_t)s_last_remap_ga &&
                 i686_fault_region_prot(ctx, rga, NULL, NULL) != 0 &&
-                i686_vm32_union_prot(ctx, rga & ~0xFFFU,
-                                     (rga & ~0xFFFU) + 0x1000U) == 0) {
-                s_last_remap_ga = (uint64_t)rga;
-                goto dispatch; /* mapping re-asserted; retry */
+                i686_spurious_allow(ctx, rga) != 0) {
+                if (i686_spurious_emulate(ctx, rga) == 0) {
+                    goto dispatch; /* emulated; resume past the insn */
+                }
+                if (i686_vm32_widen_prot(ctx, rga & ~0xFFFU,
+                                        (rga & ~0xFFFU) + 0x1000U) == 0) {
+                    s_last_remap_ga = (uint64_t)rga;
+                    goto dispatch; /* cover re-asserted; retry */
+                }
             }
         }
         s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
@@ -658,6 +820,18 @@ dispatch:
             if (!i686_seg_flat_cs(ctx) || ctx->v86 != 0U) {
                 i686_fault_disarm();
                 return i686_interp_run(ctx);
+            }
+        }
+        /* C2-2: async-signal poll at the C dispatch boundary.  Chained
+         * blocks stay in asm; every C exit (syscall, self-loop sig_check
+         * bail, IBTC miss, fault) lands here, so a pending raise/alarm
+         * delivers before the next block runs — the interp loop's safe
+         * point (interp.c) mirrored for the DBT.  A delivered handler
+         * re-dispatches at its entry; no handler keeps executing. */
+        if (ctx->pending_signals != 0U) {
+            extern int i686_deliver_pending(i686_ctx_t *);
+            if (i686_deliver_pending(ctx) == 0) {
+                continue;
             }
         }
         dbt_entry_t *e = dbt_get_or_compile(ctx, ctx->eip);
@@ -703,14 +877,45 @@ dispatch:
              * carries the faulting pc in exit_dest (stored by the exit
              * sequence for every reason; eip itself is only written for
              * BRANCH) — set it before stepping or we re-execute the
-             * block start forever. */
+             * block start forever.  A non-continue single step takes
+             * the interpreter's exit switch semantics: syscalls are
+             * served like translated SYSCALL exits, and FAULT/TRAP
+             * goes through signal delivery (a divide error's SIGFPE
+             * arrives here, not via the host-fault checkpoint). */
             extern int i686_interp_step(i686_ctx_t *ctx);
+            int ir;
             ctx->eip = ctx->exit_dest;
-            if (i686_interp_step(ctx) != 0) {
-                i686_fault_disarm();
-                return I686_EXIT_UNDEF;
+            ir = i686_interp_step(ctx);
+            if (ir == I686_INTERP_CONTINUE) {
+                continue;
             }
-            continue;
+            if (ir == I686_EXIT_SYSCALL) {
+                extern long i686_handle_syscall(i686_ctx_t *);
+                extern int i686_syscall_is_exit(long);
+                long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
+                long rv = i686_handle_syscall(ctx);
+                if (s_trace_dbt) {
+                    (void)fprintf(stderr, "S %ld -> %ld\n", nr, rv);
+                }
+                if (i686_syscall_is_exit(nr)) {
+                    ctx->exit_arg = (uint32_t)rv; /* exit status */
+                    i686_fault_disarm();
+                    return I686_EXIT_SYSCALL;
+                }
+                continue;
+            }
+            if (ir == I686_EXIT_FAULT || ir == I686_EXIT_TRAP) {
+                extern int i686_deliver_sync(i686_ctx_t *, int);
+                extern void i686_diag_fault(i686_ctx_t *);
+                if (i686_deliver_sync(ctx, ir) == 0) {
+                    goto dispatch; /* handler installed; resume at it */
+                }
+                i686_diag_fault(ctx);
+                i686_fault_disarm();
+                return ir;
+            }
+            i686_fault_disarm();
+            return ir;
         }
         case I686_EXIT_TRAP:
         case I686_EXIT_FAULT:

@@ -89,7 +89,9 @@
  */
 
 #include <stdint.h>
+#include <string.h>
 
+#include "dbt/aot/aot.h"
 #include "dbt/emit.h"
 
 #define SCR_W    8U  /* LSE Rs: transformed source operand            */
@@ -107,6 +109,48 @@
 #define LSE_OPC_EOR 2U
 #define LSE_OPC_SET 3U
 #define LSE_OPC_SWP 8U
+
+/* 0xFF sentinel in the frozen x86_insn_t (ea_base none). */
+#define AT_NONE 0xFFU
+
+/* RC-U3 recovery site for the single LSE/CASAL access.  A fault in a
+ * LOCK RMW without a site resumes at the block base and re-executes
+ * the (non-idempotent) prefix: the classic shape is call-get_pc_thunk
+ * + add-GOT followed by pushes and the atomic, where re-running the
+ * add corrupts the EA base and the atomic faults on a wild address
+ * (two-threaded C2-2 flock).  The site pins the fault to this insn so
+ * recovery emulates exactly once.  Delta comes from translate.c's
+ * per-insn e->insn_pc (no cursor walk: cursor state is shared while
+ * e->insn_pc is per-emission).  mem is the LSE/CASAL offset itself;
+ * there is no TSO pair for AL atomics (e->tso never set), so no +4. */
+static void em_atomic_site(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                           uint32_t seq, uint32_t mem, uint32_t cont,
+                           unsigned width)
+{
+    dbt_mem_site_t site;
+
+    memset(&site, 0, sizeof(site));
+    site.seq_start_offset = (uint16_t)seq;
+    site.host_insn_offset = (uint16_t)mem;
+    site.cont_insn_offset = (uint16_t)cont;
+    if (e->insn_pc >= e->guest_eip &&
+        e->insn_pc - e->guest_eip <= 0xFFF0U) {
+        site.guest_pc_delta = (uint16_t)(e->insn_pc - e->guest_eip);
+    } else {
+        site.guest_pc_delta = I686_SITE_PC_UNKNOWN;
+    }
+    site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                     ((uint32_t)insn->pfx_lock << 16);
+    site.sp_rollback_delta = 0;
+    site.npc_mode = (uint8_t)I686_NPC_SEQUENTIAL;
+    site.width = (uint8_t)width;
+    site.flags = (uint8_t)I686_SITE_STORE;
+    site.val_or_dst_reg = (uint8_t)SCR_SRC;
+    site.addr_base_reg = (uint8_t)(insn->ea_base != AT_NONE
+                                       ? i686_w(insn->ea_base)
+                                       : 0xFFu);
+    (void)i686_aot_note_stack_site(&site);
+}
 
 /* ---- width-trivial raw encoders ------------------------------------- */
 
@@ -146,6 +190,32 @@ static void emit_casal(a64_buf_t *b, unsigned width, unsigned rs, unsigned rt,
 {
     a64_emit(b, casal_base(width) | ((rs & 31U) << 16) | ((rn & 31U) << 5) |
                      (rt & 31U));
+}
+
+/* Site-wrapping LSE/CASAL: capture the faulting access offset around the
+ * single atomic instruction so recovery pins the fault to this insn. */
+static void emit_lse_site(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                           uint32_t seq, unsigned opc, unsigned width,
+                           unsigned rs, unsigned rt, unsigned rn)
+{
+    a64_buf_t *b = &e->buf;
+    uint32_t mem = (uint32_t)((uint64_t)b->count * 4u);
+    uint32_t cont;
+    emit_lse(b, opc, width, rs, rt, rn);
+    cont = (uint32_t)((uint64_t)b->count * 4u);
+    em_atomic_site(e, insn, seq, mem, cont, width);
+}
+
+static void emit_casal_site(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                            uint32_t seq, unsigned width, unsigned rs,
+                            unsigned rt, unsigned rn)
+{
+    a64_buf_t *b = &e->buf;
+    uint32_t mem = (uint32_t)((uint64_t)b->count * 4u);
+    uint32_t cont;
+    emit_casal(b, width, rs, rt, rn);
+    cont = (uint32_t)((uint64_t)b->count * 4u);
+    em_atomic_site(e, insn, seq, mem, cont, width);
 }
 
 /* AND Wd, Wn, #0xFF / #0xFFFF (N=0, immr=0) — descriptor masking. */
@@ -309,6 +379,7 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn)
 
     /* EA -> w21 (32-bit guest offset, segment base added); the LSE base
      * register must be a full X: x23 = xG + uxtw(w21). */
+    uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
     i686_emit_ea(e, insn, 1);
     a64_emit_add_uxtw_x(b, SCR_ADDR, 20U, 21U);
 
@@ -335,29 +406,34 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn)
             a64_emit_mov_w(b, SCR_W, SCR_SRC);
         }
         if (kind == AT_ADD) {
-            emit_lse(b, LSE_OPC_ADD, width, SCR_W, SCR_OLD, SCR_ADDR);
+            emit_lse_site(e, insn, seq, LSE_OPC_ADD, width, SCR_W,
+                          SCR_OLD, SCR_ADDR);
             a64_emit_add_reg_w(b, false, SCR_RES, SCR_OLD, SCR_SRC,
                                A64_SHIFT_LSL, 0U);
             mask_res(b, width);
             emit_lazy(e, I686_FOP_ADD, SCR_RES, SCR_OLD, SCR_SRC, width);
         } else if (kind == AT_SUB) {
-            emit_lse(b, LSE_OPC_ADD, width, SCR_W, SCR_OLD, SCR_ADDR);
+            emit_lse_site(e, insn, seq, LSE_OPC_ADD, width, SCR_W,
+                          SCR_OLD, SCR_ADDR);
             a64_emit_sub_reg_w(b, false, SCR_RES, SCR_OLD, SCR_SRC,
                                A64_SHIFT_LSL, 0U);
             mask_res(b, width);
             emit_lazy(e, I686_FOP_SUB, SCR_RES, SCR_OLD, SCR_SRC, width);
         } else if (kind == AT_AND) {
-            emit_lse(b, LSE_OPC_CLR, width, SCR_W, SCR_OLD, SCR_ADDR);
+            emit_lse_site(e, insn, seq, LSE_OPC_CLR, width, SCR_W,
+                          SCR_OLD, SCR_ADDR);
             a64_emit_and_reg_w(b, false, SCR_RES, SCR_OLD, SCR_SRC,
                                A64_SHIFT_LSL, 0U);
             emit_lazy(e, I686_FOP_LOGIC, SCR_RES, 31U, 31U, width);
         } else if (kind == AT_OR) {
-            emit_lse(b, LSE_OPC_SET, width, SCR_W, SCR_OLD, SCR_ADDR);
+            emit_lse_site(e, insn, seq, LSE_OPC_SET, width, SCR_W,
+                          SCR_OLD, SCR_ADDR);
             a64_emit_orr_reg_w(b, SCR_RES, SCR_OLD, SCR_SRC, A64_SHIFT_LSL,
                                0U);
             emit_lazy(e, I686_FOP_LOGIC, SCR_RES, 31U, 31U, width);
         } else { /* AT_XOR */
-            emit_lse(b, LSE_OPC_EOR, width, SCR_W, SCR_OLD, SCR_ADDR);
+            emit_lse_site(e, insn, seq, LSE_OPC_EOR, width, SCR_W,
+                          SCR_OLD, SCR_ADDR);
             a64_emit_eor_reg_w(b, SCR_RES, SCR_OLD, SCR_SRC, A64_SHIFT_LSL,
                                0U);
             emit_lazy(e, I686_FOP_LOGIC, SCR_RES, 31U, 31U, width);
@@ -365,7 +441,8 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn)
         break;
     case AT_XADD:
         /* LDADDAL Ws=src, Wt=old: mem = old+src, w9 = old. */
-        emit_lse(b, LSE_OPC_ADD, width, SCR_SRC, SCR_OLD, SCR_ADDR);
+        emit_lse_site(e, insn, seq, LSE_OPC_ADD, width, SCR_SRC,
+                      SCR_OLD, SCR_ADDR);
         store_reg_w(b, SCR_OLD, insn->modrm_reg, width);
         a64_emit_add_reg_w(b, false, SCR_RES, SCR_OLD, SCR_SRC,
                            A64_SHIFT_LSL, 0U);
@@ -374,7 +451,8 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn)
         break;
     case AT_XCHG:
         /* SWPAL Ws=src, Wt=old: mem = src, w9 = old.  No flags. */
-        emit_lse(b, LSE_OPC_SWP, width, SCR_SRC, SCR_OLD, SCR_ADDR);
+        emit_lse_site(e, insn, seq, LSE_OPC_SWP, width, SCR_SRC,
+                      SCR_OLD, SCR_ADDR);
         store_reg_w(b, SCR_OLD, insn->modrm_reg, width);
         break;
     default: /* AT_CMPXCHG */
@@ -389,7 +467,7 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn)
          * success (Rs == acc), the old memory value on failure. */
         load_reg_w(b, SCR_ACC, I686_REG_EAX, width);
         load_reg_w(b, SCR_ACC2, I686_REG_EAX, width);
-        emit_casal(b, width, SCR_ACC, SCR_SRC, SCR_ADDR);
+        emit_casal_site(e, insn, seq, width, SCR_ACC, SCR_SRC, SCR_ADDR);
         store_reg_w(b, SCR_ACC, I686_REG_EAX, width);
         a64_emit_sub_reg_w(b, false, SCR_RES, SCR_ACC2, SCR_ACC,
                            A64_SHIFT_LSL, 0U);

@@ -31,9 +31,14 @@ static uint32_t aot_crc32(const uint8_t *p, size_t len)
     return crc ^ 0xFFFFFFFFu;
 }
 
-static dbt_mem_site_t s_ring[I686_AOT_SITE_RING];
-static uint64_t s_ring_gen[I686_AOT_SITE_RING];
-static uint64_t s_ring_next;
+/* Thread-local (clone/Phase 4): stack-site notes are recorded during
+ * translation and replayed on that same thread's faults, so each thread
+ * owns its ring exactly like its direct-mapped cache (engine.c).  A
+ * shared ring would interleave two threads' sites into each other's
+ * slices and corrupt fault recovery. */
+static __thread dbt_mem_site_t s_ring[I686_AOT_SITE_RING];
+static __thread uint64_t s_ring_gen[I686_AOT_SITE_RING];
+static __thread uint64_t s_ring_next;
 
 size_t i686_aot_note_stack_site(const dbt_mem_site_t *site)
 {

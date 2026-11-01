@@ -508,7 +508,11 @@ static int64_t sys_stime(i686_ctx_t *ctx, uint32_t tptr)
 
 static int64_t sys_alarm(uint32_t seconds)
 {
-    return (int64_t)alarm((unsigned)seconds);
+    /* Route through the async host-signal bridge (signals_i386.c) so a
+     * guest-armed timer delivers to the guest handler instead of killing
+     * the runner when translation outlasts the 1s host timer. */
+    extern unsigned i686_host_alarm(unsigned seconds);
+    return (int64_t)i686_host_alarm((unsigned)seconds);
 }
 
 static int64_t sys_gettimeofday(i686_ctx_t *ctx, uint32_t tv_va, uint32_t tz_va)
@@ -641,6 +645,17 @@ static int64_t sys_setitimer(i686_ctx_t *ctx, uint32_t which, uint32_t new_va,
     if (setitimer((int)(int32_t)which, (new_va != 0U) ? &hnew : NULL,
                   (old != 0U) ? &hold : NULL) != 0) {
         return -(long)errno;
+    }
+    if (which == 0U && new_va != 0U) {
+        /* ITIMER_REAL drives host SIGALRM: arm the bridge (musl's
+         * alarm() arrives here, not via the alarm syscall).  A zero
+         * it_value disarms; a nonzero it_interval repeats. */
+        extern void i686_host_alarm_set(int armed, int repeat);
+        int armed = (hnew.it_value.tv_sec != 0 ||
+                     hnew.it_value.tv_usec != 0) ? 1 : 0;
+        int repeat = (hnew.it_interval.tv_sec != 0 ||
+                      hnew.it_interval.tv_usec != 0) ? 1 : 0;
+        i686_host_alarm_set(armed, repeat);
     }
     if (old != 0U) {
         int r = i686_time_store_itimerval(ctx, old, &hold);

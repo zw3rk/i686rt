@@ -32,9 +32,23 @@ static long sig_host_gettid(void)
 }
 
 #include "i686rt.h"
+#include "interp/interp.h"
 #include "os/marshal.h"
 #include "os/sigframe_i386.h"
 #include "os/threads.h"
+#include "vm/vm32.h"
+#include "vm/vm_file.h"
+#include "x86/decode.h"
+
+extern int i686_fault_region_prot(const i686_ctx_t *ctx, uint32_t ga,
+                                  uint32_t *out_prot, uint32_t *out_flags);
+
+/* The host bridge below uses sa_sigaction + SA_SIGINFO throughout
+ * (matching interp.c and backend_linux.c): portable across Darwin,
+ * glibc, and musl under strict POSIX, where sa_handler is a macro on
+ * some platforms and absent on others (musl hides it).  The kernel
+ * reads the handler value through the SA_SIGINFO-selected union
+ * member, so a cast SIG_DFL stores the same zero value either way. */
 
 /* Guest sigaction table (frozen in sys_pass.c Phase 2 v1: single static).
  * Phase 4 moves it here per-thread via the ctx tail. */
@@ -85,6 +99,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
         return -1; /* SIG_DFL: caller terminates */
     }
+    (void)fp_va; (void)i;
 
     /* Handler double-fault (RC7b T4b): when the same signal's handler is
      * already running (a live, not-yet-sigreturned frame) and a fault
@@ -93,13 +108,24 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
      * path re-entered save_context forever (SA_ONSTACK rewinds to the
      * altstack top, so the guard never fired).  A DIFFERENT signal's
      * handler may nest legitimately, so only the same-signal case is
-     * forced to the default action.  Both frame layouts keep sig at +4. */
+     * forced to the default action.  Both frame layouts keep sig at +4.
+     * C2-2: a stale slot must not kill a legitimate re-delivery.  The
+     * guest may unwind out of the handler with siglongjmp (no sigreturn
+     * syscall marks the exit, but the stack pointer is restored past the
+     * frame).  Delivery always parks ESP at the frame base, and handler
+     * code only pushes down, so a current ESP above the live frame base
+     * proves the handler already exited: drop the stale slot and deliver
+     * instead of killing. */
     if (ctx->sig_last_frame_va != 0U) {
         int32_t live = 0;
         memcpy(&live, i686_guest_ptr(ctx, ctx->sig_last_frame_va + 4U),
                sizeof(live));
         if (live == sig) {
-            return -1;
+            if (sp > ctx->sig_last_frame_va) {
+                ctx->sig_last_frame_va = 0U; /* unwound via longjmp */
+            } else {
+                return -1;
+            }
         }
     }
 
@@ -112,6 +138,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
         (sp < ctx->altstack_sp ||
          sp >= ctx->altstack_sp + ctx->altstack_size)) {
         sp = ctx->altstack_sp + ctx->altstack_size;
+        ctx->altstack_onstack = 1U; /* entered on the alternate stack */
     }
 
     /* Guard pre-check (RC7b): a frame crossing into the stack guard
@@ -223,6 +250,10 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
         *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
             ((ga->flags & SA_RESTORER_) != 0U) ? ga->restorer
                 : frame_va + sizeof(i686_rt_sigframe_t) - 8;
+        /* [frame+4] is the handler's signo argument (it previously held
+         * whatever the abandoned stack had there; signal-number checks
+         * in handlers read garbage without this store). */
+        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 4) = (uint32_t)sig;
         *(uint32_t *)i686_guest_ptr(ctx, frame_va + 8) = frame_va + 0x10;
         *(uint32_t *)i686_guest_ptr(ctx, frame_va + 12) = frame_va + 0x90;
         {
@@ -244,6 +275,8 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
         *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
             ((ga->flags & SA_RESTORER_) != 0U) ? ga->restorer
                 : frame_va + sizeof(i686_sigframe_t) - 8;
+        /* [frame+4] is the handler's signo argument (see rt branch). */
+        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 4) = (uint32_t)sig;
     }
 
     /* Kernel-contiguous handler entry (i386): esp = frame base;
@@ -317,6 +350,7 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
         frame = ctx->sig_last_frame_va;
     }
     ctx->sig_last_frame_va = 0U;
+    ctx->altstack_onstack = 0U; /* sigreturn leaves the alternate stack */
     base = frame + (rt ? (0x90U + 20U) : 8U);
     if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
         return -1;
@@ -379,11 +413,95 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
     return 0;
 }
 
+/* Async host-signal bridge (Wave C2 p3_torture): the guest arms a real
+ * host alarm(2) through sys_alarm. Without a host handler the 1s SIGALRM
+ * kills the runner whenever translation runs slower than native (the FP
+ * loop beats 1s natively but not under interp). The bridge converts the
+ * host SIGALRM into a pending_signals bit on the main ctx, which both
+ * engine loops already poll at safe points (interp.c, engine.c) and
+ * i686_deliver_pending delivers honoring mask and disposition.
+ * One-shot semantics: the armed flag clears at the first fire. With no
+ * guest alarm armed (suite perl-alarm watchdog, stray timers) the handler
+ * restores SIG_DFL and re-raises so hang protection still kills. */
+static volatile sig_atomic_t s_alarm_armed = 0;
+static volatile sig_atomic_t s_alarm_repeat = 0;
+
+static void host_sigalrm_handler(int sig, siginfo_t *info, void *ucontext)
+{
+    extern i686_ctx_t *i686_thread_registry_main_ctx(void);
+    extern uint32_t i686_gsig_handler_raw(int signum);
+    i686_ctx_t *target;
+    uint32_t disp;
+
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+    if (s_alarm_armed == 0) {
+        /* Not ours (watchdog): die with the default disposition. */
+        (void)signal(SIGALRM, SIG_DFL);
+        (void)raise(SIGALRM);
+        return;
+    }
+    if (s_alarm_repeat == 0) {
+        s_alarm_armed = 0; /* one-shot consumed */
+    } /* interval timers stay armed across fires */
+    target = i686_thread_registry_main_ctx();
+    if (target == NULL) {
+        (void)signal(SIGALRM, SIG_DFL);
+        (void)raise(SIGALRM);
+        return;
+    }
+    if ((target->sig_mask & ((uint64_t)1U << 13)) != 0ULL) {
+        /* Blocked: queue (kernel keeps it pending until unmasked). */
+        target->pending_signals |= (uint64_t)1U << 13; /* SIGALRM = 14 */
+        return;
+    }
+    disp = i686_gsig_handler_raw(14);
+    if (disp == 1U) {
+        return; /* SIG_IGN */
+    }
+    if (disp == 0U) {
+        /* SIG_DFL: Linux default action terminates. */
+        (void)signal(SIGALRM, SIG_DFL);
+        (void)raise(SIGALRM);
+        return;
+    }
+    target->pending_signals |= (uint64_t)1U << 13; /* SIGALRM = 14 */
+}
+
+/* Host alarm(2) wrapper that tracks the armed state for the bridge.
+ * Called by sys_alarm (sys_time.c) instead of alarm() directly. */
+unsigned i686_host_alarm(unsigned seconds);
+unsigned i686_host_alarm(unsigned seconds)
+{
+    s_alarm_armed = (seconds != 0U) ? 1 : 0;
+    s_alarm_repeat = 0;
+    return alarm(seconds);
+}
+
+/* ITIMER_REAL arming for the bridge (sys_setitimer path: musl's
+ * alarm() uses setitimer, not the alarm syscall).  repeat is nonzero
+ * when it_interval is nonzero: interval timers stay armed across
+ * fires, one-shot timers disarm at the first fire. */
+void i686_host_alarm_set(int armed, int repeat);
+void i686_host_alarm_set(int armed, int repeat)
+{
+    s_alarm_armed = (armed != 0) ? 1 : 0;
+    s_alarm_repeat = (repeat != 0) ? 1 : 0;
+}
+
 void i686_signals_i386_init(void)
 {
-    /* Host-signal registration for async delivery lands with Phase 4
-     * S4 integration (host_sig_handler + pending bit set); v1 delivers
-     * sync exits (FAULT/FPE/TRAP) directly at the engine exit switch. */
+    /* Host-signal registration for async delivery: SA_RESTART keeps host
+     * blocking syscalls (futex waits) across the timer; the pending bit
+     * delivers at the next engine safe point. v1 still delivers sync
+     * exits (FAULT/FPE/TRAP) directly at the engine exit switch. */
+    struct sigaction sa;
+    (void)memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = host_sigalrm_handler;
+    (void)sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_SIGINFO;
+    (void)sigaction(SIGALRM, &sa, NULL);
 }
 
 /* Delivery/thread forensics gate (RC7b T4b). */
@@ -409,6 +527,240 @@ int i686_sigtrace_on(void)
  * as the legacy fallback for unrecorded channels.
  * TRAP -> SIGTRAP(5); UNDEF -> SIGILL(4). Returns 0 when a guest
  * handler was installed (frame pushed, eip=handler), -1 otherwise. */
+/* C2-2 spurious-fault emulation (Regime A2 widened host pages).  A
+ * widened host page denies its whole cover, so a touch of a
+ * still-guest-accessible sub-page (e.g. the RW sibling of a guest
+ * PROT_NONE page) host-faults even though the mirror allows it.  When
+ * the fine-grained mirror (`i686_vm_file_prot`) grants full R|W at the
+ * faulting page, the access is legitimate: unrestrict the covering
+ * host page to the union cover, single-step exactly one guest
+ * instruction with the interpreter (code is untouched, so no cache
+ * work is needed), and re-widen.  Returns 0 when the fault was
+ * emulated (the caller resumes at the advanced PC), -1 when the
+ * mirror denies the page (the caller delivers the signal).  The
+ * direction check lives in i686_spurious_allow (above): a pure-read
+ * insn needs only the R grant, a pure store only W; a partially
+ * allowed page against the insn's direction (R-only write, NONE
+ * read) is a genuine guest fault and must trap. */
+int i686_spurious_allow(i686_ctx_t *ctx, uint32_t ga)
+{
+    /* Access-aware heal gate for the fault paths (C2-2 rodata hang).
+     * The legacy gate requires full R|W mirror, which kills legitimate
+     * READS from spuriously-closed R-only pages (small-binary .rodata
+     * sharing its 16 KiB host cover with unrecorded padding widens
+     * shut at load; the first format-string load then dies instead of
+     * healing).  A pure-read insn only needs the R grant, a pure
+     * store only the W grant; the union cover always grants a superset
+     * of the faulting sub-page's own record, so healing under union is
+     * sound exactly when the mirror grants the insn's direction.  The
+     * EA-page match pins the fault to this insn (a parked/stale eip
+     * from syscall-internal access must not heal here: those heal
+     * inside the tolerant copies).  Anything unclassifiable falls back
+     * to the legacy full-grant rule. */
+    uint8_t mirror;
+    x86_insn_t insn;
+    int rd;
+    int wr;
+    int i;
+    if (ctx == NULL) {
+        return 0;
+    }
+    mirror = (uint8_t)(i686_vm_file_prot(ga & ~0xFFFU) & 0x03u);
+    if (mirror == 0x03u) {
+        return 1; /* legacy: full grant */
+    }
+    if (mirror == 0u) {
+        return 0; /* deny */
+    }
+    /* Never decode off an unmapped/unreadable code page: the fetch
+     * itself would nest a fault into this same path. */
+    if (i686_fault_region_prot(ctx, ctx->eip, NULL, NULL) == 0 ||
+        (i686_vm_file_prot(ctx->eip & ~0xFFFU) & 0x01u) == 0u) {
+        return 0;
+    }
+    if (x86_decode(ctx, ctx->eip, &insn) != 0) {
+        return 0;
+    }
+    /* LEA touches nothing: a fault parked here is stale/syscall
+     * traffic (legacy retry path heals it). */
+    if (insn.op == I686_OP_LEA_GvM) {
+        return 0;
+    }
+    /* String ops carry implicit ESI/EDI traffic.  Pin the faulting page
+     * to the live stream range(s) instead of an EA: rga must overlap
+     * [ESI, ESI+n) and/or [EDI, EDI+n), and the mirror must grant the
+     * touching stream's direction (memcpy-from-rodata reads a
+     * widen-shut R-only page legitimately).  n follows REP*ECX (or one
+     * unit without REP); ranges wrap per D4. */
+    switch (insn.op) {
+    case I686_OP_MOVSb: case I686_OP_MOVSw:
+    case I686_OP_CMPSb: case I686_OP_CMPSw:
+    case I686_OP_STOSb: case I686_OP_STOSw:
+    case I686_OP_LODSb: case I686_OP_LODSw:
+    case I686_OP_SCASb: case I686_OP_SCASw: {
+        uint32_t unit;
+        if (insn.op == I686_OP_MOVSb || insn.op == I686_OP_CMPSb ||
+            insn.op == I686_OP_STOSb || insn.op == I686_OP_LODSb ||
+            insn.op == I686_OP_SCASb) {
+            unit = 1u;
+        } else {
+            unit = (insn.pfx_opsize != 0u) ? 2u : 4u;
+        }
+        uint64_t n = (insn.pfx_rep != 0u)
+            ? (uint64_t)ctx->gpr[I686_REG_ECX] * (uint64_t)unit
+            : (uint64_t)unit;
+        uint32_t page = ga & ~0xFFFU;
+        uint64_t b;
+        int in_esi;
+        int in_edi;
+        uint8_t need = 0u;
+        if (n == 0u) {
+            return 0; /* REP with ECX=0 moves nothing: not this insn */
+        }
+        if (insn.op == I686_OP_STOSb || insn.op == I686_OP_STOSw ||
+            insn.op == I686_OP_SCASb || insn.op == I686_OP_SCASw) {
+            in_esi = 0; /* no ESI stream */
+        } else {
+            b = (uint64_t)ctx->gpr[I686_REG_ESI];
+            in_esi = (b + n <= 0x100000000ULL)
+                ? (b < (uint64_t)page + 4096u &&
+                   (uint64_t)page < b + n)
+                : (b < (uint64_t)page + 4096u ||
+                   (uint64_t)page < ((b + n) & 0xFFFFFFFFu));
+        }
+        if (insn.op == I686_OP_LODSb || insn.op == I686_OP_LODSw) {
+            in_edi = 0; /* no EDI stream */
+        } else {
+            b = (uint64_t)ctx->gpr[I686_REG_EDI];
+            in_edi = (b + n <= 0x100000000ULL)
+                ? (b < (uint64_t)page + 4096u &&
+                   (uint64_t)page < b + n)
+                : (b < (uint64_t)page + 4096u ||
+                   (uint64_t)page < ((b + n) & 0xFFFFFFFFu));
+        }
+        if (!in_esi && !in_edi) {
+            return 0; /* fault is not this insn's traffic */
+        }
+        /* Stream directions: ESI is always read (MOVS/CMPS/LODS);
+         * EDI is written by MOVS/STOS and read by CMPS/SCAS. */
+        if (in_esi) {
+            need |= 1u;
+        }
+        if (in_edi &&
+            (insn.op == I686_OP_MOVSb || insn.op == I686_OP_MOVSw ||
+             insn.op == I686_OP_STOSb || insn.op == I686_OP_STOSw)) {
+            need |= 2u;
+        } else if (in_edi) {
+            need |= 1u;
+        }
+        if ((mirror & need) != need) {
+            return 0; /* genuine protection fault: deliver */
+        }
+        return 1;
+    }
+    default:
+        break;
+    }
+    rd = 0;
+    wr = 0;
+    for (i = 0; i < 3; i++) {
+        unsigned k = insn.opnd[i];
+        int is_rm = (k == I686_OPND_RM8 || k == I686_OPND_RM16 ||
+                     k == I686_OPND_RM32);
+        int is_m = is_rm || k == I686_OPND_M1616;
+        if (!is_m) {
+            continue;
+        }
+        if (insn.has_modrm && insn.modrm_mod == 3u) {
+            continue; /* register form: no memory traffic */
+        }
+        if (i == 0) {
+            wr = 1;
+        } else {
+            rd = 1;
+        }
+    }
+    /* CMP/TEST/BT read their dst-slot operand (compare, no writeback):
+     * requiring W would mis-deliver legitimate reads. */
+    if (insn.op == I686_OP_CMP_EvGv || insn.op == I686_OP_TEST_EvGv ||
+        insn.op == I686_OP_BT_EvIb || insn.op == I686_OP_CMP_EbIb ||
+        insn.op == I686_OP_CMP_EvIz || insn.op == I686_OP_CMP_EvIbSX) {
+        wr = 0;
+        rd = 1;
+    }
+    if (!rd && !wr) {
+        return 0; /* non-memory insn cannot have faulted: retry path */
+    }
+    if ((mirror & (uint8_t)((rd ? 1 : 0) | (wr ? 2 : 0))) !=
+        (uint8_t)((rd ? 1 : 0) | (wr ? 2 : 0))) {
+        return 0; /* genuine protection fault: deliver */
+    }
+    {
+        uint32_t ea = x86_ea_compute(ctx, &insn);
+        if ((ea & ~0xFFFU) != (ga & ~0xFFFU)) {
+            return 0; /* fault is not this insn's traffic */
+        }
+    }
+    return 1;
+}
+
+int i686_spurious_emulate(i686_ctx_t *ctx, uint32_t ga)
+{
+    /* Leave-open table: a host page that faults spuriously dozens of
+     * times (a hot RW stack sharing its 16 KiB cover with a widened
+     * guard page — every touch would otherwise pay two mprotects)
+     * stays at the permissive union cover after probation.  Torture
+     * windows touch a widened neighbour at most a couple of times
+     * (tcg test-mmap: two), far below probation, so they stay enforced
+     * while guards (thousands of touches) open quickly.  Process-wide
+     * and lock-free: every outcome (open vs widened) is a safe
+     * direction, a race only shifts probation by one fault. */
+    static uint32_t s_open_page[64];
+    static uint8_t s_open_hits[64];
+    uint32_t page;
+    uint32_t hps;
+    size_t slot;
+    int ir;
+    if (ctx == NULL || ctx->vm_regime != I686_VM_REGIME_A2 ||
+        ctx->vm_host_page <= 4096u) {
+        return -1;
+    }
+    if (i686_spurious_allow(ctx, ga) == 0) {
+        return -1; /* mirror denies: genuine fault, deliver it */
+    }
+    hps = ctx->vm_host_page;
+    page = ga & ~(hps - 1u);
+    slot = (size_t)(((page >> 12) ^ (page >> 20)) & 63U);
+    if (s_open_page[slot] == page) {
+        if (s_open_hits[slot] >= 64u) {
+            /* On probation: re-union without re-widening. */
+            if (i686_vm32_union_prot(ctx, page, page + hps) != 0) {
+                return -1;
+            }
+            ir = i686_interp_step(ctx);
+            return (ir == I686_INTERP_CONTINUE) ? 0 : -1;
+        }
+        s_open_hits[slot]++;
+    } else {
+        s_open_page[slot] = page;
+        s_open_hits[slot] = 1u;
+    }
+    /* Unrestrict to the union cover (a superset of the mirror grant),
+     * step exactly one instruction, then re-widen. */
+    if (i686_vm32_union_prot(ctx, page, page + hps) != 0) {
+        return -1;
+    }
+    ir = i686_interp_step(ctx);
+    (void)i686_vm32_widen_prot(ctx, page, page + hps);
+    if (ir == I686_INTERP_CONTINUE) {
+        return 0;
+    }
+    /* The stepped instruction took its own exit (syscall/fault/trap):
+     * report not-emulated so the caller runs its normal exit switch
+     * instead of blindly resuming. */
+    return -1;
+}
+
 int i686_deliver_sync(i686_ctx_t *ctx, int reason)
 {
     int sig;
@@ -420,7 +772,8 @@ int i686_deliver_sync(i686_ctx_t *ctx, int reason)
             sig = 8;
         } else if (hsig == 4 /*SIGILL*/) {
             sig = 4;
-        } else if (hsig == 11 /*SIGSEGV*/ || hsig == 7 /*SIGBUS*/) {
+        } else if (hsig == 11 /*SIGSEGV*/ || hsig == SIGBUS /* 7 on Linux,
+                                                           10 on Darwin */) {
             sig = 11;
         } else {
             sig = (ctx->exit_arg == 0U) ? 8 : 11; /* legacy convention */

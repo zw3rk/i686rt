@@ -169,29 +169,102 @@ static int sse_emit_cvtpi2(i686_emit_ctx_t *e, const x86_insn_t *insn)
     return 0;
 }
 
-/* CVTTPS2PI/CVTTSS2SI/CVTTSD2SI/CVTTPD2PI (0F 2C). */
+/* CVTTPS2PI/CVTTSS2SI/CVTTSD2SI/CVTTPD2PI (0F 2C).
+ *
+ * Scalar range guards: x86 converts NaN and out-of-range sources to
+ * the integer-indefinite 0x80000000 (+IE), while A64 FCVTZS saturates
+ * (INT32_MAX / INT32_MIN / 0).  Sources outside [-2^31, 2^31) (NaN
+ * included) take the D2 interpret-one path, which produces the exact
+ * x86 result and flags; in-range sources convert natively.  The CMPs
+ * bracket with an NZCV save/restore so pending lazy flags survive. */
 static int sse_emit_cvttpi(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
     a64_buf_t *b = &e->buf;
 
     if (insn->pfx_rep == 1U) { /* CVTTSS2SI r32, m32/xmm */
+        unsigned dst = i686_w(insn->modrm_reg);
+        size_t to_pos, to_interp, to_valid, to_done;
+
         if (insn->modrm_mod == 3U) {
             sse_s_ldr(e, 1U, insn->modrm_rm & 7U);
+            sse_fmov_w_from_s(b, SSE_W8, 1U); /* source bits */
         } else {
             sse_guest_addr(e, insn);
-            sse_ldr_s(b, 1U, SSE_ADDR, 0U);
+            a64_emit_ldr_imm_w(b, SSE_W8, SSE_ADDR, 0U); /* bits */
+            sse_ldr_s(b, 1U, SSE_ADDR, 0U);              /* value */
         }
-        sse_fcvtzs_w_s(b, i686_w(insn->modrm_reg), 1U);
+        a64_emit_mrs_nzcv(b, SSE_W10);
+        /* sign -> bit 0; nonzero (negative) skips the +2^31 bound. */
+        a64_emit_ubfm_w(b, SSE_W9, SSE_W8, 31U, 31U);
+        to_pos = a64_emit_cbz_w_placeholder(b, false, SSE_W9);
+        /* Negative: invalid iff bits > 0xCF000000 (-2^31 is valid). */
+        a64_emit_movz_w(b, SSE_W9, 0xCF00U, 1U);
+        a64_emit_sub_reg_w(b, true, 31U, SSE_W8, SSE_W9, A64_SHIFT_LSL, 0U);
+        to_interp = a64_emit_b_cond_placeholder(b, A64_COND_HI);
+        to_valid = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, to_pos, b->count);
+        /* Non-negative: invalid iff bits >= 0x4F000000 (+2^31, Inf, NaN). */
+        a64_emit_movz_w(b, SSE_W9, 0x4F00U, 1U);
+        a64_emit_sub_reg_w(b, true, 31U, SSE_W8, SSE_W9, A64_SHIFT_LSL, 0U);
+        a64_patch_b_cond(b, to_interp, b->count);
+        to_interp = a64_emit_b_cond_placeholder(b, A64_COND_CS);
+        a64_patch_b_cond(b, to_valid, b->count);
+        a64_emit_msr_nzcv(b, SSE_W10);
+        sse_fcvtzs_w_s(b, dst, 1U);
+        to_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_b_cond(b, to_interp, b->count);
+        a64_emit_msr_nzcv(b, SSE_W10);
+        i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+        a64_patch_b_cond(b, to_done, b->count);
+        e->block_open = true; /* guard exit closed it; NEON path inlines */
         return 0;
     }
     if (insn->pfx_rep == 2U) { /* CVTTSD2SI r32, m64/xmm */
+        unsigned dst = i686_w(insn->modrm_reg);
+        size_t to_pos, to_interp, to_valid, to_done, to_interp_lo, to_valid_lo;
+
         if (insn->modrm_mod == 3U) {
             sse_d_ldr(e, 1U, insn->modrm_rm & 7U);
+            sse_umov_d(b, 8U, 1U, 0U); /* full 64-bit source bits */
+            a64_emit_ubfx_x_to_w(b, SSE_W9, 8U, 32U, 32U); /* high word */
+            a64_emit_mov_w(b, SSE_W10, SSE_W8);            /* low word */
         } else {
             sse_guest_addr(e, insn);
-            sse_ldr_d(b, 1U, SSE_ADDR, 0U);
+            a64_emit_ldr_imm_w(b, SSE_W8, SSE_ADDR, 0U);  /* low word */
+            a64_emit_ldr_imm_w(b, SSE_W9, SSE_ADDR, 4U);  /* high word */
+            a64_emit_mov_w(b, SSE_W10, SSE_W8);           /* low copy */
+            sse_ldr_d(b, 1U, SSE_ADDR, 0U);               /* value */
         }
-        sse_fcvtzs_w_d(b, i686_w(insn->modrm_reg), 1U);
+        a64_emit_mrs_nzcv(b, 12U);
+        /* sign (high bit 31 of the high word) -> bit 0. */
+        a64_emit_ubfm_w(b, 11U, SSE_W9, 31U, 31U);
+        to_pos = a64_emit_cbz_w_placeholder(b, false, 11U);
+        /* Negative: invalid iff high > 0xC1E00000, or equal with low != 0
+         * (-2^31 exactly, low == 0, is the one valid boundary value). */
+        a64_emit_movz_w(b, 13U, 0xC1E0U, 1U);
+        a64_emit_sub_reg_w(b, true, 31U, SSE_W9, 13U, A64_SHIFT_LSL, 0U);
+        to_interp = a64_emit_b_cond_placeholder(b, A64_COND_HI);
+        to_valid = a64_emit_b_cond_placeholder(b, A64_COND_NE);
+        to_interp_lo = a64_emit_cbz_w_placeholder(b, true, SSE_W10);
+        to_valid_lo = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, to_pos, b->count);
+        /* Non-negative: invalid iff high >= 0x41E00000 (+2^31, Inf, NaN). */
+        a64_emit_movz_w(b, 13U, 0x41E0U, 1U);
+        a64_emit_sub_reg_w(b, true, 31U, SSE_W9, 13U, A64_SHIFT_LSL, 0U);
+        a64_patch_b_cond(b, to_interp, b->count);
+        a64_patch_cbz_w(b, to_interp_lo, b->count);
+        to_interp = a64_emit_b_cond_placeholder(b, A64_COND_CS);
+        a64_patch_b_cond(b, to_valid, b->count);
+        a64_patch_b_cond(b, to_valid_lo, b->count);
+        a64_emit_msr_nzcv(b, 12U);
+        sse_fcvtzs_w_d(b, dst, 1U);
+        to_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_b_cond(b, to_interp, b->count);
+        a64_emit_msr_nzcv(b, 12U);
+        i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+        a64_patch_b_cond(b, to_done, b->count);
+        /* (the earlier AL placeholder targeted here as well) */
+        e->block_open = true; /* guard exit closed it; NEON path inlines */
         return 0;
     }
     /* CVTTPS2PI mm, xmm/m64 (plain, MMX dest) and CVTTPD2PI (66, m128/

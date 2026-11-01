@@ -781,9 +781,14 @@ uint32_t rt32_vm_brk(i686_ctx_t *ctx, uint32_t new_brk)
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
         (void)vm_reserve_prot_none(ctx, new_page, len);
         vm_unmap_regions_locked(new_page, old_page);
-        /* RC-U3: sync the prot tables and re-union the host pages. */
+        /* C2-2: sync the prot tables and re-widen the host pages so
+         * shrunk brk pages trap. */
         vm_file_sync_prot_locked(new_page, old_page);
-        vm_union_protect_a2(ctx, new_page, old_page);
+        {
+            extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t,
+                                            uint32_t);
+            (void)i686_vm32_widen_prot(ctx, new_page, old_page);
+        }
     }
 
     g_vm_brk_curr = new_brk;
@@ -943,12 +948,16 @@ static int vm_mprotect_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len, uint
         return -ENOMEM;
     }
 
-    /* RC-U3 P1: on Regime A2 the 4 KiB mprotect would round to (and
-     * fault on) the host page; the region tables (synced by
-     * vm_mprotect_regions_locked) drive the union instead. */
+    /* C2-2: on Regime A2 the 4 KiB mprotect widens to the covering host
+     * pages with most-restrictive protection (region tables synced by
+     * vm_mprotect_regions_locked carry the exact per-4K mirror).  A
+     * guest PROT_NONE/PROT_READ sub-page therefore traps on the host
+     * even when RW neighbours share the page (p3/tcg immediacy); the
+     * fault paths emulate the spurious neighbour touches via
+     * interpret-one and re-widen, so no permission is silently lost. */
     if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
         vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
-        if (i686_vm32_union_prot(ctx, addr, (uint32_t)end64) != 0) {
+        if (i686_vm32_widen_prot(ctx, addr, (uint32_t)end64) != 0) {
             return -EIO;
         }
         return 0;
@@ -1003,9 +1012,11 @@ static int vm_munmap_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len)
     /* RC-U3: drop file-map tracking and sync the prot tables. */
     i686_vm_file_untrack_map(start, (size_t)aligned_len);
     vm_file_sync_prot_locked(start, end);
-    /* RC-U3-r2 P1 #1: re-union the host cover from the updated tables so
-     * a removed A2 sub-page stops contributing stale permissions. */
-    vm_union_protect_a2(ctx, start, end);
+    /* C2-2: re-widen (not re-union) the host cover from the updated
+     * tables so a removed A2 sub-page traps instead of staying readable
+     * through a RW neighbour (p3/tcg munmap immediacy). */
+    extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
+    (void)i686_vm32_widen_prot(ctx, start, end);
     if (g_vm_mmap_cursor == end && start >= RT32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
     }

@@ -487,11 +487,29 @@ static int sse_emit_plogic(i686_emit_ctx_t *e, const x86_insn_t *insn,
 
 /* ADD/SUB/MUL/DIV PS/PD/SS/SD (kind: 0 add, 1 sub, 2 mul, 3 div).
  * Scalar lane reads copy only lane 0; only lane 0 of the source is
- * consumed by the scalar paths below. */
+ * consumed by the scalar paths below.
+ *
+ * FTZ/DAZ guard: NEON runs with the host FPCR (round-to-nearest, no
+ * flush), so when the guest MXCSR has flush-to-zero (bit 15) or
+ * denormals-are-zero (bit 6) set the op takes the D2 interpret-one path
+ * (the interpreter honors FTZ/DAZ flushing and UE/PE/DE accumulation
+ * exactly).  CBZ preserves host NZCV, so pending lazy flags survive. */
 static int sse_emit_fparith(i686_emit_ctx_t *e, const x86_insn_t *insn,
                             unsigned kind)
 {
     a64_buf_t *b = &e->buf;
+    size_t to_neon;
+
+    a64_emit_ldr_imm_w(b, SSE_W8, A64_XCTX, 0x198U); /* ctx->mxcsr */
+    a64_emit_movz_w(b, SSE_W9, 0x8040U, 0U);         /* FTZ|DAZ */
+    a64_emit_and_reg_w(b, false, SSE_W8, SSE_W8, SSE_W9, A64_SHIFT_LSL, 0U);
+    to_neon = a64_emit_cbz_w_placeholder(b, false, SSE_W8);
+    i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+    a64_patch_cbz_w(b, to_neon, b->count);
+    /* The guard exit closed the block; reopen it so the NEON fast path
+     * stays inline and translation continues past this insn (a mid-block
+     * conditional RET is sound: the engine dispatches on any exit). */
+    e->block_open = true;
 
     sse_q_ldr(e, 0U, insn->modrm_reg & 7U);
     if (insn->pfx_rep == 0U && insn->pfx_opsize == 0U) { /* PS */
@@ -533,11 +551,38 @@ static int sse_emit_fparith(i686_emit_ctx_t *e, const x86_insn_t *insn,
     return 0;
 }
 
+/* le core: v2 = (dest < src) | (dest == src).  A64 FCMEQ/FCMGT are
+ * false when either side is NaN, so the OR is false for unordered
+ * inputs exactly like x86 CMPPS-le (unlike !(dest > src), which is
+ * true for NaN).  Only lane 0 of v2/v3 is consumed (scalar forms), so
+ * upper-lane ORR/MVN residue is harmless there. */
+static void sse_cmp_le(a64_buf_t *b, unsigned dbl, unsigned vec)
+{
+    if (vec != 0U) {
+        if (dbl != 0U) {
+            sse_fcmgt_vd(b, 2U, 1U, 0U);
+            sse_fcmeq_vd(b, 3U, 0U, 1U);
+        } else {
+            sse_fcmgt_vs(b, 2U, 1U, 0U);
+            sse_fcmeq_vs(b, 3U, 0U, 1U);
+        }
+    } else if (dbl != 0U) {
+        sse_fcmgt_sd(b, 2U, 1U, 0U);
+        sse_fcmeq_sd(b, 3U, 0U, 1U);
+    } else {
+        sse_fcmgt_ss(b, 2U, 1U, 0U);
+        sse_fcmeq_ss(b, 3U, 0U, 1U);
+    }
+    sse_orr_16b(b, 2U, 2U, 3U);
+}
+
 /* CMPPS/SS/PD/SD imm8 predicates 0..7.  All predicates compose into
  * v2 (AND-chains for unord/ord); NOT forms invert v2.  The row forms
  * then move v2 into v0 whole; the scalar forms INS v2's low lane into
  * the dest, preserving its upper lanes.  NaN compares are false on
- * A64, so unord = !(eq & self-eq & src-eq) matches x86 exactly.
+ * A64, so unord = !(eq & self-eq & src-eq) matches x86 exactly, while
+ * le/nlt/nle are built from ordered lt/eq pieces (NOT-of-gt/ge is
+ * wrong for NaN: x86 le is false but nlt/nle are true on unordered).
  * Scalar sources copy only lane 0; only lane 0 is consumed below. */
 static int sse_emit_cmpp(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
@@ -609,13 +654,8 @@ static int sse_emit_cmpp(i686_emit_ctx_t *e, const x86_insn_t *insn)
             SSE_CMP1(sse_fcmgt_vs, sse_fcmgt_ss, 2U, 1U, 0U);
         }
         break;
-    case 2U: /* le: !(dest > src) */
-        if (dbl != 0U) {
-            SSE_CMP1(sse_fcmgt_vd, sse_fcmgt_sd, 2U, 0U, 1U);
-        } else {
-            SSE_CMP1(sse_fcmgt_vs, sse_fcmgt_ss, 2U, 0U, 1U);
-        }
-        sse_mvn_16b(b, 2U, 2U);
+    case 2U: /* le: (dest < src) | (dest == src) */
+        sse_cmp_le(b, dbl, vec);
         break;
     case 3U: /* unord: !(dest==dest & src==src) — NaN self-compares false */
     case 7U: /* ord:    dest==dest & src==src                        */
@@ -639,19 +679,17 @@ static int sse_emit_cmpp(i686_emit_ctx_t *e, const x86_insn_t *insn)
         }
         sse_mvn_16b(b, 2U, 2U);
         break;
-    case 5U: /* nlt: dest >= src */
+    case 5U: /* nlt: !(dest < src) */
         if (dbl != 0U) {
-            SSE_CMP1(sse_fcmge_vd, sse_fcmge_sd, 2U, 0U, 1U);
+            SSE_CMP1(sse_fcmgt_vd, sse_fcmgt_sd, 2U, 1U, 0U);
         } else {
-            SSE_CMP1(sse_fcmge_vs, sse_fcmge_ss, 2U, 0U, 1U);
+            SSE_CMP1(sse_fcmgt_vs, sse_fcmgt_ss, 2U, 1U, 0U);
         }
+        sse_mvn_16b(b, 2U, 2U);
         break;
-    default: /* nle: dest > src */
-        if (dbl != 0U) {
-            SSE_CMP1(sse_fcmgt_vd, sse_fcmgt_sd, 2U, 0U, 1U);
-        } else {
-            SSE_CMP1(sse_fcmgt_vs, sse_fcmgt_ss, 2U, 0U, 1U);
-        }
+    default: /* nle: !((dest < src) | (dest == src)) */
+        sse_cmp_le(b, dbl, vec);
+        sse_mvn_16b(b, 2U, 2U);
         break;
     }
 #undef SSE_CMP1
