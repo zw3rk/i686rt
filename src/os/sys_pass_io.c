@@ -449,7 +449,8 @@ static long sys_pwrite64(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
         long rc = host_ret_(pwrite((int)fd, i686_guest_ptr(ctx, buf_va),
                                    (size_t)count, pos));
         if (rc > 0) {
-            i686_vm_file_note_pwrite((int)fd, (uint64_t)pos, (size_t)rc);
+            (void)i686_vm_file_note_pwrite(ctx, (int)fd, (uint64_t)pos,
+                                           (size_t)rc);
         }
         return rc;
     }

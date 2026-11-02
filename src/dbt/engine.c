@@ -207,6 +207,17 @@ void i686_dbt_trace_enable(int on)
     s_trace_blocks = on && getenv("I686RT_DBTTRACE") != NULL;
 }
 
+void i686_dbt_fork_child(void)
+{
+#ifdef __APPLE__
+    (void)pthread_mutex_destroy(&s_jit_toggle_mutex);
+    (void)pthread_mutex_init(&s_jit_toggle_mutex, NULL);
+    s_jit_toggle_locked = false;
+#else
+    (void)0;
+#endif
+}
+
 void i686_dbt_flush_all(void)
 {
     dbt_sites_clear_all();

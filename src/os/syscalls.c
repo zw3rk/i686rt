@@ -766,6 +766,16 @@ static int64_t r_execve(i686_ctx_t *ctx)
         extern void i686_seg_exec_reset_tls(i686_ctx_t *ctx);
         i686_seg_exec_reset_tls(ctx);
     }
+    {
+        extern void i686_gsig_exec_reset(void);
+        i686_gsig_exec_reset();
+    }
+    ctx->altstack_sp = 0U;
+    ctx->altstack_size = 0U;
+    ctx->altstack_flags = 0x2U;
+    ctx->altstack_onstack = 0U;
+    ctx->sig_last_frame_va = 0U;
+    ctx->sig_last_frame_rt = 0U;
     return 0;
 }
 

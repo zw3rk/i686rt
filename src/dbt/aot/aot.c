@@ -15,6 +15,7 @@
 #include "dbt/aot/aot.h"
 #include "vm/vm_file.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 /* IEEE CRC-32 (bitwise; payloads are small). */
@@ -100,6 +101,12 @@ void i686_split_lock_release_if_held(void)
         t_split_held = 0;
         i686_spin_unlock(&s_split_lock);
     }
+}
+
+void i686_aot_fork_child(void)
+{
+    atomic_store_explicit(&s_split_lock, 0U, memory_order_release);
+    t_split_held = 0;
 }
 
 bool i686_mem_is_unaligned(const void *p, unsigned width)

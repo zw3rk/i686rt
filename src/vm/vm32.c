@@ -60,11 +60,18 @@ static __thread volatile int s_subpage_dropped_exec;
 
 static pthread_mutex_t s_futex_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct vm32_futex_slot s_futex_slots[I686_VM32_FUTEX_SLOTS];
-static pthread_once_t s_atfork_once = PTHREAD_ONCE_INIT;
 
+/* Child-state reset for the coordinated fork handlers in src/os/clone.c
+ * (I686-R3-8): fork_prepare locks the runtime-owned mutexes in the
+ * parent, fork_parent releases them, and fork_child reaches this reset
+ * via i686_vm32_fork_child. There is deliberately no standalone
+ * pthread_atfork registration here; a child-only handler would run
+ * outside that coordination (and twice, alongside fork_child). */
 static void vm32_atfork_child(void)
 {
     unsigned i;
+    (void)pthread_mutex_destroy(&s_subpage_mtx);
+    (void)pthread_mutex_destroy(&s_futex_mtx);
     (void)pthread_mutex_init(&s_subpage_mtx, NULL);
     (void)pthread_mutex_init(&s_futex_mtx, NULL);
     atomic_store_explicit(&s_subpage_writers, 0u, memory_order_relaxed);
@@ -79,18 +86,25 @@ static void vm32_atfork_child(void)
     }
 }
 
-static void vm32_register_atfork(void)
+void i686_vm32_fork_prepare(void)
 {
-    (void)pthread_atfork(NULL, NULL, vm32_atfork_child);
+    (void)pthread_mutex_lock(&s_subpage_mtx);
+    (void)pthread_mutex_lock(&s_futex_mtx);
 }
 
-void i686_vm32_exec_enter(const i686_ctx_t *ctx)
+void i686_vm32_fork_parent(void)
 {
-    if (ctx == NULL || ctx->vm_regime != I686_VM_REGIME_A2 ||
-        ctx->vm_host_page <= 4096u || s_in_guest_exec != 0 ||
-        s_holds_subpage_lock != 0) {
-        return;
-    }
+    (void)pthread_mutex_unlock(&s_futex_mtx);
+    (void)pthread_mutex_unlock(&s_subpage_mtx);
+}
+
+void i686_vm32_fork_child(void)
+{
+    vm32_atfork_child();
+}
+
+static void vm32_register_reader(void)
+{
     for (;;) {
         while (atomic_load_explicit(&s_subpage_writers,
                                     memory_order_acquire) != 0u) {
@@ -105,6 +119,16 @@ void i686_vm32_exec_enter(const i686_ctx_t *ctx)
         }
         atomic_fetch_sub_explicit(&s_exec_readers, 1u, memory_order_seq_cst);
     }
+}
+
+void i686_vm32_exec_enter(const i686_ctx_t *ctx)
+{
+    if (ctx == NULL || ctx->vm_regime != I686_VM_REGIME_A2 ||
+        ctx->vm_host_page <= 4096u || s_in_guest_exec != 0 ||
+        s_holds_subpage_lock != 0) {
+        return;
+    }
+    vm32_register_reader();
 }
 
 void i686_vm32_exec_leave(void)
@@ -143,26 +167,7 @@ void i686_vm32_subpage_unlock(void)
     (void)pthread_mutex_unlock(&s_subpage_mtx);
     atomic_fetch_sub_explicit(&s_subpage_writers, 1u, memory_order_release);
     if (dropped != 0) {
-        /* Re-register as an exec reader with the same wait/add/recheck
-         * handshake as i686_vm32_exec_enter (no ctx is available here,
-         * and the registration was known-good before the lock dropped
-         * it, so no regime check is needed). */
-        for (;;) {
-            while (atomic_load_explicit(&s_subpage_writers,
-                                        memory_order_acquire) != 0u) {
-                (void)pthread_mutex_lock(&s_subpage_mtx);
-                (void)pthread_mutex_unlock(&s_subpage_mtx);
-            }
-            atomic_fetch_add_explicit(&s_exec_readers, 1u,
-                                      memory_order_seq_cst);
-            if (atomic_load_explicit(&s_subpage_writers,
-                                     memory_order_seq_cst) == 0u) {
-                s_in_guest_exec = 1;
-                return;
-            }
-            atomic_fetch_sub_explicit(&s_exec_readers, 1u,
-                                      memory_order_seq_cst);
-        }
+        vm32_register_reader();
     }
 }
 
@@ -172,7 +177,6 @@ int i686_vm32_init(i686_ctx_t *ctx, uint64_t requested_window)
     if (ctx == NULL) {
         return -1;
     }
-    (void)pthread_once(&s_atfork_once, vm32_register_atfork);
     if (rt32_vm_init(ctx, requested_window) != 0) {
         return -1;
     }

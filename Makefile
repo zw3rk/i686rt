@@ -70,10 +70,10 @@ I686RT_X64 := $(BUILD_DIR)/i686rt-x86_64
 
 build-x86_64: $(I686RT_X64) ## Interpreter-only x86_64-host build (D3 tier 2, H4)
 $(I686RT_X64): $(OBJS_X64)
-	$(CC) $(CFLAGS) -DI686RT_NO_DBT $(OBJS_X64) $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) -Werror -DI686RT_NO_DBT $(OBJS_X64) $(LDFLAGS) -o $@
 $(OBJ_DIR)-x64/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -DI686RT_NO_DBT -c $< -o $@
+	$(CC) $(CFLAGS) -Werror -DI686RT_NO_DBT -c $< -o $@
 
 all: build ## Build everything (currently just the i686rt binary)
 
@@ -81,12 +81,12 @@ build: $(I686RT_BIN) ## Build static-PIE aarch64-linux i686rt binary
 
 $(I686RT_BIN): $(OBJS)
 	@printf "\033[32m▸ Linking\033[0m $@\n"
-	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) -Werror $(OBJS) $(LDFLAGS) -o $@
 	@ln -sf i686rt $(BUILD_DIR)/i686rt-binfmt-p
 
 $(OBJ_DIR)/%.o: src/%.c $(HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -Werror -c $< -o $@
 
 test: check ## Run the host test suite (line limits + Wave U3 host checks)
 
@@ -234,23 +234,8 @@ h2-report: ## Assemble tests/hardening/h2-report.md from the committed runner lo
 ##  Wave U3 — lane u3-i686: two-regime vm32, dual backends, AOT sites   ##
 ## ------------------------------------------------------------------ ##
 
-# Curated-C11 file size discipline for this lane's exclusive ownership
-# (Wave U3 card L-U3-I686 as delegated: src/vm/, dual backends,
-# src/dbt/aot/, the LOCK-atomics lines in h_alu.c/h_shift.c, the site
-# records in emit_mov.c, the i686rt.h tail, and the lane test). Files
-# outside this list (vendored src/rt32 donor, src/os/sys_* syscall
-# tables) belong to sibling lanes and are not gated here.
-U3_OWNED := src/vm/vm32.c src/vm/vm32.h src/vm/vm_file.c src/vm/vm_file.h \
-        src/os/backend.h src/os/backend_linux.c src/os/backend_linux_sys.c \
-        src/os/backend_darwin.c src/os/backend_darwin_io.c \
-        src/os/backend_darwin_net.c \
-        src/dbt/aot/aot.h src/dbt/aot/aot.c \
-        src/interp/h_alu.c src/interp/h_shift.c src/dbt/emit_mov.c \
-        src/i686rt.h tests/unit/test_u3_sites.c
-# Lane P13-6 split of the SSE emitter (emit_sse.c + emit_sse2.c sharing
-# emit_sse_shared.h) plus the dbt header carrying the XMM cache mask.
-P13_OWNED := src/dbt/emit_sse.c src/dbt/emit_sse2.c \
-        src/dbt/emit_sse_shared.h src/dbt/emit.h
+# Repository-wide file size discipline: every first-party .c/.h/.S
+# file under src, include, and tests stays within 900 lines.
 check-line-limits: ## Enforce the <= 900-line rule on all .c/.h/.S files
 	@fail=0; \
 	for f in $$(find src include tests -type f \( -name '*.c' -o -name '*.h' -o -name '*.S' \) | sort); do \
@@ -275,15 +260,15 @@ I686RT_DARWIN := $(BUILD_DIR)/i686rt-darwin
 
 $(OBJ_DIR)-darwin/%.o: src/%.c $(HDRS)
 	@mkdir -p $(dir $@)
-	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -c $< -o $@
+	$(HOST_CC) $(CFLAGS) -Werror $(HOST_DEFS) -c $< -o $@
 
 $(OBJ_DIR)-darwin/%.o: src/%.S $(HDRS)
 	@mkdir -p $(dir $@)
-	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -c $< -o $@
+	$(HOST_CC) $(CFLAGS) -Werror $(HOST_DEFS) -c $< -o $@
 
 $(I686RT_DARWIN): $(DARWIN_OBJS)
 	@printf "\033[32m▸ Linking\033[0m $@\n"
-	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) $(DARWIN_OBJS) -pthread -o $@
+	$(HOST_CC) $(CFLAGS) -Werror $(HOST_DEFS) $(DARWIN_OBJS) -pthread -o $@
 	@ln -sf i686rt-darwin $(BUILD_DIR)/i686rt-darwin-arm64
 
 build-darwin: $(I686RT_DARWIN) test-u3 ## Build native macOS arm64 i686rt translator + run the host check
@@ -299,7 +284,7 @@ U3_TEST_SRCS := tests/unit/test_u3_sites.c src/dbt/aot/aot.c \
 
 test-u3: ## Build and run the Wave U3 host check (must print U3-I686 OK)
 	@mkdir -p $(BUILD_DIR)
-	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -DI686RT_NO_DBT $(U3_TEST_SRCS) -o $(BUILD_DIR)/test_u3_sites -pthread
+	$(HOST_CC) $(CFLAGS) -Werror $(HOST_DEFS) -DI686RT_NO_DBT $(U3_TEST_SRCS) -o $(BUILD_DIR)/test_u3_sites -pthread
 	timeout --kill-after=10s 30s ./$(BUILD_DIR)/test_u3_sites
 
 .PHONY: check-line-limits build-darwin test-u3

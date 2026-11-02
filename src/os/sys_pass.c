@@ -52,14 +52,38 @@ uint32_t i686_gsig_handler_raw(int signum)
     return s_sigact[signum].handler;
 }
 
+void i686_gsig_exec_reset(void);
+void i686_gsig_exec_reset(void)
+{
+    int s;
+    for (s = 1; s <= 64; s++) {
+        if (s_sigact[s].handler == 1U) {
+            continue;
+        }
+        s_sigact[s].handler = 0U;
+        s_sigact[s].flags = 0U;
+        s_sigact[s].restorer = 0U;
+        s_sigact[s].mask = 0ULL;
+    }
+}
+
 /* prctl PR_{GET,SET}_NAME: TASK_COMM_LEN = 16 NUL-padded bytes. */
 static char s_comm[16];
 
 static long sys_rt_sigaction(i686_ctx_t *ctx, uint32_t sig, uint32_t act_va,
                              uint32_t oldact_va, uint32_t sigsetsize)
 {
+    uint8_t staged[20];
+    int have_staged = 0;
     if (sigsetsize != 8U || sig == 0U || sig > 64U) {
         return -EINVAL;
+    }
+    if (act_va != 0U) {
+        if (guest_ptr_bad(act_va) ||
+            i686_copy_from_guest(ctx, staged, act_va, sizeof staged) != 0) {
+            return -EFAULT;
+        }
+        have_staged = 1;
     }
     if (oldact_va != 0U) {
         uint8_t old[20];
@@ -72,16 +96,11 @@ static long sys_rt_sigaction(i686_ctx_t *ctx, uint32_t sig, uint32_t act_va,
             return -EFAULT;
         }
     }
-    if (act_va != 0U) {
-        uint8_t act[20];
-        if (guest_ptr_bad(act_va) ||
-            i686_copy_from_guest(ctx, act, act_va, sizeof act) != 0) {
-            return -EFAULT;
-        }
-        s_sigact[sig].handler  = rd_le32(act + 0U);
-        s_sigact[sig].flags    = rd_le32(act + 4U);
-        s_sigact[sig].restorer = rd_le32(act + 8U);
-        memcpy(&s_sigact[sig].mask, act + 12U, 8U);
+    if (have_staged) {
+        s_sigact[sig].handler  = rd_le32(staged + 0U);
+        s_sigact[sig].flags    = rd_le32(staged + 4U);
+        s_sigact[sig].restorer = rd_le32(staged + 8U);
+        memcpy(&s_sigact[sig].mask, staged + 12U, 8U);
     }
     return 0;
 }
@@ -89,8 +108,17 @@ static long sys_rt_sigaction(i686_ctx_t *ctx, uint32_t sig, uint32_t act_va,
 static long sys_rt_sigprocmask(i686_ctx_t *ctx, uint32_t how, uint32_t set_va,
                                uint32_t oldset_va, uint32_t sigsetsize)
 {
+    uint8_t staged[8];
+    int have_staged = 0;
     if (sigsetsize != 8U) {
         return -EINVAL;
+    }
+    if (set_va != 0U) {
+        if (guest_ptr_bad(set_va) ||
+            i686_copy_from_guest(ctx, staged, set_va, sizeof staged) != 0) {
+            return -EFAULT;
+        }
+        have_staged = 1;
     }
     if (oldset_va != 0U) {
         uint8_t old[8];
@@ -100,14 +128,9 @@ static long sys_rt_sigprocmask(i686_ctx_t *ctx, uint32_t how, uint32_t set_va,
             return -EFAULT;
         }
     }
-    if (set_va != 0U) {
-        uint8_t set[8];
+    if (have_staged) {
         uint64_t m;
-        if (guest_ptr_bad(set_va) ||
-            i686_copy_from_guest(ctx, set, set_va, sizeof set) != 0) {
-            return -EFAULT;
-        }
-        memcpy(&m, set, 8U);
+        memcpy(&m, staged, 8U);
         switch (how) {
         case 0U: /* SIG_BLOCK */
             ctx->sig_mask |= m;
@@ -141,6 +164,15 @@ static long sys_rt_sigpending(i686_ctx_t *ctx, uint32_t set_va, uint32_t sigsets
 
 static long sys_sigaltstack(i686_ctx_t *ctx, uint32_t ss_va, uint32_t old_ss_va)
 {
+    uint8_t staged[SS_];
+    int have_staged = 0;
+    if (ss_va != 0U) {
+        if (guest_ptr_bad(ss_va) ||
+            i686_copy_from_guest(ctx, staged, ss_va, sizeof staged) != 0) {
+            return -EFAULT;
+        }
+        have_staged = 1;
+    }
     if (old_ss_va != 0U) {
         uint8_t old[SS_];
         uint32_t oflags = ctx->altstack_flags;
@@ -155,15 +187,10 @@ static long sys_sigaltstack(i686_ctx_t *ctx, uint32_t ss_va, uint32_t old_ss_va)
             return -EFAULT;
         }
     }
-    if (ss_va != 0U) {
-        uint8_t ss[SS_];
-        if (guest_ptr_bad(ss_va) ||
-            i686_copy_from_guest(ctx, ss, ss_va, sizeof ss) != 0) {
-            return -EFAULT;
-        }
-        ctx->altstack_sp    = rd_le32(ss + 0U);
-        ctx->altstack_flags = rd_le32(ss + 4U);
-        ctx->altstack_size  = rd_le32(ss + 8U);
+    if (have_staged) {
+        ctx->altstack_sp    = rd_le32(staged + 0U);
+        ctx->altstack_flags = rd_le32(staged + 4U);
+        ctx->altstack_size  = rd_le32(staged + 8U);
     }
     return 0;
 }
@@ -274,6 +301,7 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
     }
 #else
     (void)huaddr2;
+    (void)arg4; /* timeout/val2 words are consumed via ts/ESI above */
     {
         const struct timespec *tp =
             (cmd < 32u && ((timeout_cmds >> cmd) & 1u) != 0u && utime_va != 0U)

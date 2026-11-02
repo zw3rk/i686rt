@@ -140,7 +140,7 @@ void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
     (void)pthread_mutex_lock(&s_registry_lock);
     if (s_registry_n < I686_THREAD_REGISTRY_MAX) {
         s_registry[s_registry_n].tid = tid;
-        s_registry[s_registry_n].host_tid = 0;
+        s_registry[s_registry_n].host_tid = (int)tid;
         s_registry[s_registry_n].ctx = ctx;
         s_registry_n++;
     }
@@ -149,12 +149,12 @@ void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
     (void)pthread_mutex_unlock(&s_registry_lock);
 }
 
-/* thread_entry records the host tid of the interpreter thread running
- * this guest ctx and RE-KEYS the registry entry to it (the tid
- * namespace is the host one: PI futex words and robust-list recovery
- * carry kernel tids, so the guest's own tid view must match — the
- * kernel writes its tid into FUTEX_LOCK_PI words and dying-owner
- * recovery compares against it). */
+/* Record the host tid running a guest ctx without changing the guest
+ * tid namespace (I686-R3-1: the namespace is the host one throughout,
+ * so the entry is added under the child's host tid and never rekeyed;
+ * PI futex words and robust-list recovery compare against that same
+ * value). Kept for compatibility; new clones publish the host tid
+ * before the parent returns. */
 void i686_thread_registry_set_host_tid(uint32_t tid, int host_tid);
 void i686_thread_registry_set_host_tid(uint32_t tid, int host_tid)
 {
@@ -162,7 +162,6 @@ void i686_thread_registry_set_host_tid(uint32_t tid, int host_tid)
     (void)pthread_mutex_lock(&s_registry_lock);
     for (i = 0; i < s_registry_n; i++) {
         if (s_registry[i].tid == tid) {
-            s_registry[i].tid = (uint32_t)host_tid;
             s_registry[i].host_tid = host_tid;
             break;
         }
@@ -238,9 +237,13 @@ uint32_t i686_thread_registry_self_tid(const i686_ctx_t *ctx)
 
 struct clone_arg {
     i686_ctx_t *ctx;          /* child's private ctx copy (heap) */
-    uint32_t tid;             /* pre-start registry tid (rekeyed at run) */
     uint32_t parent_tid_va;   /* PARENT_SETTID word (musl's self->tid) */
     uint32_t child_tid_va;    /* CHILD_SETTID word (glibc's tid slot) */
+    pthread_mutex_t mtx;      /* startup handshake: child publishes host tid */
+    pthread_cond_t cond;      /* parent registers it before clone returns */
+    uint32_t host_tid;        /* child's host tid (guest tid namespace) */
+    int ready;                /* child published host_tid */
+    int registered;           /* parent registered host_tid */
 };
 
 /* ---- blocked-target wake (fix-campaign C2) ----------------------------
@@ -448,36 +451,43 @@ static void *thread_entry(void *arg)
 {
     struct clone_arg *ca = arg;
     i686_ctx_t *ctx = ca->ctx;
-    uint32_t pre_tid = ca->tid;
     uint32_t parent_tid_va = ca->parent_tid_va;
     uint32_t child_tid_va = ca->child_tid_va;
     uint32_t tid;
-    free(ca);
 
     (void)pthread_once(&s_once, make_key);
     (void)pthread_setspecific(s_ctx_key, ctx);
     s_thread_ctx = ctx;
     (void)pthread_once(&s_wake_once, wake_sig_install);
 
-    /* Publish the synthetic registry tid through PARENT_SETTID /
-     * CHILD_SETTID BEFORE any guest code runs (the kernel writes the
-     * true tid through CHILD_SETTID before the first instruction).
-     * This is the same number clone(2) returned to the parent and
-     * gettid/set_tid_address report, and the number musl/glibc mutex
-     * words and robust-list recovery compare against (C2 robust walk
-     * uses the r_clone-allocated registry tid).  The host tid is
-     * recorded in the registry alongside for internal wake/kill use.
-     * musl's self->tid is the PARENT_SETTID word (shared TLS, visible
-     * to the child); glibc's is CHILD_SETTID. */
+    /* I686-R3-1: the guest tid namespace is the host one throughout.
+     * Publish this thread's host tid to the parent, wait until the
+     * parent has registered it (so clone's return value, gettid,
+     * tkill/tgkill, and both SETTID words agree), then publish the
+     * CHILD_SETTID word before any guest code runs. The parent writes
+     * the PARENT_SETTID word itself before clone returns, so it is
+     * visible on return. musl's self->tid is the PARENT_SETTID word
+     * (shared TLS); glibc's is CHILD_SETTID. */
     tid = clone_host_gettid();
-    i686_thread_registry_set_host_tid(pre_tid, (int)tid);
-    tid = pre_tid;
-    if (parent_tid_va != 0U) {
-        (void)i686_copy_to_guest(ctx, parent_tid_va, &tid, 4U);
+    (void)pthread_mutex_lock(&ca->mtx);
+    ca->host_tid = tid;
+    ca->ready = 1;
+    (void)pthread_cond_signal(&ca->cond);
+    while (ca->registered == 0) {
+        (void)pthread_cond_wait(&ca->cond, &ca->mtx);
     }
+    tid = ca->host_tid;
+    parent_tid_va = ca->parent_tid_va;
+    child_tid_va = ca->child_tid_va;
+    ctx = ca->ctx;
+    (void)pthread_mutex_unlock(&ca->mtx);
+    (void)pthread_mutex_destroy(&ca->mtx);
+    (void)pthread_cond_destroy(&ca->cond);
+    free(ca);
     if (child_tid_va != 0U) {
         (void)i686_copy_to_guest(ctx, child_tid_va, &tid, 4U);
     }
+    (void)parent_tid_va;
 
     /* Interpreter runs until the thread exits. The engine entry point
      * is provided by the coordinator glue (interp loop over the copy);
@@ -665,44 +675,40 @@ static int64_t r_clone(i686_ctx_t *ctx)
     /* Threads share the thread group: getpid() reports the tgid (the
      * process's live pid), not the thread's tid. */
     child->host_tid = (int)getpid();
+    ca->ctx = child;
     ca->parent_tid_va = 0U;
     ca->child_tid_va = 0U;
+    ca->host_tid = 0U;
+    ca->ready = 0;
+    ca->registered = 0;
+    if (pthread_mutex_init(&ca->mtx, NULL) != 0 ||
+        pthread_cond_init(&ca->cond, NULL) != 0) {
+        free(child);
+        free(ca);
+        return -ENOMEM;
+    }
 
     if ((flags & I686_CLONE_SETTLS) != 0U && tls_va != 0U) {
         /* Kernel-faithful (RC7b T4c): a bad TLS descriptor fails the
          * clone (-EINVAL/-EFAULT), it is not ignored. */
         long terr = i686_tls_install(child, tls_va);
         if (terr != 0) {
+            (void)pthread_mutex_destroy(&ca->mtx);
+            (void)pthread_cond_destroy(&ca->cond);
             free(child); free(ca);
             return terr;
         }
     }
-    {
-        /* small positive tids (i386 pid_t); the raw heap pointer
-         * truncates to unpredictable 32-bit garbage. */
-        static uint32_t s_next_tid = 101U;
-        uint32_t tid = s_next_tid++;
-        if ((flags & I686_CLONE_PARENT_SETTID) != 0U && parent_tid != 0U) {
-            (void)i686_copy_to_guest(ctx, parent_tid, &tid, 4U);
-            /* pre-start view; thread_entry rewrites the true (host)
-             * tid before any guest code runs */
-            ca->parent_tid_va = parent_tid;
-        }
-        if ((flags & I686_CLONE_CHILD_SETTID) != 0U && child_tid != 0U) {
-            (void)i686_copy_to_guest(child, child_tid, &tid, 4U);
-            /* pre-start view; thread_entry rewrites the true (host)
-             * tid before any guest code runs */
-            ca->child_tid_va = child_tid;
-        }
-        if ((flags & I686_CLONE_CHILD_CLEARTID) != 0U && child_tid != 0U) {
-            child->clear_child_tid = child_tid;
-        }
-        r_val = tid;
+    if ((flags & I686_CLONE_PARENT_SETTID) != 0U && parent_tid != 0U) {
+        ca->parent_tid_va = parent_tid;
+    }
+    if ((flags & I686_CLONE_CHILD_SETTID) != 0U && child_tid != 0U) {
+        ca->child_tid_va = child_tid;
+    }
+    if ((flags & I686_CLONE_CHILD_CLEARTID) != 0U && child_tid != 0U) {
+        child->clear_child_tid = child_tid;
     }
 
-    ca->ctx = child;
-    ca->tid = r_val;
-    i686_thread_registry_add(child, r_val);
 #ifndef I686RT_NO_DBT
     {
         extern void i686_dbt_enable_tso(void);
@@ -713,19 +719,92 @@ static int64_t r_clone(i686_ctx_t *ctx)
         int crc;
         crc = pthread_create(&th, NULL, thread_entry, ca);
         if (crc != 0) {
-            i686_thread_registry_remove(r_val);
+            (void)pthread_mutex_destroy(&ca->mtx);
+            (void)pthread_cond_destroy(&ca->cond);
             free(child); free(ca);
             return -ENOMEM;
         }
     }
+    (void)pthread_mutex_lock(&ca->mtx);
+    while (ca->ready == 0) {
+        (void)pthread_cond_wait(&ca->cond, &ca->mtx);
+    }
+    r_val = ca->host_tid;
+    i686_thread_registry_add(child, r_val);
+    if (ca->parent_tid_va != 0U) {
+        (void)i686_copy_to_guest(ctx, ca->parent_tid_va, &r_val, 4U);
+    }
+    ca->registered = 1;
+    (void)pthread_cond_signal(&ca->cond);
+    (void)pthread_mutex_unlock(&ca->mtx);
     pthread_detach(th);
-    return (int64_t)r_val; /* parent sees the positive tid */
+    return (int64_t)r_val; /* parent sees the child's host tid */
+}
+
+static void fork_prepare(void)
+{
+    extern void rt32_vm_fork_prepare(void);
+    extern void i686_vm32_fork_prepare(void);
+    rt32_vm_fork_prepare();
+    (void)pthread_mutex_lock(&s_registry_lock);
+    i686_vm32_fork_prepare();
+}
+
+static void fork_parent(void)
+{
+    extern void rt32_vm_fork_parent(void);
+    extern void i686_vm32_fork_parent(void);
+    i686_vm32_fork_parent();
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    rt32_vm_fork_parent();
+}
+
+static void fork_child(void)
+{
+    extern void rt32_vm_fork_child(void);
+    extern void i686_vm32_fork_child(void);
+    extern void i686_aot_fork_child(void);
+#ifndef I686RT_NO_DBT
+    extern void i686_dbt_fork_child(void);
+#endif
+    i686_ctx_t *surviving;
+    rt32_vm_fork_child();
+    i686_vm32_fork_child();
+#ifndef I686RT_NO_DBT
+    i686_dbt_fork_child();
+#endif
+    i686_aot_fork_child();
+    (void)pthread_mutex_destroy(&s_registry_lock);
+    (void)pthread_mutex_init(&s_registry_lock, NULL);
+    surviving = i686_current_ctx();
+    if (surviving == NULL) {
+        surviving = s_thread_ctx;
+    }
+    if (surviving == NULL) {
+        surviving = s_main_ctx;
+    }
+    (void)pthread_mutex_lock(&s_registry_lock);
+    s_registry_n = 0;
+    if (surviving != NULL) {
+        s_main_ctx = surviving;
+        surviving->host_tid = (int)getpid();
+        surviving->is_thread_clone = false;
+    }
+    (void)pthread_mutex_unlock(&s_registry_lock);
+}
+
+static pthread_once_t s_fork_once = PTHREAD_ONCE_INIT;
+
+static void fork_register(void)
+{
+    (void)pthread_atfork(fork_prepare, fork_parent, fork_child);
 }
 
 void i686_threads_main_init(i686_ctx_t *ctx)
 {
     extern void i686_sys_register(long, int64_t (*)(i686_ctx_t *));
     (void)pthread_once(&s_once, make_key);
+    (void)pthread_once(&s_fork_once, fork_register);
     s_thread_ctx = ctx;
     (void)pthread_setspecific(s_ctx_key, ctx);
     /* The main thread's host tid IS the process pid (kernel main-thread
@@ -742,6 +821,7 @@ void i686_threads_init(void)
 {
     extern void i686_sys_register(long, int64_t (*)(i686_ctx_t *));
     (void)pthread_once(&s_once, make_key);
+    (void)pthread_once(&s_fork_once, fork_register);
     if (s_thread_ctx != NULL) {
         (void)pthread_setspecific(s_ctx_key, s_thread_ctx);
     }

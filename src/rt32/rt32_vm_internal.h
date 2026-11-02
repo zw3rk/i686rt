@@ -56,6 +56,9 @@ static inline void rt32_vm_invalidate_jit(i686_ctx_t *ctx, uint32_t start,
 
 void rt32_vm_lock_acquire(void);
 void rt32_vm_lock_release(void);
+void rt32_vm_fork_prepare(void);
+void rt32_vm_fork_parent(void);
+void rt32_vm_fork_child(void);
 void rt32_vm_sync_from_ctx(i686_ctx_t *ctx);
 void rt32_vm_sync_to_ctx(i686_ctx_t *ctx);
 int rt32_vm_reserve_prot_none(i686_ctx_t *ctx, uint32_t start, uint32_t len);
@@ -66,11 +69,14 @@ int rt32_vm_mmap2_staged_a2_locked(i686_ctx_t *ctx, uint32_t target_va,
                                    uint32_t len, int fd, uint64_t file_off,
                                    bool is_anon, bool is_shared);
 void rt32_vm_file_sync_prot_locked(uint32_t start, uint32_t end);
-void rt32_vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end);
+int rt32_vm_can_unmap_locked(uint32_t s, uint32_t e);
+int rt32_vm_can_record_locked(uint32_t start, uint32_t end);
+int rt32_vm_can_mprotect_locked(uint32_t s, uint32_t e);
+int rt32_vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end);
 int rt32_vm_record_region_locked(uint32_t start, uint32_t end, uint32_t prot,
                                  uint32_t flags, const char *name);
-void rt32_vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end,
-                                     uint32_t prot);
+int rt32_vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end,
+                                    uint32_t prot);
 bool rt32_vm_range_overlaps_locked(uint32_t start, uint32_t end);
 bool rt32_vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                                        uint32_t *out_prot, uint32_t *out_flags,

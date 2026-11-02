@@ -89,12 +89,19 @@ uint32_t i686_vm_file_shrink_cut(uint32_t map_start, size_t map_len,
 int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
                            uint64_t file_offset, uint8_t kind);
 int i686_vm_file_untrack_map(uint32_t gva, size_t len);
+/* Capacity check for a replacing mapping [gva, gva+len): 0 when untrack
+ * would succeed and, if want_track is nonzero, a slot would remain for
+ * the new track. No state is changed. */
+int i686_vm_file_can_replace(uint32_t gva, size_t len, int want_track);
 int i686_vm_file_lookup_map(uint32_t gva, int *out_fd,
                             uint64_t *out_file_offset, uint8_t *out_kind);
 
 /* pwrite hook: re-read overlapped MAP_PRIVATE CLEAN pages from fd so
- * they observe the new file bytes.  Returns pages refreshed. */
-size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len);
+ * they observe the new file bytes.  Returns pages refreshed. Caller
+ * passes the faulting ctx for quiesced copies and JIT invalidation. */
+struct i686_ctx;
+size_t i686_vm_file_note_pwrite(struct i686_ctx *ctx, int fd,
+                                uint64_t file_offset, size_t len);
 
 /* ftruncate hook: shrink every tracked MAP_PRIVATE map on fd to
  * new_size via the shrink hook above.  Returns maps shrunk. */

@@ -45,7 +45,10 @@ static __thread struct {
  * widened host page whose 4 KiB sub-page mirror grants s_copy_args.need_prot,
  * acquires the subpage lock, opens the covering host page to union_prot,
  * retries the copy, and ALWAYS re-widens every opened host page before
- * returning or re-raising a genuine fault. */
+ * returning. Syscall copies never propagate to the outer engine
+ * checkpoint: unrecoverable faults return -EFAULT so callers run their
+ * cleanup (I686-R3-6). Guest-instruction fault propagation uses the
+ * separate interfaces in signals_subpage.c. */
 static int s_copy_fault_page(i686_ctx_t *ctx, uint32_t *out_page)
 {
     uint64_t fa;
@@ -107,9 +110,6 @@ static int s_copy_tolerant(i686_ctx_t *ctx, uint32_t va, copy_op_fn copy_op)
                 if (locked) {
                     i686_vm32_subpage_unlock();
                 }
-                if (outer != NULL) {
-                    siglongjmp(*outer, 1);
-                }
                 return -I686_EFAULT;
             }
             if (!locked) {
@@ -124,9 +124,6 @@ static int s_copy_tolerant(i686_ctx_t *ctx, uint32_t va, copy_op_fn copy_op)
                     (void)i686_vm32_widen_prot(ctx, s_opened[k], s_opened[k] + hps);
                 }
                 i686_vm32_subpage_unlock();
-                if (outer != NULL) {
-                    siglongjmp(*outer, 1);
-                }
                 return -I686_EFAULT;
             }
             i686_fault_arm(&inner);

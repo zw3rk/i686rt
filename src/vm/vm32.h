@@ -74,6 +74,9 @@ void i686_vm32_fini(i686_ctx_t *ctx);
 /* Serialize temporary Regime A2 union_prot -> emulate/copy -> widen_prot
  * transitions across threads, pausing guest execution on sibling threads
  * while a mixed-permission host page is widened. */
+void i686_vm32_fork_prepare(void);
+void i686_vm32_fork_parent(void);
+void i686_vm32_fork_child(void);
 void i686_vm32_subpage_lock(void);
 void i686_vm32_subpage_unlock(void);
 void i686_vm32_exec_enter(const i686_ctx_t *ctx);
