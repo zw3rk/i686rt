@@ -398,13 +398,14 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                            (uint32_t)(new_aligned - old_aligned),
                                            prot, ext_flags, ext_fd, ext_pgoff);
             if (ext <= 0xFFFFF000U) {
+                int rec_rc = rt32_vm_record_region_locked(old_end,
+                                                          (uint32_t)new_end,
+                                                          prot, keep_flags,
+                                                          region_name);
                 int ok = 0;
-                if (rt32_vm_record_region_locked(old_end, (uint32_t)new_end,
-                                                 prot, keep_flags,
-                                                 region_name) == 0 &&
-                    has_file == false) {
+                if (rec_rc == 0 && has_file == false) {
                     ok = 1;
-                } else if (has_file &&
+                } else if (rec_rc == 0 && has_file &&
                            i686_vm_file_untrack_map(old_addr,
                                                     (size_t)new_aligned) == 0 &&
                            i686_vm_file_track_map(map_fd, old_addr,

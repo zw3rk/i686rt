@@ -634,9 +634,21 @@ size_t i686_vm_file_note_pwrite(i686_ctx_t *ctx, int fd,
                 (void)i686_vm32_widen_prot(ctx, gbase, gbase + hps);
                 i686_vm32_subpage_unlock();
             } else {
-                memcpy((void *)(uintptr_t)(ctx->guest_base + (uint64_t)gva +
-                                           (r_start - (f & ~0xFFFULL))),
-                       tmp, want);
+                uint32_t pg = gva & ~0xFFFu;
+                uint64_t dst_off =
+                    (uint64_t)gva + (r_start - (f & ~0xFFFULL));
+                void *dst =
+                    (void *)(uintptr_t)(ctx->guest_base + dst_off);
+                void *page =
+                    (void *)(uintptr_t)(ctx->guest_base + (uint64_t)pg);
+                int restore =
+                    i686_host_prot(ctx, i686_vm_file_prot(gva));
+                if (mprotect(page, 0x1000u, PROT_READ | PROT_WRITE) != 0) {
+                    continue;
+                }
+                memcpy(dst, tmp, want);
+                (void)mprotect(page, 0x1000u, restore);
+                __builtin___clear_cache((char *)dst, (char *)dst + want);
             }
             refreshed++;
 #ifndef I686RT_NO_DBT

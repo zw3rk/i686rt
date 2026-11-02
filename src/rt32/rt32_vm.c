@@ -4,9 +4,7 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Vendored from a32rt/src/vm.c @ d84feb3 (D13): renamed a32_→rt32_,
- * A32_→RT32_, retyped on i686_ctx_t; guest VA ceiling A32_KUSER_BASE_32 →
- * I686_TASK_SIZE_TOP (the ARM kuser page does not exist on i386, D12).
+ * Vendored from a32rt/src/vm.c @ d84feb3 (D13).
  */
 #define _GNU_SOURCE
 #include "rt32_vm_internal.h"
@@ -28,7 +26,6 @@ static uint32_t         g_vm_brk_curr = 0U;
 uint32_t                g_vm_mmap_cursor = RT32_MMAP_BASE_32;
 static i686_region_t    g_vm_regions[I686_MAX_REGIONS];
 static size_t           g_vm_region_count = 0U;
-
 static void vm_bump_epoch(void)
 {
     uint32_t next = atomic_fetch_add_explicit(&g_vm_epoch, 1U,
@@ -57,18 +54,15 @@ void rt32_vm_fork_child(void)
 
 int rt32_vm_reserve_prot_none(i686_ctx_t *ctx, uint32_t start, uint32_t len)
 {
-    /* RC-U3-r2 P1 #1: on Regime A2 (host page > 4 KiB) a 4 KiB-granular
-     * PROT_NONE reserve can neither mmap nor mprotect without
-     * disturbing sub-page neighbours, so skip the host op. */
+    /* A2: skip 4 KiB PROT_NONE host op to protect sub-page neighbours. */
+    void *res;
     if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
         return 0;
     }
-    {
-        void *res = mmap(i686_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (res == MAP_FAILED) {
-            return -errno;
-        }
+    res = mmap(i686_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (res == MAP_FAILED) {
+        return -errno;
     }
     return 0;
 }

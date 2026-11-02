@@ -789,6 +789,12 @@ static void fork_child(void)
         s_main_ctx = surviving;
         surviving->host_tid = (int)getpid();
         surviving->is_thread_clone = false;
+        if (s_registry_n < I686_THREAD_REGISTRY_MAX) {
+            s_registry[s_registry_n].tid = (uint32_t)surviving->host_tid;
+            s_registry[s_registry_n].host_tid = surviving->host_tid;
+            s_registry[s_registry_n].ctx = surviving;
+            s_registry_n++;
+        }
     }
     (void)pthread_mutex_unlock(&s_registry_lock);
 }
