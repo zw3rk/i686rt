@@ -303,7 +303,7 @@ static void t_statfs_layout(void)
 static void t_statfs64_sz_validation(void)
 {
     i686_ctx_t *ctx = new_ctx();
-    strcpy((char *)mem(0x2000U), "/");
+    memcpy(mem(0x2000U), "/", 2U);
 
     ctx->gpr[I686_REG_EBX] = 0x2000U;
     ctx->gpr[I686_REG_EDX] = 0x3000U;

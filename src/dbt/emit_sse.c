@@ -784,11 +784,11 @@ int i686_emit_sse(i686_emit_ctx_t *e, const x86_insn_t *insn)
     case I686_OP_CMPPS:
         return sse_emit_cmpp(e, insn);
     case I686_OP_SFENCE:
-        /* 0F AE /7: store fence, no-op in the single-threaded TSO guest
-         * model; the memory modrm forms are x86 #UD (D2 decline). */
+        /* 0F AE /7: store fence; the memory modrm forms are x86 #UD (D2 decline). */
         if (insn->modrm_mod != 3U) {
             return -1;
         }
+        a64_emit(&e->buf, 0xD5033ABFU); /* dmb ishst */
         return 0;
     case I686_OP_EMMS: {
         /* ftag = 0xFFFF (all empty); TOP untouched. */

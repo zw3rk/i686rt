@@ -33,15 +33,10 @@ static long sig_host_gettid(void)
 
 #include "i686rt.h"
 #include "interp/interp.h"
+#include "interp/x87.h"
 #include "os/marshal.h"
 #include "os/sigframe_i386.h"
 #include "os/threads.h"
-#include "vm/vm32.h"
-#include "vm/vm_file.h"
-#include "x86/decode.h"
-
-extern int i686_fault_region_prot(const i686_ctx_t *ctx, uint32_t ga,
-                                  uint32_t *out_prot, uint32_t *out_flags);
 
 /* The host bridge below uses sa_sigaction + SA_SIGINFO throughout
  * (matching interp.c and backend_linux.c): portable across Darwin,
@@ -81,7 +76,7 @@ static uint32_t push_bytes(i686_ctx_t *ctx, uint32_t *sp, const void *b,
                            size_t n)
 {
     *sp -= (uint32_t)n;
-    memcpy(i686_guest_ptr(ctx, *sp), b, n);
+    (void)i686_copy_to_guest(ctx, *sp, b, n);
     return *sp;
 }
 
@@ -118,8 +113,8 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
      * instead of killing. */
     if (ctx->sig_last_frame_va != 0U) {
         int32_t live = 0;
-        memcpy(&live, i686_guest_ptr(ctx, ctx->sig_last_frame_va + 4U),
-               sizeof(live));
+        (void)i686_copy_from_guest(ctx, &live, ctx->sig_last_frame_va + 4U,
+                                   sizeof(live));
         if (live == sig) {
             if (sp > ctx->sig_last_frame_va) {
                 ctx->sig_last_frame_va = 0U; /* unwound via longjmp */
@@ -162,13 +157,20 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     fp.swd = ctx->fstat;
     fp.twd = ctx->ftag;
     fp.mxcsr = ctx->mxcsr;
-    /* D34: st_space is 8 x 10-byte x87 registers (80 bytes); ctx->x87_st
-     * is 8 x 16-byte slots.  A bulk copy ran 48 bytes past st_space,
-     * clobbering __pad0/the FXSAVE header/mxcsr on every fpstate-bearing
-     * delivery — copy each register's 10 significant bytes instead. */
+    /* D34 / I686-10: st_space is 8 x 10-byte x87 registers (80 bytes);
+     * ctx->x87_st is 8 x 16-byte slots holding IEEE binary64 in default
+     * mode (!ctx->x87_80) or 10-byte ext80 in --x87-80 mode. Convert
+     * binary64 slots to 80-bit extended precision in default mode. */
     for (unsigned st_i = 0U; st_i < 8U; st_i++) {
-        memcpy((uint8_t *)fp.st_space + st_i * 10U, &ctx->x87_st[st_i][0],
-               10U);
+        uint8_t ext[10];
+        if (ctx->x87_80 != 0U) {
+            memcpy(ext, &ctx->x87_st[st_i][0], 10U);
+        } else {
+            double d;
+            memcpy(&d, &ctx->x87_st[st_i][0], sizeof(d));
+            x87_f64_to_ext80(d, ext);
+        }
+        memcpy((uint8_t *)fp.st_space + st_i * 10U, ext, 10U);
     }
     memcpy(&fp.xmm_space, ctx->xmm, sizeof(ctx->xmm));
     fp.sw_reserved[0] = 0x46505853U; /* FP_XSTATE_MAGIC1 */
@@ -237,25 +239,29 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
             /* uc_sigmask: ucontext@frame+0x90, +0x14 mcontext(88) -> +0x6c */
             uint8_t m[8];
             memcpy(m, &pre, sizeof(m));
-            memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 0x6c), m, sizeof(m));
+            (void)i686_copy_to_guest(ctx, frame_va + 0x90U + 0x6cU, m,
+                                     sizeof(m));
         } else {
             sc.oldmask = (uint32_t)pre;
         }
     }
     if (sa_siginfo) {
+        uint32_t hdr[4];
         /* rt frame: sc lives in ucontext at frame+0x90+20 */
-        memcpy(i686_guest_ptr(ctx, frame_va + 0x90 + 20), &sc, sizeof(sc));
-        memcpy(i686_guest_ptr(ctx, frame_va + sizeof(i686_rt_sigframe_t) - 8),
-               retcode_rt, 8);
-        *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
-            ((ga->flags & SA_RESTORER_) != 0U) ? ga->restorer
-                : frame_va + sizeof(i686_rt_sigframe_t) - 8;
+        (void)i686_copy_to_guest(ctx, frame_va + 0x90U + 20U, &sc, sizeof(sc));
+        (void)i686_copy_to_guest(
+            ctx, frame_va + (uint32_t)sizeof(i686_rt_sigframe_t) - 8U,
+            retcode_rt, 8U);
+        hdr[0] = ((ga->flags & SA_RESTORER_) != 0U)
+                     ? ga->restorer
+                     : frame_va + (uint32_t)sizeof(i686_rt_sigframe_t) - 8U;
         /* [frame+4] is the handler's signo argument (it previously held
          * whatever the abandoned stack had there; signal-number checks
          * in handlers read garbage without this store). */
-        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 4) = (uint32_t)sig;
-        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 8) = frame_va + 0x10;
-        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 12) = frame_va + 0x90;
+        hdr[1] = (uint32_t)sig;
+        hdr[2] = frame_va + 0x10U;
+        hdr[3] = frame_va + 0x90U;
+        (void)i686_copy_to_guest(ctx, frame_va, hdr, sizeof(hdr));
         {
             /* si_signo, si_errno, si_code(+8), si_addr(12 for SEGV) */
             uint8_t si[16];
@@ -266,17 +272,20 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
                 uint32_t a = sc.cr2;
                 memcpy(si + 12, &a, 4);
             }
-            memcpy(i686_guest_ptr(ctx, frame_va + 0x10), si, sizeof(si));
+            (void)i686_copy_to_guest(ctx, frame_va + 0x10U, si, sizeof(si));
         }
     } else {
-        memcpy(i686_guest_ptr(ctx, frame_va + 8), &sc, sizeof(sc));
-        memcpy(i686_guest_ptr(ctx, frame_va + sizeof(i686_sigframe_t) - 8),
-               retcode_nonrt, 8);
-        *(uint32_t *)i686_guest_ptr(ctx, frame_va) =
-            ((ga->flags & SA_RESTORER_) != 0U) ? ga->restorer
-                : frame_va + sizeof(i686_sigframe_t) - 8;
+        uint32_t hdr[2];
+        (void)i686_copy_to_guest(ctx, frame_va + 8U, &sc, sizeof(sc));
+        (void)i686_copy_to_guest(
+            ctx, frame_va + (uint32_t)sizeof(i686_sigframe_t) - 8U,
+            retcode_nonrt, 8U);
+        hdr[0] = ((ga->flags & SA_RESTORER_) != 0U)
+                     ? ga->restorer
+                     : frame_va + (uint32_t)sizeof(i686_sigframe_t) - 8U;
         /* [frame+4] is the handler's signo argument (see rt branch). */
-        *(uint32_t *)i686_guest_ptr(ctx, frame_va + 4) = (uint32_t)sig;
+        hdr[1] = (uint32_t)sig;
+        (void)i686_copy_to_guest(ctx, frame_va, hdr, sizeof(hdr));
     }
 
     /* Kernel-contiguous handler entry (i386): esp = frame base;
@@ -291,17 +300,19 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
             uint32_t ret = 0U;
             uint32_t sysinfo = 0U;
             uint8_t tcbdump[16];
+            uint32_t tcb_w[4];
             memset(tcbdump, 0, sizeof(tcbdump));
 
-            memcpy(&ret, i686_guest_ptr(ctx, ctx->gpr[I686_REG_ESP]),
-                   sizeof(ret));
+            (void)i686_copy_from_guest(ctx, &ret, ctx->gpr[I686_REG_ESP],
+                                       sizeof(ret));
             if (ctx->seg_base[I686_SEG_GS] != 0U) {
-                memcpy(&sysinfo,
-                       i686_guest_ptr(ctx, ctx->seg_base[I686_SEG_GS] + 0x10U),
-                       sizeof(sysinfo));
-                memcpy(&tcbdump,
-                       i686_guest_ptr(ctx, ctx->seg_base[I686_SEG_GS]), 16U);
+                (void)i686_copy_from_guest(
+                    ctx, &sysinfo, ctx->seg_base[I686_SEG_GS] + 0x10U,
+                    sizeof(sysinfo));
+                (void)i686_copy_from_guest(ctx, &tcbdump,
+                                           ctx->seg_base[I686_SEG_GS], 16U);
             }
+            memcpy(tcb_w, tcbdump, sizeof(tcb_w));
             (void)fprintf(stderr,
                           "SIG tid=%ld sig=%d trapno=%u eip=%08x cr2=%08x "
                           "esp=%08x frame=%08x gs=%04x/%08x ret=%08x "
@@ -312,10 +323,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
                           sc.cr2, ctx->gpr[I686_REG_ESP], frame_va,
                           ctx->seg_sel[I686_SEG_GS],
                           ctx->seg_base[I686_SEG_GS], ret, sysinfo,
-                          *(const uint32_t *)(const void *)(tcbdump + 0),
-                          *(const uint32_t *)(const void *)(tcbdump + 4),
-                          *(const uint32_t *)(const void *)(tcbdump + 8),
-                          *(const uint32_t *)(const void *)(tcbdump + 12),
+                          tcb_w[0], tcb_w[1], tcb_w[2], tcb_w[3],
                           sc.eax, sc.ebx, sc.ecx, sc.edx, sc.esi, sc.edi,
                           sc.ebp);
         }
@@ -367,7 +375,9 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
      * SIGCANCEL re-raise relies on the edit surviving). */
     if (rt) {
         uint8_t m[8];
-        memcpy(m, i686_guest_ptr(ctx, frame + 0x90U + 0x6cU), sizeof(m));
+        if (i686_copy_from_guest(ctx, m, frame + 0x90U + 0x6cU, sizeof(m)) != 0) {
+            return -1;
+        }
         memcpy(&ctx->sig_mask, m, sizeof(ctx->sig_mask));
     } else {
         ctx->sig_mask = (uint64_t)sc.oldmask;
@@ -403,7 +413,17 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
         if (i686_copy_from_guest(ctx, &fp, sc.fpstate, sizeof(fp)) == 0) {
             ctx->fctrl = fp.cwd; ctx->fstat = fp.swd; ctx->ftag = fp.twd;
             ctx->mxcsr = fp.mxcsr;
-            memcpy(ctx->x87_st, &fp.st_space, sizeof(ctx->x87_st));
+            for (unsigned st_i = 0U; st_i < 8U; st_i++) {
+                const uint8_t *ext = (const uint8_t *)fp.st_space + st_i * 10U;
+                if (ctx->x87_80 != 0U) {
+                    memcpy(&ctx->x87_st[st_i][0], ext, 10U);
+                    memset(&ctx->x87_st[st_i][10], 0, 6U);
+                } else {
+                    double d = x87_ext80_to_f64(ext);
+                    memcpy(&ctx->x87_st[st_i][0], &d, sizeof(d));
+                    memset(&ctx->x87_st[st_i][8], 0, 8U);
+                }
+            }
             memcpy(ctx->xmm, &fp.xmm_space, sizeof(ctx->xmm));
         }
     }
@@ -527,240 +547,6 @@ int i686_sigtrace_on(void)
  * as the legacy fallback for unrecorded channels.
  * TRAP -> SIGTRAP(5); UNDEF -> SIGILL(4). Returns 0 when a guest
  * handler was installed (frame pushed, eip=handler), -1 otherwise. */
-/* C2-2 spurious-fault emulation (Regime A2 widened host pages).  A
- * widened host page denies its whole cover, so a touch of a
- * still-guest-accessible sub-page (e.g. the RW sibling of a guest
- * PROT_NONE page) host-faults even though the mirror allows it.  When
- * the fine-grained mirror (`i686_vm_file_prot`) grants full R|W at the
- * faulting page, the access is legitimate: unrestrict the covering
- * host page to the union cover, single-step exactly one guest
- * instruction with the interpreter (code is untouched, so no cache
- * work is needed), and re-widen.  Returns 0 when the fault was
- * emulated (the caller resumes at the advanced PC), -1 when the
- * mirror denies the page (the caller delivers the signal).  The
- * direction check lives in i686_spurious_allow (above): a pure-read
- * insn needs only the R grant, a pure store only W; a partially
- * allowed page against the insn's direction (R-only write, NONE
- * read) is a genuine guest fault and must trap. */
-int i686_spurious_allow(i686_ctx_t *ctx, uint32_t ga)
-{
-    /* Access-aware heal gate for the fault paths (C2-2 rodata hang).
-     * The legacy gate requires full R|W mirror, which kills legitimate
-     * READS from spuriously-closed R-only pages (small-binary .rodata
-     * sharing its 16 KiB host cover with unrecorded padding widens
-     * shut at load; the first format-string load then dies instead of
-     * healing).  A pure-read insn only needs the R grant, a pure
-     * store only the W grant; the union cover always grants a superset
-     * of the faulting sub-page's own record, so healing under union is
-     * sound exactly when the mirror grants the insn's direction.  The
-     * EA-page match pins the fault to this insn (a parked/stale eip
-     * from syscall-internal access must not heal here: those heal
-     * inside the tolerant copies).  Anything unclassifiable falls back
-     * to the legacy full-grant rule. */
-    uint8_t mirror;
-    x86_insn_t insn;
-    int rd;
-    int wr;
-    int i;
-    if (ctx == NULL) {
-        return 0;
-    }
-    mirror = (uint8_t)(i686_vm_file_prot(ga & ~0xFFFU) & 0x03u);
-    if (mirror == 0x03u) {
-        return 1; /* legacy: full grant */
-    }
-    if (mirror == 0u) {
-        return 0; /* deny */
-    }
-    /* Never decode off an unmapped/unreadable code page: the fetch
-     * itself would nest a fault into this same path. */
-    if (i686_fault_region_prot(ctx, ctx->eip, NULL, NULL) == 0 ||
-        (i686_vm_file_prot(ctx->eip & ~0xFFFU) & 0x01u) == 0u) {
-        return 0;
-    }
-    if (x86_decode(ctx, ctx->eip, &insn) != 0) {
-        return 0;
-    }
-    /* LEA touches nothing: a fault parked here is stale/syscall
-     * traffic (legacy retry path heals it). */
-    if (insn.op == I686_OP_LEA_GvM) {
-        return 0;
-    }
-    /* String ops carry implicit ESI/EDI traffic.  Pin the faulting page
-     * to the live stream range(s) instead of an EA: rga must overlap
-     * [ESI, ESI+n) and/or [EDI, EDI+n), and the mirror must grant the
-     * touching stream's direction (memcpy-from-rodata reads a
-     * widen-shut R-only page legitimately).  n follows REP*ECX (or one
-     * unit without REP); ranges wrap per D4. */
-    switch (insn.op) {
-    case I686_OP_MOVSb: case I686_OP_MOVSw:
-    case I686_OP_CMPSb: case I686_OP_CMPSw:
-    case I686_OP_STOSb: case I686_OP_STOSw:
-    case I686_OP_LODSb: case I686_OP_LODSw:
-    case I686_OP_SCASb: case I686_OP_SCASw: {
-        uint32_t unit;
-        if (insn.op == I686_OP_MOVSb || insn.op == I686_OP_CMPSb ||
-            insn.op == I686_OP_STOSb || insn.op == I686_OP_LODSb ||
-            insn.op == I686_OP_SCASb) {
-            unit = 1u;
-        } else {
-            unit = (insn.pfx_opsize != 0u) ? 2u : 4u;
-        }
-        uint64_t n = (insn.pfx_rep != 0u)
-            ? (uint64_t)ctx->gpr[I686_REG_ECX] * (uint64_t)unit
-            : (uint64_t)unit;
-        uint32_t page = ga & ~0xFFFU;
-        uint64_t b;
-        int in_esi;
-        int in_edi;
-        uint8_t need = 0u;
-        if (n == 0u) {
-            return 0; /* REP with ECX=0 moves nothing: not this insn */
-        }
-        if (insn.op == I686_OP_STOSb || insn.op == I686_OP_STOSw ||
-            insn.op == I686_OP_SCASb || insn.op == I686_OP_SCASw) {
-            in_esi = 0; /* no ESI stream */
-        } else {
-            b = (uint64_t)ctx->gpr[I686_REG_ESI];
-            in_esi = (b + n <= 0x100000000ULL)
-                ? (b < (uint64_t)page + 4096u &&
-                   (uint64_t)page < b + n)
-                : (b < (uint64_t)page + 4096u ||
-                   (uint64_t)page < ((b + n) & 0xFFFFFFFFu));
-        }
-        if (insn.op == I686_OP_LODSb || insn.op == I686_OP_LODSw) {
-            in_edi = 0; /* no EDI stream */
-        } else {
-            b = (uint64_t)ctx->gpr[I686_REG_EDI];
-            in_edi = (b + n <= 0x100000000ULL)
-                ? (b < (uint64_t)page + 4096u &&
-                   (uint64_t)page < b + n)
-                : (b < (uint64_t)page + 4096u ||
-                   (uint64_t)page < ((b + n) & 0xFFFFFFFFu));
-        }
-        if (!in_esi && !in_edi) {
-            return 0; /* fault is not this insn's traffic */
-        }
-        /* Stream directions: ESI is always read (MOVS/CMPS/LODS);
-         * EDI is written by MOVS/STOS and read by CMPS/SCAS. */
-        if (in_esi) {
-            need |= 1u;
-        }
-        if (in_edi &&
-            (insn.op == I686_OP_MOVSb || insn.op == I686_OP_MOVSw ||
-             insn.op == I686_OP_STOSb || insn.op == I686_OP_STOSw)) {
-            need |= 2u;
-        } else if (in_edi) {
-            need |= 1u;
-        }
-        if ((mirror & need) != need) {
-            return 0; /* genuine protection fault: deliver */
-        }
-        return 1;
-    }
-    default:
-        break;
-    }
-    rd = 0;
-    wr = 0;
-    for (i = 0; i < 3; i++) {
-        unsigned k = insn.opnd[i];
-        int is_rm = (k == I686_OPND_RM8 || k == I686_OPND_RM16 ||
-                     k == I686_OPND_RM32);
-        int is_m = is_rm || k == I686_OPND_M1616;
-        if (!is_m) {
-            continue;
-        }
-        if (insn.has_modrm && insn.modrm_mod == 3u) {
-            continue; /* register form: no memory traffic */
-        }
-        if (i == 0) {
-            wr = 1;
-        } else {
-            rd = 1;
-        }
-    }
-    /* CMP/TEST/BT read their dst-slot operand (compare, no writeback):
-     * requiring W would mis-deliver legitimate reads. */
-    if (insn.op == I686_OP_CMP_EvGv || insn.op == I686_OP_TEST_EvGv ||
-        insn.op == I686_OP_BT_EvIb || insn.op == I686_OP_CMP_EbIb ||
-        insn.op == I686_OP_CMP_EvIz || insn.op == I686_OP_CMP_EvIbSX) {
-        wr = 0;
-        rd = 1;
-    }
-    if (!rd && !wr) {
-        return 0; /* non-memory insn cannot have faulted: retry path */
-    }
-    if ((mirror & (uint8_t)((rd ? 1 : 0) | (wr ? 2 : 0))) !=
-        (uint8_t)((rd ? 1 : 0) | (wr ? 2 : 0))) {
-        return 0; /* genuine protection fault: deliver */
-    }
-    {
-        uint32_t ea = x86_ea_compute(ctx, &insn);
-        if ((ea & ~0xFFFU) != (ga & ~0xFFFU)) {
-            return 0; /* fault is not this insn's traffic */
-        }
-    }
-    return 1;
-}
-
-int i686_spurious_emulate(i686_ctx_t *ctx, uint32_t ga)
-{
-    /* Leave-open table: a host page that faults spuriously dozens of
-     * times (a hot RW stack sharing its 16 KiB cover with a widened
-     * guard page — every touch would otherwise pay two mprotects)
-     * stays at the permissive union cover after probation.  Torture
-     * windows touch a widened neighbour at most a couple of times
-     * (tcg test-mmap: two), far below probation, so they stay enforced
-     * while guards (thousands of touches) open quickly.  Process-wide
-     * and lock-free: every outcome (open vs widened) is a safe
-     * direction, a race only shifts probation by one fault. */
-    static uint32_t s_open_page[64];
-    static uint8_t s_open_hits[64];
-    uint32_t page;
-    uint32_t hps;
-    size_t slot;
-    int ir;
-    if (ctx == NULL || ctx->vm_regime != I686_VM_REGIME_A2 ||
-        ctx->vm_host_page <= 4096u) {
-        return -1;
-    }
-    if (i686_spurious_allow(ctx, ga) == 0) {
-        return -1; /* mirror denies: genuine fault, deliver it */
-    }
-    hps = ctx->vm_host_page;
-    page = ga & ~(hps - 1u);
-    slot = (size_t)(((page >> 12) ^ (page >> 20)) & 63U);
-    if (s_open_page[slot] == page) {
-        if (s_open_hits[slot] >= 64u) {
-            /* On probation: re-union without re-widening. */
-            if (i686_vm32_union_prot(ctx, page, page + hps) != 0) {
-                return -1;
-            }
-            ir = i686_interp_step(ctx);
-            return (ir == I686_INTERP_CONTINUE) ? 0 : -1;
-        }
-        s_open_hits[slot]++;
-    } else {
-        s_open_page[slot] = page;
-        s_open_hits[slot] = 1u;
-    }
-    /* Unrestrict to the union cover (a superset of the mirror grant),
-     * step exactly one instruction, then re-widen. */
-    if (i686_vm32_union_prot(ctx, page, page + hps) != 0) {
-        return -1;
-    }
-    ir = i686_interp_step(ctx);
-    (void)i686_vm32_widen_prot(ctx, page, page + hps);
-    if (ir == I686_INTERP_CONTINUE) {
-        return 0;
-    }
-    /* The stepped instruction took its own exit (syscall/fault/trap):
-     * report not-emulated so the caller runs its normal exit switch
-     * instead of blindly resuming. */
-    return -1;
-}
-
 int i686_deliver_sync(i686_ctx_t *ctx, int reason)
 {
     int sig;
@@ -807,19 +593,21 @@ int i686_deliver_sync(i686_ctx_t *ctx, int reason)
     }
 }
 
-/* Deliver the lowest pending, unblocked signal at an interpreter safe
- * point.  Unblock check against the guest mask (ctx->sig_mask, the
+/* Deliver the lowest pending, unblocked signal at an engine safe point.
+ * Unblock check against the guest mask (ctx->sig_mask, the
  * sys_rt_sigprocmask store).
  *
  * Kernel pending semantics (fix-campaign C1b handoff): a bit stays
  * pending while MASKED and delivers when the mask is lifted — musl's
  * raise() blocks all signals, tkills itself and restores, so the poll
- * runs inside the blocked window and MUST NOT drop the bit.  The v1
- * core wiped every pending bit after each poll, dropping exactly those
- * raise() signals ("handler did not run").  Now only a bit that is
- * actually delivered is cleared; blocked bits (and, for v1's lack of
- * default-action machinery, unblocked SIG_DFL/SIG_IGN-disposition
- * bits) survive the poll. */
+ * runs inside the blocked window and MUST NOT drop the bit.  Only an
+ * unblocked signal is consumed from ctx->pending_signals:
+ *  - SIG_IGN (handler == 1U): dropped.
+ *  - SIG_DFL (ga == NULL || handler == 0U): executes the Linux default
+ *    disposition (ignore for SIGCHLD/SIGURG/SIGWINCH, continue for
+ *    SIGCONT, stop for SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU, and process
+ *    termination for all other signals).
+ *  - Installed handler: builds a guest signal frame and redirects EIP. */
 int i686_deliver_pending(i686_ctx_t *ctx)
 {
     uint64_t pend = ctx->pending_signals;
@@ -833,18 +621,28 @@ int i686_deliver_pending(i686_ctx_t *ctx)
         for (scan = bit; scan > 1ULL; scan >>= 1) {
             sig++;
         }
+        if ((ctx->sig_mask & bit) != 0ULL && sig != 9 && sig != 19) {
+            continue; /* blocked: stays pending until unmasked */
+        }
         ga = i686_gsig_tab(sig);
-        if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
-            if ((ctx->sig_mask & bit) == 0ULL) {
-                /* unblocked with no guest handler: v1 has no
-                 * default-action machinery; keep v1's drop semantics
-                 * so the bit cannot wedge the scan forever */
-                ctx->pending_signals &= ~bit;
-            }
+        if (ga != NULL && ga->handler == 1U && sig != 9 && sig != 19) {
+            ctx->pending_signals &= ~bit; /* SIG_IGN: drop */
             continue;
         }
-        if ((ctx->sig_mask & bit) != 0ULL) {
-            continue; /* blocked: stays pending until unmasked */
+        if (ga == NULL || ga->handler == 0U || sig == 9 || sig == 19) {
+            ctx->pending_signals &= ~bit;
+            if (sig == 17 || sig == 18 || sig == 23 || sig == 28) {
+                continue; /* Ign / Cont */
+            }
+            if (sig == 19 || sig == 20 || sig == 21 || sig == 22) {
+                (void)kill(getpid(), SIGSTOP);
+                continue;
+            }
+            if (sig > 0 && sig < NSIG) {
+                (void)signal(sig, SIG_DFL);
+                (void)raise(sig);
+            }
+            _exit(128 + sig);
         }
         ctx->pending_signals &= ~bit;
         ctx->exit_arg = 0; /* no trapno for async */

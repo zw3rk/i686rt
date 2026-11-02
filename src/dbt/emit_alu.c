@@ -125,26 +125,15 @@ static void emit_guest_load(i686_emit_ctx_t *e, unsigned rt, unsigned width)
 {
     a64_buf_t *b = &e->buf;
 
-    if (!e->tso) {
-        if (width == 8U) {
-            a64_emit_guest_ldrb_w(b, rt, 21U);
-        } else if (width == 16U) {
-            a64_emit_guest_ldrh_w(b, rt, 21U);
-        } else {
-            a64_emit_guest_ldr_w(b, rt, 21U);
-        }
-        return;
-    }
-    /* LDAR-class through x23 = xG + uxtw(w21). Ordered loads require
-     * natural alignment. i686_emit_begin leaves e->tso false, so this
-     * arm is not emitted. */
-    a64_emit_add_uxtw_x(b, 23U, 20U, 21U);
     if (width == 8U) {
-        a64_emit(b, 0x08DFFC00U | (23U << 5) | (rt & 31U));
+        a64_emit_guest_ldrb_w(b, rt, 21U);
     } else if (width == 16U) {
-        a64_emit(b, 0x48DFFC00U | (23U << 5) | (rt & 31U));
+        a64_emit_guest_ldrh_w(b, rt, 21U);
     } else {
-        a64_emit(b, 0x88DFFC00U | (23U << 5) | (rt & 31U));
+        a64_emit_guest_ldr_w(b, rt, 21U);
+    }
+    if (e->tso) {
+        a64_emit(b, 0xD50339BFU); /* dmb ishld */
     }
 }
 
@@ -152,23 +141,15 @@ static void emit_guest_store(i686_emit_ctx_t *e, unsigned rt, unsigned width)
 {
     a64_buf_t *b = &e->buf;
 
-    if (!e->tso) {
-        if (width == 8U) {
-            a64_emit_guest_strb_w(b, rt, 21U);
-        } else if (width == 16U) {
-            a64_emit_guest_strh_w(b, rt, 21U);
-        } else {
-            a64_emit_guest_str_w(b, rt, 21U);
-        }
-        return;
-    }
-    a64_emit_add_uxtw_x(b, 23U, 20U, 21U);
     if (width == 8U) {
-        a64_emit(b, 0x089FC000U | (23U << 5) | (rt & 31U));
+        a64_emit_guest_strb_w(b, rt, 21U);
     } else if (width == 16U) {
-        a64_emit(b, 0x489FC000U | (23U << 5) | (rt & 31U));
+        a64_emit_guest_strh_w(b, rt, 21U);
     } else {
-        a64_emit(b, 0x889FC000U | (23U << 5) | (rt & 31U));
+        a64_emit_guest_str_w(b, rt, 21U);
+    }
+    if (e->tso) {
+        a64_emit(b, 0xD5033BBFU); /* dmb ish */
     }
 }
 

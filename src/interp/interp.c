@@ -211,20 +211,29 @@ int i686_fault_code(void)
 int i686_fault_region_prot(const i686_ctx_t *ctx, uint32_t ga,
                             uint32_t *out_prot, uint32_t *out_flags)
 {
+    extern void rt32_vm_sync_ctx(i686_ctx_t *);
     size_t i;
+    int pass;
     if (ctx == NULL) {
         return 0;
     }
-    for (i = 0U; i < ctx->region_count; i++) {
-        const i686_region_t *r = &ctx->regions[i];
-        if (r->start <= ga && ga < r->end) {
-            if (out_prot != NULL) {
-                *out_prot = r->prot;
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0U; i < ctx->region_count; i++) {
+            const i686_region_t *r = &ctx->regions[i];
+            if (r->start <= ga && ga < r->end) {
+                if (out_prot != NULL) {
+                    *out_prot = r->prot;
+                }
+                if (out_flags != NULL) {
+                    *out_flags = r->flags;
+                }
+                return 1;
             }
-            if (out_flags != NULL) {
-                *out_flags = r->flags;
-            }
-            return 1;
+        }
+        if (pass == 0 && ctx->is_thread_clone) {
+            rt32_vm_sync_ctx((i686_ctx_t *)(uintptr_t)ctx);
+        } else {
+            break;
         }
     }
     return 0;
@@ -475,7 +484,11 @@ int i686_interp_run(i686_ctx_t *ctx)
             if (rga != (uint32_t)s_last_remap_ga &&
                 i686_fault_region_prot(ctx, rga, NULL, NULL) != 0 &&
                 i686_spurious_allow(ctx, rga) != 0) {
+                ctx->exit_reason = I686_EXIT_NONE;
                 if (i686_spurious_emulate(ctx, rga) == 0) {
+                    if (ctx->exit_reason == I686_EXIT_SYSCALL) {
+                        return I686_EXIT_SYSCALL;
+                    }
                     i686_fault_arm(&fault_jmp); /* re-arm: resume may fault */
                     goto run_loop; /* emulated; resume past the insn */
                 }
@@ -510,6 +523,11 @@ run_loop:
         i686_interp_fn fn;
         int r;
 
+        /* RC-U3 checkpoint for the fault path above (must precede
+         * x86_decode so an instruction-fetch fault on a widened page
+         * never restores a stale ESP/EBP from the previous insn). */
+        s_saved_esp = ctx->gpr[I686_REG_ESP];
+        s_saved_ebp = ctx->gpr[I686_REG_EBP];
         if (x86_decode(ctx, ctx->eip, &insn) != 0) {
             uint32_t b;
             ctx->exit_reason = I686_EXIT_UNDEF;
@@ -549,9 +567,6 @@ run_loop:
                      ctx->gpr[I686_REG_ESP]);
             (void)write(2, tl, strlen(tl));
         }
-        /* RC-U3 checkpoint for the fault path above. */
-        s_saved_esp = ctx->gpr[I686_REG_ESP];
-        s_saved_ebp = ctx->gpr[I686_REG_EBP];
         r = fn(ctx, &insn);
         ctx->blocks_executed++;
 

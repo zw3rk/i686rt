@@ -89,6 +89,8 @@ uint32_t i686_vm_file_shrink_cut(uint32_t map_start, size_t map_len,
 int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
                            uint64_t file_offset, uint8_t kind);
 void i686_vm_file_untrack_map(uint32_t gva, size_t len);
+int i686_vm_file_lookup_map(uint32_t gva, int *out_fd,
+                            uint64_t *out_file_offset, uint8_t *out_kind);
 
 /* pwrite hook: re-read overlapped MAP_PRIVATE CLEAN pages from fd so
  * they observe the new file bytes.  Returns pages refreshed. */

@@ -169,12 +169,12 @@ static void t_maps_format(void)
     ctx.regions[0].end   = 0x0804A000U;
     ctx.regions[0].prot  = PROT_READ | PROT_EXEC;
     ctx.regions[0].flags = 0U;
-    strcpy(ctx.regions[0].name, "/bin/busybox");
+    memcpy(ctx.regions[0].name, "/bin/busybox", sizeof("/bin/busybox"));
     ctx.regions[1].start = 0xD8000000U;
     ctx.regions[1].end   = 0xE0000000U;
     ctx.regions[1].prot  = PROT_READ | PROT_WRITE;
     ctx.regions[1].flags = 0x12U;
-    strcpy(ctx.regions[1].name, "[stack]");
+    memcpy(ctx.regions[1].name, "[stack]", sizeof("[stack]"));
     ctx.region_count = 2U;
 
     char buf[1024];
@@ -265,11 +265,11 @@ static void t_open_at(void)
     ctx.regions[0].start = 0x08048000U;
     ctx.regions[0].end   = 0x0804A000U;
     ctx.regions[0].prot  = PROT_READ | PROT_EXEC;
-    strcpy(ctx.regions[0].name, "/bin/busybox");
+    memcpy(ctx.regions[0].name, "/bin/busybox", sizeof("/bin/busybox"));
     ctx.regions[1].start = 0xD8000000U;
     ctx.regions[1].end   = 0xE0000000U;
     ctx.regions[1].prot  = PROT_READ | PROT_WRITE;
-    strcpy(ctx.regions[1].name, "[stack]");
+    memcpy(ctx.regions[1].name, "[stack]", sizeof("[stack]"));
     ctx.region_count = 2U;
 
     /* not virtualized -> caller falls through to the host path */

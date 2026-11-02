@@ -64,7 +64,7 @@ help: ## Show available build and verification targets
 SRCS_X64 := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/x86/*.c) \
         $(wildcard src/interp/*.c) $(U3_OS_SRCS) \
         $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)
-SRCS_X64 := $(filter-out src/rt32/rt32_a64_emit.c,$(SRCS_X64))
+SRCS_X64 := $(filter-out src/rt32/rt32_a64_emit.c src/rt32/rt32_a64_emit_exit.c,$(SRCS_X64))
 OBJS_X64  := $(patsubst src/%.c,$(OBJ_DIR)-x64/%.o,$(SRCS_X64))
 I686RT_X64 := $(BUILD_DIR)/i686rt-x86_64
 
@@ -88,8 +88,7 @@ $(OBJ_DIR)/%.o: src/%.c $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: ## Run the test suite (none yet; fixtures arrive in Phase 1)
-	@echo "phase 0: no tests yet"
+test: check ## Run the host test suite (line limits + Wave U3 host checks)
 
 check: check-line-limits test-u3 ## Run line limits + host unit tests (RC-U3)
 
@@ -252,14 +251,14 @@ U3_OWNED := src/vm/vm32.c src/vm/vm32.h src/vm/vm_file.c src/vm/vm_file.h \
 # emit_sse_shared.h) plus the dbt header carrying the XMM cache mask.
 P13_OWNED := src/dbt/emit_sse.c src/dbt/emit_sse2.c \
         src/dbt/emit_sse_shared.h src/dbt/emit.h
-check-line-limits: ## Enforce the <= 900-line rule on lane-owned files
+check-line-limits: ## Enforce the <= 900-line rule on all .c/.h/.S files
 	@fail=0; \
-	for f in $(U3_OWNED) $(P13_OWNED); do \
+	for f in $$(find src include tests -type f \( -name '*.c' -o -name '*.h' -o -name '*.S' \) | sort); do \
 	  n=$$(wc -l < "$$f"); \
 	  if [ "$$n" -gt 900 ]; then echo "OVER LIMIT: $$f ($$n lines)"; fail=1; fi; \
 	done; \
 	if [ "$$fail" -ne 0 ]; then echo "FAIL: files over 900 lines"; exit 1; fi; \
-	echo "check-line-limits: all lane-owned files <= 900 lines"
+	echo "check-line-limits: all .c/.h/.S files <= 900 lines"
 
 # Native macOS arm64 standalone translator build (_build/i686rt-darwin +
 # _build/i686rt-darwin-arm64 symlink). Compiles every translator TU and
@@ -293,7 +292,7 @@ build-darwin: $(I686RT_DARWIN) test-u3 ## Build native macOS arm64 i686rt transl
 # regime selection, and the dual-backend smoke set. Uses the host
 # toolchain (never the cross CC).
 U3_TEST_SRCS := tests/unit/test_u3_sites.c src/dbt/aot/aot.c \
-        src/vm/vm32.c src/vm/vm_file.c src/rt32/rt32_vm.c \
+        src/vm/vm32.c src/vm/vm_file.c src/rt32/rt32_vm.c src/rt32/rt32_vm_mmap.c \
         src/os/backend_linux.c src/os/backend_linux_sys.c \
         src/os/backend_darwin.c src/os/backend_darwin_io.c \
         src/os/backend_darwin_net.c

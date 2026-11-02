@@ -31,6 +31,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef enum {
     RT_BACKEND_LINUX = 1, /* static-PIE aarch64-linux (native or hyper-linux) */
@@ -41,6 +42,20 @@ typedef enum {
 rt_backend_kind_t rt_host_backend_kind(void);
 int rt_host_is_hyper_linux(void);
 size_t rt_host_page_size(void); /* 4096, 16384, or 65536 */
+
+static inline size_t rt_host_page_size_query(size_t fallback)
+{
+    static _Atomic size_t cached = 0u;
+    size_t c = atomic_load_explicit(&cached, memory_order_relaxed);
+    long v;
+    if (c != 0u) {
+        return c;
+    }
+    v = sysconf(_SC_PAGESIZE);
+    c = (v > 0) ? (size_t)v : fallback;
+    atomic_store_explicit(&cached, c, memory_order_relaxed);
+    return c;
+}
 
 /* 2. Low-level host memory primitives consumed by src/vm/vm32.c. */
 int rt_host_map_anon(void *hint_addr, size_t len, int linux_prot, int fixed,

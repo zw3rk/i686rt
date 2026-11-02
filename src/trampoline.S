@@ -45,9 +45,9 @@ _i686_jit_run_block:
     stp     d14, d15, [sp, #144]
 
     mov     x19, x0                 /* x19 = xCtx */
-    ldr     x20, [x19, #112]        /* x20 = xG (guest_base) */
+    ldr     x20, [x19, #112]        /* x20 = xG (guest_base on both A1 and A2) */
     mov     x21, x2                 /* x21 = cur_entry (unused: IBTC links) */
-    mov     x22, x3                 /* x22 = &g_cache_epoch (unused) */
+    mov     x26, x3                 /* x26 = &g_dbt_cache_epoch */
     mov     x23, x1                 /* x23 = code_ptr (stash: the GPR load
                                        below writes w1, clobbering x1) */
 
@@ -87,6 +87,12 @@ _i686_jit_run_block:
     ldr     w10, [x11, #2536]       /* slot->key (ctx->ibtc @0x9e8) */
     cmp     w10, w9                 /* key == exit_dest? */
     b.ne    .Lexit
+    cbz     x26, 2f
+    ldr     w12, [x26]              /* *epoch_ptr (g_dbt_cache_epoch) */
+    ldr     w13, [x11, #2540]       /* slot->epoch */
+    cmp     w12, w13
+    b.ne    .Lexit
+2:
     ldr     x23, [x11, #2544]       /* slot->host_code (key@0, epoch@4,
                                        host_code@8) */
     cbz     x23, .Lexit             /* cleared slot -> C epilogue */

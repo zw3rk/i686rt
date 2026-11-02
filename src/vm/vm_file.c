@@ -312,15 +312,58 @@ void i686_vm_file_untrack_map(uint32_t gva, size_t len)
     uint64_t end = (uint64_t)gva + (uint64_t)len;
     uint32_t i;
     for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        uint64_t m_start;
         uint64_t m_end;
         if (s_maps[i].used == 0) {
             continue;
         }
-        m_end = (uint64_t)s_maps[i].gva + (uint64_t)s_maps[i].len;
-        if ((uint64_t)s_maps[i].gva < end && m_end > (uint64_t)gva) {
+        m_start = (uint64_t)s_maps[i].gva;
+        m_end = m_start + (uint64_t)s_maps[i].len;
+        if (m_start >= end || m_end <= (uint64_t)gva) {
+            continue;
+        }
+        if (m_start >= (uint64_t)gva && m_end <= end) {
             s_maps[i].used = 0;
+        } else if (m_start < (uint64_t)gva && m_end <= end) {
+            s_maps[i].len = (size_t)((uint64_t)gva - m_start);
+        } else if (m_start >= (uint64_t)gva && m_end > end) {
+            uint64_t delta = end - m_start;
+            s_maps[i].gva = (uint32_t)end;
+            s_maps[i].len = (size_t)(m_end - end);
+            s_maps[i].file_offset += delta;
+        } else {
+            s_maps[i].len = (size_t)((uint64_t)gva - m_start);
         }
     }
+}
+
+int i686_vm_file_lookup_map(uint32_t gva, int *out_fd,
+                            uint64_t *out_file_offset, uint8_t *out_kind)
+{
+    uint32_t i;
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        uint64_t m_start;
+        uint64_t m_end;
+        if (s_maps[i].used == 0) {
+            continue;
+        }
+        m_start = (uint64_t)s_maps[i].gva;
+        m_end = m_start + (uint64_t)s_maps[i].len;
+        if ((uint64_t)gva >= m_start && (uint64_t)gva < m_end) {
+            uint64_t delta = (uint64_t)gva - m_start;
+            if (out_fd != NULL) {
+                *out_fd = s_maps[i].fd;
+            }
+            if (out_file_offset != NULL) {
+                *out_file_offset = s_maps[i].file_offset + delta;
+            }
+            if (out_kind != NULL) {
+                *out_kind = s_maps[i].kind;
+            }
+            return 0;
+        }
+    }
+    return -1;
 }
 
 size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len)

@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "dbt/aot/aot.h"
 #include "dbt/emit.h"
 #include "interp/interp.h"
 #include "rt32/rt32_a64_emit.h"
@@ -90,24 +91,85 @@ static int tr_is_fused9(unsigned op)
     }
 }
 
+static int tr_is_block_end(const x86_insn_t *insn)
+{
+    switch (insn->op) {
+    case I686_OP_JMP_Jb:
+    case I686_OP_JMP_Jz:
+    case I686_OP_JMP_Ev:
+    case I686_OP_JCC_Jb:
+    case I686_OP_JCC_Jz:
+    case I686_OP_LOOPNZ_Jb:
+    case I686_OP_LOOPZ_Jb:
+    case I686_OP_LOOP_Jb:
+    case I686_OP_JCXZ_Jb:
+    case I686_OP_CALL_Jz:
+    case I686_OP_CALL_Ev:
+    case I686_OP_RET:
+    case I686_OP_RET_Iw:
+    case I686_OP_IRET:
+    case I686_OP_INT_Ib:
+    case I686_OP_INT3:
+    case I686_OP_INTO:
+    case I686_OP_HLT:
+    case I686_OP_UD2:
+    case I686_OP_SYSENTER:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int tr_page_readable(const i686_ctx_t *ctx, uint32_t va)
+{
+    extern void rt32_vm_sync_ctx(i686_ctx_t *);
+    uint32_t page = va & ~0xFFFu;
+    size_t i;
+    int pass;
+
+    if (ctx->region_count == 0U && !ctx->is_thread_clone) {
+        return 1;
+    }
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0U; i < ctx->region_count; i++) {
+            uint32_t start = ctx->regions[i].start;
+            uint32_t end = ctx->regions[i].end;
+            if (end > start && page >= start && page < end) {
+                return (ctx->regions[i].prot & 0x05U) != 0U ? 1 : 0;
+            }
+        }
+        if (pass == 0 && ctx->is_thread_clone) {
+            rt32_vm_sync_ctx((i686_ctx_t *)(uintptr_t)ctx);
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
 static unsigned tr_classify(const x86_insn_t *insn)
 {
     unsigned op = insn->op;
     int regonly = tr_is_regonly(insn);
 
-    /* Fused full writers (no LOCK): skippable, valid j.  Register and
-     * memory forms alike: a faulting memory op recovers only eip/esp
-     * (engine.c fault path; GPRs and lazy flags materialize at block
-     * exit), so a skipped lazy store is never observed. */
+    if (op == (unsigned)I686_OP_LEA_GvM) {
+        return TRC_TRANSPARENT;
+    }
+    /* Any memory-accessing instruction can fault (SIGSEGV/SIGBUS) and
+     * materialize EFLAGS into the signal frame before block exit, so
+     * memory instructions are always flag barriers (I686-5). */
+    if (regonly == 0) {
+        return TRC_BARRIER;
+    }
+
+    /* Fused full writers (register-only, no LOCK): skippable, valid j. */
     if (insn->pfx_lock == 0U &&
         (tr_is_fused9(op) != 0 ||
          op == (unsigned)I686_OP_NEG_Eb || op == (unsigned)I686_OP_NEG_Ev)) {
         return TRC_PARTICIPANT;
     }
     /* Eager full writers with a static nonzero count (no LOCK): valid j,
-     * never skipped (their stores always run).  SHL/SHR/SAR by 1 or by a
-     * nonzero imm count are full writers for register and memory dests
-     * alike (LOCKed memory declines to the interpreter). */
+     * never skipped (their stores always run). */
     if (insn->pfx_lock == 0U) {
         switch (op) {
         case I686_OP_SHL_Eb1: case I686_OP_SHL_Ev1:
@@ -124,10 +186,7 @@ static unsigned tr_classify(const x86_insn_t *insn)
         case I686_OP_IMUL_GvEv:
         case I686_OP_IMUL_GvEvIz:
         case I686_OP_IMUL_GvEvIb:
-            if (regonly != 0) {
-                return TRC_JONLY;
-            }
-            break;
+            return TRC_JONLY;
         default:
             break;
         }
@@ -157,42 +216,25 @@ static unsigned tr_classify(const x86_insn_t *insn)
     default:
         break;
     }
-    /* Flag-transparent, provably never declining/closing.  MOV (all
-     * forms, register or memory) and MOVZX/MOVSX never touch flags. */
+    /* Flag-transparent register-only ops. */
     switch (op) {
     case I686_OP_NOP:
     case I686_OP_WAIT:
     case I686_OP_BSWAP_Gv:
-    case I686_OP_LEA_GvM:
-        return TRC_TRANSPARENT;
     case I686_OP_NOT_Eb:
     case I686_OP_NOT_Ev:
-        if (regonly != 0) {
-            return TRC_TRANSPARENT;
-        }
-        break;
     case I686_OP_MOV_EbGb: case I686_OP_MOV_EvGv:
     case I686_OP_MOV_GbEb: case I686_OP_MOV_GvEv:
-    case I686_OP_MOV_ALOb: case I686_OP_MOV_eAXOv:
-    case I686_OP_MOV_ObAL: case I686_OP_MOV_OveAX:
     case I686_OP_MOV_EbIb: case I686_OP_MOV_EvIz:
     case I686_OP_MOV_GbIb: case I686_OP_MOV_GvIv:
     case I686_OP_MOVZX_GvEb: case I686_OP_MOVZX_GvEw:
     case I686_OP_MOVSX_GvEb: case I686_OP_MOVSX_GvEw:
-        return TRC_TRANSPARENT;
     case I686_OP_XCHG_EbGb: case I686_OP_XCHG_EvGv:
     case I686_OP_XCHG_eAXGv:
-        if (regonly != 0) {
-            return TRC_TRANSPARENT;
-        }
-        break;
+        return TRC_TRANSPARENT;
     default:
         break;
     }
-    /* Everything else is a fault/reader/partial/exit barrier:
-     * DIV/IDIV, ADC/SBB (carry readers), CL-count shifts, MUL/IMUL-1op,
-     * LOCKed forms, all branches/syscalls/traps/string/SSE/x87/unknown
-     * rows, and any remaining memory access. */
     return TRC_BARRIER;
 }
 
@@ -219,19 +261,31 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
     unsigned n;
     unsigned i;
     int failed = 0;
+    int stopped_early = 0;
     uint32_t fail_pc = 0U;
 
-    /* Phase 1: decode at most one page worth of instructions.  The walk
-     * stays on the block-start page (mapped by construction), so it is
-     * fault-safe; it stops where the v1 loop would (fail/page/64). */
+    /* Phase 1: decode at most one page worth of instructions, stopping
+     * immediately at block terminators or before crossing into an
+     * unmapped page (I686-6). */
     for (i = 0U; i < I686_DBT_MAX_INSNS; i++) {
-        if (x86_decode(ctx, pc, &insns[m]) != 0) {
+        uint32_t fetch_va = ctx->seg_base[I686_SEG_CS] + pc;
+        int drc;
+        if (i > 0U && (fetch_va & 0xFFFu) > 0xFF0u &&
+            tr_page_readable(ctx, (fetch_va & ~0xFFFu) + 0x1000u) == 0) {
+            stopped_early = 1;
+            break;
+        }
+        drc = x86_decode(ctx, pc, &insns[m]);
+        if (drc != 0) {
             failed = 1;
             fail_pc = pc;
             break;
         }
         m++;
         pc += insns[m - 1U].len;
+        if (tr_is_block_end(&insns[m - 1U]) != 0) {
+            break;
+        }
         if (i686_page_down(pc) != i686_page_down(eip)) {
             break;
         }
@@ -267,6 +321,8 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
 
     for (n = 0U; n < m; n++) {
         x86_insn_t *insn = &insns[n];
+        size_t ring_insn = i686_aot_ring_count();
+        size_t w_start = e.buf.count;
         int rc;
 
         e.insn_pc = pc;
@@ -299,6 +355,18 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
             i686_emit_exit(&e, I686_EXIT_UNDEF, insn->len, pc);
             break;
         }
+        if (i686_aot_ring_count() == ring_insn && e.buf.count > w_start &&
+            (tr_is_regonly(insn) == 0 ||
+             (insn->op >= I686_OP_MOVSb && insn->op <= I686_OP_SCASw))) {
+            dbt_mem_site_t site;
+            memset(&site, 0, sizeof(site));
+            site.seq_start_offset = (uint16_t)(w_start * 4U);
+            site.host_insn_offset = (uint16_t)((e.buf.count - 1U) * 4U);
+            site.cont_insn_offset = (uint16_t)(e.buf.count * 4U);
+            site.guest_pc_delta = (uint16_t)(pc - eip);
+            site.insn_word = (uint32_t)insn->op & 0xFFFFU;
+            (void)i686_aot_note_stack_site(&site);
+        }
 
         pc += insn->len;
 
@@ -316,7 +384,7 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
         if (failed != 0) {
             /* v1 decode-fail shape: UNDEF with arg 0 at the fail PC. */
             i686_emit_exit(&e, I686_EXIT_UNDEF, 0U, fail_pc);
-        } else if (m == I686_DBT_MAX_INSNS) {
+        } else if (m == I686_DBT_MAX_INSNS || stopped_early != 0) {
             i686_emit_exit(&e, I686_EXIT_BRANCH, 0U, pc);
         }
     }

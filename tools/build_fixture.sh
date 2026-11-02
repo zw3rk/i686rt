@@ -46,6 +46,11 @@ esac
 
 mkdir -p "$root/$(dirname -- "$out")"
 
+extra_src=
+if [ -f "$root/${src%.c}_cases.c" ]; then
+    extra_src="${src%.c}_cases.c"
+fi
+
 docker run --rm --platform linux/386 \
     -v "$root":/w \
     alpine:3.20 \
@@ -54,7 +59,7 @@ docker run --rm --platform linux/386 \
            cc -std=c11 -Wall -Wextra -ffreestanding -static -nostdlib -O2 \
               -march=i686 -mno-mmx -mno-sse -mno-sse2 \
               -fno-pie -fno-stack-protector \
-              -o '$out' '$src'"
+              -o '$out' '$src' $extra_src"
 
 desc=$(file -b "$out")
 case $desc in

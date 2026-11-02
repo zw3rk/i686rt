@@ -64,7 +64,7 @@
 /* Wave U3 two-regime Class-A VM selector (lane u3-i686,
  * UNIFICATION-PLAN.md Rev 4 section 4.6). */
 #define I686_VM_REGIME_A1 1U /* H == 4096: direct 4 GiB window [x20, wAddr, uxtw] */
-#define I686_VM_REGIME_A2 2U /* H > 4096: Soft-TLB over MAP_PRIVATE arena (x20 = &tlb[0]) */
+#define I686_VM_REGIME_A2 2U /* H > 4096: direct window (x20 = G) + 4K sub-page mirrors */
 
 /* Block exit reasons (engines return to the dispatcher via ctx->exit_reason). */
 #define I686_EXIT_NONE    0U
@@ -273,7 +273,7 @@ typedef struct i686_ctx {
 
     /* Wave U3 two-regime VM + DBT fault-landing tail (lane u3-i686).
      * C-only tail: ABI-locked prefix above is untouched. */
-    void    *vm_tlb;             /* Regime A2 Soft-TLB (4096 x 32B entries), NULL on A1 */
+    void    *vm_tlb;             /* reserved ABI slot (always NULL; A2 uses x20 = G + 4K mirrors) */
     uint32_t vm_regime;          /* I686_VM_REGIME_A1 / I686_VM_REGIME_A2 (0 = uninit) */
     uint32_t vm_host_page;       /* cached rt_host_page_size() at vm init */
     uint32_t dbt_fault_nzcv;     /* NZCV word spilled by the fault landing pad */

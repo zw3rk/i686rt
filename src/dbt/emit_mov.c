@@ -88,64 +88,18 @@ void i686_emit_fault_landing(i686_emit_ctx_t *e)
 #define SCR0 8U
 #define SCR1 9U
 
-/* Per-block guest-PC cursor for real guest_pc_delta (RC-U3): the frozen
- * emitter API carries no per-insn PC, so walk x86_decode forward from
- * the block base in emission order.  Keyed on (ctx, block base, code
- * buffer): a new key means a new translation, reset to the base.  Each
- * site-emitting insn advances past exactly one matching op+len, so
- * repeated same-op insns attribute in order; a failed walk keeps
- * I686_SITE_PC_UNKNOWN. */
-static const i686_ctx_t *s_pc_ctx;
-static uint32_t s_pc_base;
-static const void *s_pc_buf;
-static uint32_t s_pc_cur;
-
-static uint32_t site_pc(i686_emit_ctx_t *e, const x86_insn_t *insn)
+/* Per-insn guest_pc_delta from e->insn_pc (set by translate.c and
+ * initialized to guest_eip by i686_emit_begin). */
+static uint16_t site_pc_delta(const i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
-    uint32_t pc;
-    unsigned n;
-
-    if (e->ctx != s_pc_ctx || e->guest_eip != s_pc_base ||
-        e->buf.words != s_pc_buf) {
-        s_pc_ctx = e->ctx;
-        s_pc_base = e->guest_eip;
-        s_pc_buf = e->buf.words;
-        s_pc_cur = e->guest_eip;
-    }
-    pc = s_pc_cur;
-    for (n = 0U; n < 64U; n++) { /* I686_DBT_MAX_INSNS bound */
-        x86_insn_t w;
-        if (x86_decode(e->ctx, pc, &w) != 0) {
-            break;
-        }
-        if (w.op == insn->op && w.len == insn->len) {
-            s_pc_cur = pc + (uint32_t)w.len;
-            return pc;
-        }
-        pc += (uint32_t)w.len;
-    }
-    return UINT32_MAX;
-}
-
-static uint16_t site_pc_delta(i686_emit_ctx_t *e, const x86_insn_t *insn)
-{
-    uint32_t pc = site_pc(e, insn);
-    if (pc == UINT32_MAX || pc < e->guest_eip) {
+    (void)insn;
+    if (e->insn_pc < e->guest_eip || e->insn_pc - e->guest_eip > 0xFFF0U) {
         return I686_SITE_PC_UNKNOWN;
     }
-    if (pc - e->guest_eip > 0xFFF0U) {
-        return I686_SITE_PC_UNKNOWN;
-    }
-    return (uint16_t)(pc - e->guest_eip);
+    return (uint16_t)(e->insn_pc - e->guest_eip);
 }
 
-/* RC-U3: record one guest-memory access site for fault recovery.  MOV
- * loads and stores previously recorded nothing, so a faulting MOV
- * recovered eip to the block base and the heal path emulated the wrong
- * insn (fatal with stale GPRs).  Single-access insns call exactly once
- * per emission so the (op,len) cursor attributes the right guest PC;
- * mem is the faulting access offset itself (single-word accesses, or
- * +4 into the TSO add+ldar pair when e->tso). */
+/* RC-U3: record one guest-memory access site for fault recovery. */
 static void em_note_mem_site(i686_emit_ctx_t *e, const x86_insn_t *insn,
                              uint32_t seq, uint32_t mem, uint32_t cont,
                              unsigned width, unsigned val_reg,
@@ -154,7 +108,8 @@ static void em_note_mem_site(i686_emit_ctx_t *e, const x86_insn_t *insn,
     dbt_mem_site_t site;
 
     if (e->tso) {
-        mem += 4U;
+        a64_emit(&e->buf, is_store != 0U ? 0xD5033BBFU : 0xD50339BFU);
+        cont = (uint32_t)((uint64_t)e->buf.count * 4u);
     }
     memset(&site, 0, sizeof(site));
     site.seq_start_offset = (uint16_t)seq;
@@ -613,6 +568,9 @@ static void emit_push_store(i686_emit_ctx_t *e, const x86_insn_t *insn,
     } else {
         a64_emit_guest_strh_w(b, wsrc, 4U);
     }
+    if (e->tso) {
+        a64_emit(b, 0xD5033BBFU); /* dmb ish */
+    }
     cont = (uint32_t)((uint64_t)b->count * 4u);
 
     memset(&site, 0, sizeof(site));
@@ -686,13 +644,22 @@ static int em_pop_gv(i686_emit_ctx_t *e, const x86_insn_t *insn)
     if (bytes == 4U) {
         if (r == 4U) {
             a64_emit_guest_ldr_w(b, SCR0, 4U);
+            if (e->tso) {
+                a64_emit(b, 0xD50339BFU); /* dmb ishld */
+            }
             a64_emit_mov_w(b, 4U, SCR0);
         } else {
             a64_emit_guest_ldr_w(b, r, 4U);
+            if (e->tso) {
+                a64_emit(b, 0xD50339BFU); /* dmb ishld */
+            }
             a64_emit_add_imm_w(b, false, 4U, 4U, 4U, 0U);
         }
     } else {
         a64_emit_guest_ldrh_w(b, SCR0, 4U);
+        if (e->tso) {
+            a64_emit(b, 0xD50339BFU); /* dmb ishld */
+        }
         a64_emit_add_imm_w(b, false, 4U, 4U, 2U, 0U);
         emit_write_w16(b, r, SCR0);
     }

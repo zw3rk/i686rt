@@ -213,9 +213,6 @@ static inline void xalu_note_mem_site(i686_emit_ctx_t *e,
 {
     dbt_mem_site_t site;
 
-    if (e->tso) {
-        mem += 4U;
-    }
     memset(&site, 0, sizeof(site));
     site.seq_start_offset = (uint16_t)seq;
     site.host_insn_offset = (uint16_t)mem;
@@ -251,6 +248,9 @@ static inline void xalu_guest_load(i686_emit_ctx_t *e, unsigned rt, unsigned wid
     } else {
         a64_emit_guest_ldr_w(b, rt, 21U);
     }
+    if (e->tso) {
+        a64_emit(b, 0xD50339BFU); /* dmb ishld */
+    }
 }
 
 static inline void xalu_guest_store(i686_emit_ctx_t *e, unsigned rt, unsigned width)
@@ -263,6 +263,9 @@ static inline void xalu_guest_store(i686_emit_ctx_t *e, unsigned rt, unsigned wi
         a64_emit_guest_strh_w(b, rt, 21U);
     } else {
         a64_emit_guest_str_w(b, rt, 21U);
+    }
+    if (e->tso) {
+        a64_emit(b, 0xD5033BBFU); /* dmb ish */
     }
 }
 

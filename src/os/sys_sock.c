@@ -77,6 +77,7 @@
  * (darwin: sys/wait.h -> sys/signal.h) rewrite with a macro; the frozen
  * struct must parse before any of that lands. */
 #include "marshal.h"
+#include "os/sys_sock_internal.h"
 #include "structs_i386.h"
 
 #include <errno.h>
@@ -90,139 +91,12 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ---- syscall numbers (generated table + arch/x86 syscall_32.tbl) ----- */
-
-#define I686_SOCK_NR_SOCKETCALL   102L
-#define I686_SOCK_NR_RECVMMSG     337L
-#define I686_SOCK_NR_SENDMMSG     345L
-#define I686_SOCK_NR_SOCKET       359L
-#define I686_SOCK_NR_SOCKETPAIR   360L
-#define I686_SOCK_NR_BIND         361L
-#define I686_SOCK_NR_CONNECT      362L
-#define I686_SOCK_NR_LISTEN       363L
-#define I686_SOCK_NR_ACCEPT4      364L
-#define I686_SOCK_NR_GETSOCKOPT   365L
-#define I686_SOCK_NR_SETSOCKOPT   366L
-#define I686_SOCK_NR_GETSOCKNAME  367L
-#define I686_SOCK_NR_GETPEERNAME  368L
-#define I686_SOCK_NR_SENDTO       369L
-#define I686_SOCK_NR_SENDMSG      370L
-#define I686_SOCK_NR_RECVFROM     371L
-#define I686_SOCK_NR_RECVMSG      372L
-#define I686_SOCK_NR_SHUTDOWN     373L
-#define I686_SOCK_NR_RECVMMSG_T64 417L
-
-/* ---- socketcall subcall ops (include/uapi/linux/net.h) --------------- */
-
-#define I686_SC_SOCKET      1U
-#define I686_SC_BIND        2U
-#define I686_SC_CONNECT     3U
-#define I686_SC_LISTEN      4U
-#define I686_SC_ACCEPT      5U
-#define I686_SC_GETSOCKNAME 6U
-#define I686_SC_GETPEERNAME 7U
-#define I686_SC_SOCKETPAIR  8U
-#define I686_SC_SEND        9U
-#define I686_SC_RECV        10U
-#define I686_SC_SENDTO      11U
-#define I686_SC_RECVFROM    12U
-#define I686_SC_SHUTDOWN    13U
-#define I686_SC_SETSOCKOPT  14U
-#define I686_SC_GETSOCKOPT  15U
-#define I686_SC_SENDMSG     16U
-#define I686_SC_RECVMSG     17U
-#define I686_SC_ACCEPT4     18U
-#define I686_SC_RECVMMSG    19U
-#define I686_SC_SENDMMSG    20U
-#define I686_SC_MAX         20U
-
 /* Argument word counts per op 0..20 (net/socket.c sys_socketcall nargs,
  * in unsigned-long = u32 words on i386). */
 static const uint8_t s_sc_nargs[I686_SC_MAX + 1U] = {
     0U, 3U, 3U, 3U, 2U, 3U, 3U, 3U, 4U, 4U, 4U,
     6U, 6U, 2U, 5U, 5U, 3U, 3U, 4U, 5U, 4U,
 };
-
-/* ---- ABI constants ---------------------------------------------------- */
-
-/* include/uapi/linux/uio.h; also net/compat.c get_compat_msghdr. */
-#define I686_UIO_MAXIOV 1024U
-
-/* errno numbers are ABI-identical across Linux arches (asm-generic/errno
- * .h); the synthesized ENOSYS below must be the Linux value 38 even when
- * the unit-test host (darwin) renumbers its own <errno.h>. */
-#define I686_ENOSYS 38
-
-/* Guest-side (i386 Linux ABI) constants that differ from or are absent on
- * the unit-test host. */
-#define I686_SOL_SOCKET       1U   /* asm-generic/socket.h SOL_SOCKET */
-#define I686_SO_RCVTIMEO_OLD  20U
-#define I686_SO_SNDTIMEO_OLD  21U
-#define I686_MSG_WAITFORONE   0x10000U /* asm-generic/socket.h */
-
-/* i386 struct cmsghdr: u32 cmsg_len + int level + int type, 4-byte align
- * (CMSG_COMPAT_* in arch/x86/include/asm/compat.h). */
-#define I686_CMSG32_HDR         12U
-#define I686_CMSG32_ALIGN(len)  (((uint32_t)(len) + 3U) & ~3U)
-
-/* Linux uapi CMSG_ALIGN; darwin's headers (unit-test host only) lack it. */
-#ifndef CMSG_ALIGN
-#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1U) & ~(sizeof(size_t) - 1U))
-#endif
-
-#define I686_SOCKADDR_MAX  ((uint32_t)sizeof(struct sockaddr_storage))
-
-/* Stack capacities; larger control/iov marshals fall back to the heap. */
-#define I686_CMSG_STACK   256U
-#define I686_IOV_STACK    16U
-/* Host-side recvmsg control staging: worst-case repack of a guest buffer
- * G needs < 2*G bytes; beyond 4096 we let MSG_CTRUNC speak. */
-#define I686_CMSG_HOST_MAX 4096U
-
-/* i686_mmsghdr_t: i386 struct mmsghdr = 28 B msghdr + u32 msg_len.  The
- * frozen structs header carries the msghdr; the mmsg wrapper is local. */
-typedef struct {
-    i686_msghdr_t msg_hdr;
-    uint32_t      msg_len;
-} i686_mmsghdr_t;
-
-_Static_assert(sizeof(i686_mmsghdr_t) == 32U, "i686_mmsghdr_t 32 bytes");
-_Static_assert(offsetof(i686_mmsghdr_t, msg_len) == 28U, "mmsg msg_len at 28");
-
-/* ---- small helpers ---------------------------------------------------- */
-
-static uint32_t guest_le32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void guest_store_le32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v & 0xFFU);
-    p[1] = (uint8_t)((v >> 8) & 0xFFU);
-    p[2] = (uint8_t)((v >> 16) & 0xFFU);
-    p[3] = (uint8_t)((v >> 24) & 0xFFU);
-}
-
-/* Host call result -> guest convention: value, or -errno. */
-static int64_t sret(int64_t r)
-{
-    return (r < 0) ? -(int64_t)errno : r;
-}
-
-/* [va, va+len) fully inside the 4 GiB guest window without u32 wrap and
- * clear of the low guard page (len 0 needs no backing). */
-static int va_ok(uint32_t va, uint64_t len)
-{
-    if (len == 0U) {
-        return 1;
-    }
-    if (va < 0x1000U) {
-        return 0;
-    }
-    return (va + len <= 0x100000000ULL);
-}
 
 /* darwin is never a runtime host (aarch64 Linux only); the shim exists so
  * the macOS-native unit driver links.  Flags are folded by callers that
@@ -243,171 +117,6 @@ static int hs_accept4(int fd, struct sockaddr *sa, socklen_t *sl, int flags)
     return accept4(fd, sa, sl, flags);
 }
 #endif
-
-/* ---- cmsghdr conversion (i386 <-> host) -------------------------------
- * Non-static: driven directly by tests/unit/test_l2b.c.
- *
- * i686_sock_cmsg32_to_64: walk the guest control buffer (12-byte i386
- * cmsghdr headers, cmsg_len u32, 4-byte alignment) and emit host-layout
- * cmsghdrs.  hbuf == NULL performs a size-only pass (out_hlen receives
- * the exact host size).  Returns -EINVAL for a malformed guest cmsg
- * (cmsg_len < 12 or past the end), 0 otherwise.
- */
-int i686_sock_cmsg32_to_64(const uint8_t *gctl, uint32_t glen, uint8_t *hbuf,
-                           size_t hcap, size_t *out_hlen)
-{
-    uint32_t off32 = 0U;
-    size_t   off64 = 0U;
-
-    if (gctl == NULL || out_hlen == NULL) {
-        return -EINVAL;
-    }
-    while ((uint64_t)off32 + (uint64_t)I686_CMSG32_HDR <= (uint64_t)glen) {
-        uint32_t len32 = guest_le32(gctl + off32);
-        if (len32 < I686_CMSG32_HDR || len32 > glen - off32) {
-            return -EINVAL; /* net/socket.c __sys_sendmsg compat walk */
-        }
-        uint32_t payload = len32 - I686_CMSG32_HDR;
-        size_t   space   = CMSG_SPACE((size_t)payload);
-        if (hbuf != NULL) {
-            if (off64 + space > hcap) {
-                break; /* caller undersized (cannot happen after sizing pass) */
-            }
-            struct cmsghdr *cm = (struct cmsghdr *)(void *)(hbuf + off64);
-            cm->cmsg_len   = CMSG_LEN((size_t)payload);
-            cm->cmsg_level = (int)guest_le32(gctl + off32 + 4U);
-            cm->cmsg_type  = (int)guest_le32(gctl + off32 + 8U);
-            if (payload != 0U) {
-                memcpy(CMSG_DATA(cm), gctl + off32 + I686_CMSG32_HDR,
-                       (size_t)payload);
-            }
-        }
-        off64 += space;
-        off32 += I686_CMSG32_ALIGN(len32);
-    }
-    *out_hlen = off64;
-    return 0;
-}
-
-/*
- * i686_sock_cmsg64_to_32: walk host-layout cmsghdrs and pack them into a
- * guest buffer (12-byte headers, u32 cmsg_len, 4-byte alignment).  A cmsg
- * that no longer fits set MSG_CTRUNC in *out_add_flags; when close_dropped
- * is set the fds of a dropped SCM_RIGHTS cmsg are closed (kernel compat
- * behaviour on truncation).  Malformed host entries stop the walk.
- */
-void i686_sock_cmsg64_to_32(const uint8_t *hctl, size_t hlen, uint8_t *gbuf,
-                            uint32_t gcap, uint32_t *out_glen,
-                            uint32_t *out_add_flags, int close_dropped)
-{
-    uint32_t off32 = 0U;
-    size_t   off64 = 0U;
-
-    if (out_glen != NULL) {
-        *out_glen = 0U;
-    }
-    if (out_add_flags != NULL) {
-        *out_add_flags = 0U;
-    }
-    if (hctl == NULL || gbuf == NULL) {
-        return;
-    }
-    while (off64 + sizeof(struct cmsghdr) <= hlen) {
-        const struct cmsghdr *cm =
-            (const struct cmsghdr *)(const void *)(hctl + off64);
-        size_t clen = (size_t)cm->cmsg_len;
-        if (clen < sizeof(struct cmsghdr) || clen > hlen - off64) {
-            break;
-        }
-        size_t payload = clen - sizeof(struct cmsghdr);
-        if ((uint64_t)I686_CMSG32_HDR + (uint64_t)payload <=
-            (uint64_t)gcap - off32) {
-            uint32_t len32   = I686_CMSG32_HDR + (uint32_t)payload;
-            uint32_t space32 = I686_CMSG32_ALIGN(len32);
-            guest_store_le32(gbuf + off32, len32);
-            guest_store_le32(gbuf + off32 + 4U, (uint32_t)cm->cmsg_level);
-            guest_store_le32(gbuf + off32 + 8U, (uint32_t)cm->cmsg_type);
-            if (payload != 0U) {
-                memcpy(gbuf + off32 + I686_CMSG32_HDR, CMSG_DATA(cm), payload);
-            }
-            off32 += ((uint64_t)off32 + space32 <= (uint64_t)gcap) ? space32
-                                                                   : len32;
-        } else {
-            if (out_add_flags != NULL) {
-                *out_add_flags = (uint32_t)MSG_CTRUNC;
-            }
-            if (close_dropped && cm->cmsg_level == SOL_SOCKET &&
-                cm->cmsg_type == SCM_RIGHTS) {
-                size_t      nfds = payload / sizeof(int);
-                const int  *fds  = (const int *)(const void *)CMSG_DATA(cm);
-                for (size_t i = 0U; i < nfds; i++) {
-                    (void)close(fds[i]);
-                }
-            }
-        }
-        off64 += CMSG_ALIGN(clen);
-    }
-    if (out_glen != NULL) {
-        *out_glen = off32;
-    }
-}
-
-/*
- * i686_sock_translate_iov: walk the guest i686_iovec_t array and build the
- * host iovec[] pointing straight into the window.  iovcnt 0 uses the
- * caller's stack array; above stack_cap a heap array is returned for the
- * caller to free (a32rt translate_guest_iov pattern).  Returns 0 or
- * -errno (EINVAL above UIO_MAXIOV, EFAULT for low/wrapping buffers).
- */
-int i686_sock_translate_iov(i686_ctx_t *ctx, uint32_t iov_va, uint32_t iovcnt,
-                            struct iovec *stack_iov, uint32_t stack_cap,
-                            struct iovec **out_iov)
-{
-    struct iovec *hiov;
-
-    if (out_iov == NULL) {
-        return -EINVAL;
-    }
-    if ((int32_t)iovcnt < 0 || iovcnt > I686_UIO_MAXIOV) {
-        return -EINVAL;
-    }
-    if (iovcnt == 0U) {
-        *out_iov = stack_iov;
-        return 0;
-    }
-    if (!va_ok(iov_va, (uint64_t)iovcnt * (uint64_t)sizeof(i686_iovec_t))) {
-        return -EFAULT;
-    }
-    hiov = stack_iov;
-    if (iovcnt > stack_cap) {
-        hiov = (struct iovec *)calloc((size_t)iovcnt, sizeof(*hiov));
-        if (hiov == NULL) {
-            return -ENOMEM;
-        }
-    }
-    for (uint32_t i = 0U; i < iovcnt; i++) {
-        i686_iovec_t g;
-        memcpy(&g, (const void *)i686_guest_ptr(
-                       ctx, iov_va + i * (uint32_t)sizeof(i686_iovec_t)),
-               sizeof(g));
-        if (g.iov_len != 0U) {
-            if (g.iov_base < 0x1000U ||
-                (uint64_t)g.iov_base + (uint64_t)g.iov_len >
-                    0x100000000ULL) {
-                if (hiov != stack_iov) {
-                    free(hiov);
-                }
-                return -EFAULT;
-            }
-            hiov[i].iov_base = i686_guest_ptr(ctx, g.iov_base);
-        } else {
-            hiov[i].iov_base = NULL;
-        }
-        hiov[i].iov_len = (size_t)g.iov_len;
-    }
-    *out_iov = hiov;
-    return 0;
-}
 
 /* ---- subcall cores (shared by socketcall and direct numbers) ---------- */
 
@@ -678,343 +387,6 @@ static int64_t sock_getsockopt(i686_ctx_t *ctx, uint32_t fd, uint32_t level,
                                : NULL));
 }
 
-/* Build the host msghdr for one sendmsg/recvmsg; returns 0 with *hm, the
- * guest msghdr copy in *gm, and the heap pointers to release, or -errno
- * (callers release iovp/ctlp on failure too — translate_iov frees its own
- * allocations internally).  dir_recv selects the control staging
- * direction. */
-static int msghdr_build(i686_ctx_t *ctx, uint32_t msg_va, int dir_recv,
-                        struct msghdr *hm, i686_msghdr_t *gm,
-                        struct iovec **iovp, uint8_t **ctlp,
-                        uint8_t *stack_ctl, uint32_t stack_ctl_len,
-                        struct iovec *stack_iov, uint32_t stack_iov_len)
-{
-    size_t ctl_len = 0U;
-
-    memset(hm, 0, sizeof(*hm));
-    if (!va_ok(msg_va, (uint64_t)sizeof(*gm)) ||
-        i686_copy_from_guest(ctx, gm, msg_va, sizeof(*gm)) != 0) {
-        return -EFAULT;
-    }
-    if (gm->msg_iovlen > I686_UIO_MAXIOV) {
-        return -EMSGSIZE; /* net/compat.c get_compat_msghdr */
-    }
-    if (!dir_recv && gm->msg_controllen != 0U &&
-        gm->msg_controllen < I686_CMSG32_HDR) {
-        return -EINVAL; /* send-side control shorter than a cmsg header */
-    }
-    hm->msg_flags = (int)gm->msg_flags;
-    if (gm->msg_name != 0U) {
-        uint32_t nlen = (gm->msg_namelen > I686_SOCKADDR_MAX)
-                            ? I686_SOCKADDR_MAX
-                            : gm->msg_namelen;
-        if (!va_ok(gm->msg_name, nlen)) {
-            return -EFAULT;
-        }
-        hm->msg_name    = i686_guest_ptr(ctx, gm->msg_name);
-        hm->msg_namelen = gm->msg_namelen;
-    } else if (dir_recv) {
-        hm->msg_namelen = 0U;
-    }
-    if (gm->msg_control != 0U && gm->msg_controllen != 0U) {
-        if (!va_ok(gm->msg_control, gm->msg_controllen)) {
-            return -EFAULT;
-        }
-        if (!dir_recv) {
-            /* exact sizing pass, then build */
-            const uint8_t *gctl =
-                (const uint8_t *)i686_guest_ptr(ctx, gm->msg_control);
-            int rc = i686_sock_cmsg32_to_64(gctl, gm->msg_controllen, NULL, 0U,
-                                            &ctl_len);
-            if (rc != 0) {
-                return rc;
-            }
-            if (ctl_len != 0U) {
-                *ctlp = (ctl_len <= stack_ctl_len) ? stack_ctl
-                                                   : (uint8_t *)malloc(ctl_len);
-                if (*ctlp == NULL) {
-                    return -ENOMEM;
-                }
-                rc = i686_sock_cmsg32_to_64(gctl, gm->msg_controllen, *ctlp,
-                                            ctl_len, &ctl_len);
-                if (rc != 0) {
-                    if (*ctlp != stack_ctl) {
-                        free(*ctlp);
-                        *ctlp = NULL;
-                    }
-                    return rc;
-                }
-                hm->msg_control    = *ctlp;
-                hm->msg_controllen = ctl_len;
-            }
-        } else {
-            /* host staging: worst-case repack of a G-byte guest buffer
-             * stays under 2*G bytes; cap and let MSG_CTRUNC speak. */
-            uint64_t cap = (uint64_t)gm->msg_controllen * 2U;
-            if (cap > I686_CMSG_HOST_MAX) {
-                cap = I686_CMSG_HOST_MAX;
-            }
-            *ctlp = (cap <= stack_ctl_len) ? stack_ctl
-                                           : (uint8_t *)malloc((size_t)cap);
-            if (*ctlp == NULL) {
-                return -ENOMEM;
-            }
-            hm->msg_control    = *ctlp;
-            hm->msg_controllen = (size_t)cap;
-        }
-    }
-    int rc = i686_sock_translate_iov(ctx, gm->msg_iov, gm->msg_iovlen,
-                                     stack_iov, stack_iov_len, iovp);
-    if (rc != 0) {
-        return rc;
-    }
-    hm->msg_iov    = (gm->msg_iovlen != 0U) ? *iovp : NULL;
-    hm->msg_iovlen = (size_t)gm->msg_iovlen;
-    return 0;
-}
-
-static int64_t sock_sendmsg(i686_ctx_t *ctx, uint32_t fd, uint32_t msg_va,
-                            uint32_t flags)
-{
-    struct msghdr  hm;
-    i686_msghdr_t  gm;
-    struct iovec   stack_iov[I686_IOV_STACK];
-    _Alignas(8) uint8_t stack_ctl[I686_CMSG_STACK];
-    struct iovec  *hiov = NULL;
-    uint8_t       *hctl = NULL;
-    int64_t        r;
-    int            rc;
-
-    rc = msghdr_build(ctx, msg_va, 0, &hm, &gm, &hiov, &hctl, stack_ctl,
-                      (uint32_t)sizeof(stack_ctl), stack_iov,
-                      (uint32_t)(sizeof(stack_iov) / sizeof(stack_iov[0])));
-    if (rc != 0) {
-        if (hctl != NULL && hctl != stack_ctl) {
-            free(hctl); /* staging leftovers from a later-stage failure */
-        }
-        return (int64_t)rc;
-    }
-    r = sendmsg((int)fd, &hm, (int)flags);
-    if (r < 0) {
-        r = -(int64_t)errno;
-    }
-    if (hiov != NULL && hiov != stack_iov) {
-        free(hiov);
-    }
-    if (hctl != NULL && hctl != stack_ctl) {
-        free(hctl);
-    }
-    return r;
-}
-
-static int64_t sock_recvmsg(i686_ctx_t *ctx, uint32_t fd, uint32_t msg_va,
-                            uint32_t flags)
-{
-    struct msghdr  hm;
-    i686_msghdr_t  gm;
-    struct iovec   stack_iov[I686_IOV_STACK];
-    _Alignas(8) uint8_t stack_ctl[I686_CMSG_STACK];
-    struct iovec  *hiov = NULL;
-    uint8_t       *hctl = NULL;
-    int64_t        r;
-    int            rc;
-
-    rc = msghdr_build(ctx, msg_va, 1, &hm, &gm, &hiov, &hctl, stack_ctl,
-                      (uint32_t)sizeof(stack_ctl), stack_iov,
-                      (uint32_t)(sizeof(stack_iov) / sizeof(stack_iov[0])));
-    if (rc != 0) {
-        if (hctl != NULL && hctl != stack_ctl) {
-            free(hctl); /* sizing-pass leftovers */
-        }
-        return rc;
-    }
-    r = recvmsg((int)fd, &hm, (int)flags);
-    if (r < 0) {
-        rc = -(int)errno;
-        goto out_free;
-    }
-    /* write back the fields the kernel updates (compat __sys_recvmsg
-     * copies namelen/controllen/flags out) */
-    uint32_t gcap = gm.msg_controllen;
-    gm.msg_namelen    = (uint32_t)hm.msg_namelen;
-    gm.msg_flags      = (uint32_t)hm.msg_flags;
-    gm.msg_controllen = 0U;
-    if (hctl != NULL) {
-        uint32_t glen = 0U;
-        uint32_t addf = 0U;
-        i686_sock_cmsg64_to_32(hctl, hm.msg_controllen,
-                               (uint8_t *)i686_guest_ptr(ctx, gm.msg_control),
-                               gcap, &glen, &addf, 1);
-        gm.msg_controllen = glen;
-        gm.msg_flags |= addf;
-    }
-    if (i686_copy_to_guest(ctx, msg_va, &gm, sizeof(gm)) != 0) {
-        rc = -EFAULT;
-        goto out_free;
-    }
-    if (hiov != NULL && hiov != stack_iov) {
-        free(hiov);
-    }
-    if (hctl != NULL && hctl != stack_ctl) {
-        free(hctl);
-    }
-    return r;
-out_free:
-    if (hiov != NULL && hiov != stack_iov) {
-        free(hiov);
-    }
-    if (hctl != NULL && hctl != stack_ctl) {
-        free(hctl);
-    }
-    return (int64_t)rc;
-}
-
-/* sendmmsg: loop the per-message sendmsg conversion (host mmsghdr layout
- * differs); vlen is clamped to UIO_MAXIOV (net/socket.c __sys_sendmmsg).
- * Returns the number of messages sent, or the (first) error. */
-static int64_t sock_sendmmsg(i686_ctx_t *ctx, uint32_t fd, uint32_t vec_va,
-                             uint32_t vlen, uint32_t flags)
-{
-    if (vlen > I686_UIO_MAXIOV) {
-        vlen = I686_UIO_MAXIOV;
-    }
-    if (vlen == 0U) {
-        return 0;
-    }
-    if (!va_ok(vec_va, (uint64_t)vlen * (uint64_t)sizeof(i686_mmsghdr_t))) {
-        return -EFAULT;
-    }
-    uint32_t n = 0U;
-    for (uint32_t i = 0U; i < vlen; i++) {
-        uint32_t va = vec_va + i * (uint32_t)sizeof(i686_mmsghdr_t);
-        int64_t  r  = sock_sendmsg(ctx, fd, va, flags);
-        if (r < 0) {
-            return (n == 0U) ? r : (int64_t)n;
-        }
-        uint32_t len32 = (uint32_t)r;
-        (void)i686_copy_to_guest(
-            ctx, va + (uint32_t)offsetof(i686_mmsghdr_t, msg_len), &len32,
-            sizeof(len32));
-        n++;
-    }
-    return (int64_t)n;
-}
-
-/* recvmmsg: loop the per-message recvmsg conversion.  The overall timeout
- * budget (old_timespec32 for 102/19 and 337, __kernel_timespec for 417)
- * is emulated with a temporary host SO_RCVTIMEO per message and a drain
- * pass once the budget is spent; MSG_WAITFORONE switches later messages
- * to non-blocking, as the kernel does. */
-static int64_t sock_recvmmsg(i686_ctx_t *ctx, uint32_t fd, uint32_t vec_va,
-                             uint32_t vlen, uint32_t flags,
-                             uint32_t timeout_va, int time64)
-{
-    struct timespec deadline;
-    int             have_deadline = 0;
-    int             saved_valid   = 0;
-    struct timeval  saved_to;
-    uint32_t        n    = 0U;
-    int64_t         last = 0U;
-
-    if (timeout_va != 0U) {
-        int64_t sec;
-        int64_t nsec;
-        if (time64) {
-            /* struct __kernel_timespec {s64, s64}: layout-identical */
-            uint8_t raw[16];
-            if (!va_ok(timeout_va, sizeof(raw)) ||
-                i686_copy_from_guest(ctx, raw, timeout_va, sizeof(raw)) != 0) {
-                return -EFAULT;
-            }
-            sec  = (int64_t)guest_le32(raw) | ((int64_t)guest_le32(raw + 4U) << 32);
-            nsec = (int64_t)guest_le32(raw + 8U) |
-                   ((int64_t)guest_le32(raw + 12U) << 32);
-        } else {
-            i686_timespec_t g;
-            if (!va_ok(timeout_va, sizeof(g)) ||
-                i686_copy_from_guest(ctx, &g, timeout_va, sizeof(g)) != 0) {
-                return -EFAULT;
-            }
-            sec  = g.tv_sec;
-            nsec = g.tv_nsec;
-        }
-        if (nsec < 0 || nsec >= 1000000000LL) {
-            return -EINVAL; /* kernel get_old_timespec32 style validation */
-        }
-        if (sec < 0) {
-            sec = 0; /* treat expired budget as zero */
-        }
-        struct timespec now;
-        (void)clock_gettime(CLOCK_MONOTONIC, &now);
-        deadline.tv_sec  = now.tv_sec + (time_t)sec;
-        deadline.tv_nsec = now.tv_nsec + nsec;
-        if (deadline.tv_nsec >= 1000000000L) {
-            deadline.tv_nsec -= 1000000000L;
-            deadline.tv_sec++;
-        }
-        have_deadline = 1;
-        socklen_t sl = (socklen_t)sizeof(saved_to);
-        saved_valid =
-            (getsockopt((int)fd, SOL_SOCKET, SO_RCVTIMEO, &saved_to, &sl) == 0);
-    }
-    if (vlen > I686_UIO_MAXIOV) {
-        vlen = I686_UIO_MAXIOV;
-    }
-    if (vlen == 0U) {
-        return 0;
-    }
-    if (!va_ok(vec_va, (uint64_t)vlen * (uint64_t)sizeof(i686_mmsghdr_t))) {
-        return -EFAULT;
-    }
-    for (uint32_t i = 0U; i < vlen; i++) {
-        uint32_t va = vec_va + i * (uint32_t)sizeof(i686_mmsghdr_t);
-        uint32_t fl = flags & ~I686_MSG_WAITFORONE;
-        int      set_to = 0;
-
-        if (i > 0U && (flags & I686_MSG_WAITFORONE) != 0U) {
-            fl |= (uint32_t)MSG_DONTWAIT;
-        }
-        if (have_deadline) {
-            struct timespec now;
-            (void)clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t rem_s  = (int64_t)(deadline.tv_sec - now.tv_sec);
-            int64_t rem_ns = (int64_t)(deadline.tv_nsec - now.tv_nsec);
-            if (rem_ns < 0) {
-                rem_ns += 1000000000LL;
-                rem_s--;
-            }
-            if (rem_s < 0 || (rem_s == 0 && rem_ns < 1000)) {
-                fl |= (uint32_t)MSG_DONTWAIT; /* budget spent: drain only */
-            } else if (saved_valid) {
-                struct timeval rt;
-                rt.tv_sec  = (time_t)rem_s;
-                rt.tv_usec = (suseconds_t)(rem_ns / 1000LL);
-                (void)setsockopt((int)fd, SOL_SOCKET, SO_RCVTIMEO, &rt,
-                                 (socklen_t)sizeof(rt));
-                set_to = 1;
-            }
-        }
-        int64_t r = sock_recvmsg(ctx, fd, va, fl);
-        if (set_to) {
-            (void)setsockopt((int)fd, SOL_SOCKET, SO_RCVTIMEO, &saved_to,
-                             (socklen_t)sizeof(saved_to));
-        }
-        if (r < 0) {
-            last = r;
-            break;
-        }
-        uint32_t len32 = (uint32_t)r;
-        (void)i686_copy_to_guest(
-            ctx, va + (uint32_t)offsetof(i686_mmsghdr_t, msg_len), &len32,
-            sizeof(len32));
-        n++;
-    }
-    if (n == 0U) {
-        return last; /* vlen > 0, so the loop ran at least once */
-    }
-    return (int64_t)n;
-}
-
 /* ---- registry adapters ------------------------------------------------ */
 
 static int64_t r_socketcall(i686_ctx_t *ctx)
@@ -1065,15 +437,15 @@ static int64_t r_socketcall(i686_ctx_t *ctx)
     case I686_SC_GETSOCKOPT:
         return sock_getsockopt(ctx, a[0], a[1], a[2], a[3], a[4]);
     case I686_SC_SENDMSG:
-        return sock_sendmsg(ctx, a[0], a[1], a[2]);
+        return i686_sock_sendmsg(ctx, a[0], a[1], a[2]);
     case I686_SC_RECVMSG:
-        return sock_recvmsg(ctx, a[0], a[1], a[2]);
+        return i686_sock_recvmsg(ctx, a[0], a[1], a[2]);
     case I686_SC_ACCEPT4:
         return sock_accept4(ctx, a[0], a[1], a[2], a[3]);
     case I686_SC_RECVMMSG:
-        return sock_recvmmsg(ctx, a[0], a[1], a[2], a[3], a[4], 0);
+        return i686_sock_recvmmsg(ctx, a[0], a[1], a[2], a[3], a[4], 0);
     case I686_SC_SENDMMSG:
-        return sock_sendmmsg(ctx, a[0], a[1], a[2], a[3]);
+        return i686_sock_sendmmsg(ctx, a[0], a[1], a[2], a[3]);
     default:
         return -(int64_t)I686_ENOSYS;
     }
@@ -1150,8 +522,8 @@ static int64_t r_sendto(i686_ctx_t *ctx)
 
 static int64_t r_sendmsg(i686_ctx_t *ctx)
 {
-    return sock_sendmsg(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                        ctx->gpr[I686_REG_EDX]);
+    return i686_sock_sendmsg(ctx, ctx->gpr[I686_REG_EBX],
+                             ctx->gpr[I686_REG_ECX], ctx->gpr[I686_REG_EDX]);
 }
 
 static int64_t r_recvfrom(i686_ctx_t *ctx)
@@ -1163,8 +535,8 @@ static int64_t r_recvfrom(i686_ctx_t *ctx)
 
 static int64_t r_recvmsg(i686_ctx_t *ctx)
 {
-    return sock_recvmsg(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                        ctx->gpr[I686_REG_EDX]);
+    return i686_sock_recvmsg(ctx, ctx->gpr[I686_REG_EBX],
+                             ctx->gpr[I686_REG_ECX], ctx->gpr[I686_REG_EDX]);
 }
 
 static int64_t r_shutdown(i686_ctx_t *ctx)
@@ -1174,22 +546,23 @@ static int64_t r_shutdown(i686_ctx_t *ctx)
 
 static int64_t r_recvmmsg(i686_ctx_t *ctx)
 {
-    return sock_recvmmsg(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                         ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
-                         ctx->gpr[I686_REG_EDI], 0);
+    return i686_sock_recvmmsg(ctx, ctx->gpr[I686_REG_EBX],
+                              ctx->gpr[I686_REG_ECX], ctx->gpr[I686_REG_EDX],
+                              ctx->gpr[I686_REG_ESI], ctx->gpr[I686_REG_EDI], 0);
 }
 
 static int64_t r_sendmmsg(i686_ctx_t *ctx)
 {
-    return sock_sendmmsg(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                         ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI]);
+    return i686_sock_sendmmsg(ctx, ctx->gpr[I686_REG_EBX],
+                              ctx->gpr[I686_REG_ECX], ctx->gpr[I686_REG_EDX],
+                              ctx->gpr[I686_REG_ESI]);
 }
 
 static int64_t r_recvmmsg_time64(i686_ctx_t *ctx)
 {
-    return sock_recvmmsg(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                         ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
-                         ctx->gpr[I686_REG_EDI], 1);
+    return i686_sock_recvmmsg(ctx, ctx->gpr[I686_REG_EBX],
+                              ctx->gpr[I686_REG_ECX], ctx->gpr[I686_REG_EDX],
+                              ctx->gpr[I686_REG_ESI], ctx->gpr[I686_REG_EDI], 1);
 }
 
 void i686_syscalls_sock_init(void)

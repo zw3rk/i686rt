@@ -343,6 +343,9 @@ static int robust_fetch_u32(i686_ctx_t *ctx, uint32_t va, uint32_t *out)
 static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
                                 uint32_t tid, int pending)
 {
+    extern int i686_subpage_range_ok(const i686_ctx_t *, uint32_t, uint64_t, uint8_t);
+    extern int i686_vm32_pin_page(i686_ctx_t *, uint32_t);
+    extern void i686_vm32_unpin_page(i686_ctx_t *, uint32_t);
     volatile void *hp;
     uint32_t uval;
     int tries;
@@ -353,6 +356,11 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
     if ((uval & FUTEX_TID_MASK_) != tid) {
         return; /* not ours (or already recovered) */
     }
+    if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u &&
+        i686_subpage_range_ok(ctx, futex_va, 4u, 0x03u) == 0) {
+        return;
+    }
+    (void)i686_vm32_pin_page(ctx, futex_va);
     hp = i686_guest_ptr(ctx, futex_va);
     for (tries = 0; tries < 8; tries++) {
         uint32_t cur = uval;
@@ -375,6 +383,7 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
 #endif
         }
     }
+    i686_vm32_unpin_page(ctx, futex_va);
 }
 
 static void robust_exit_walk(i686_ctx_t *ctx, uint32_t tid)
@@ -519,6 +528,9 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
          * is blocked in the kernel) so the transient open is safe. */
         extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t, uint32_t);
         extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
+        extern void i686_vm32_subpage_lock(void);
+        extern void i686_vm32_subpage_unlock(void);
+        i686_vm32_subpage_lock();
         {
             uint32_t hps = (ctx->vm_host_page != 0u) ?
                 ctx->vm_host_page : 4096u;
@@ -528,7 +540,7 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
             s_clear_done = 1;
         }
         {
-            /* Wake the joiner.  musl waits private (FUTEX_WAIT|PRIVATE)
+            /* Wake the joiner.  musl waits private (FUTEX_WAKE|PRIVATE)
              * but glibc's joiner waits SHARED (observed C10:
              * WAIT_BITSET|CLOCK_REALTIME without the private bit), and
              * the two hash buckets do not overlap — the private-only
@@ -555,6 +567,7 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
             uint32_t cpage = ctx->clear_child_tid & ~(hps - 1u);
             (void)i686_vm32_widen_prot(ctx, cpage, cpage + hps);
         }
+        i686_vm32_subpage_unlock();
         ctx->clear_child_tid = 0U;
     }
 }
@@ -684,6 +697,12 @@ static int64_t r_clone(i686_ctx_t *ctx)
     ca->ctx = child;
     ca->tid = r_val;
     i686_thread_registry_add(child, r_val);
+#ifndef I686RT_NO_DBT
+    {
+        extern void i686_dbt_enable_tso(void);
+        i686_dbt_enable_tso();
+    }
+#endif
     {
         int crc;
         crc = pthread_create(&th, NULL, thread_entry, ca);

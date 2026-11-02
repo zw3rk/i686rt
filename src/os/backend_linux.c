@@ -70,14 +70,7 @@ int rt_host_is_hyper_linux(void)
 
 size_t rt_host_page_size(void)
 {
-    static size_t cached;
-    long v;
-    if (cached != 0u) {
-        return cached;
-    }
-    v = sysconf(_SC_PAGESIZE);
-    cached = (v > 0) ? (size_t)v : 4096u;
-    return cached;
+    return rt_host_page_size_query(4096u);
 }
 
 int rt_host_map_anon(void *hint_addr, size_t len, int linux_prot, int fixed,

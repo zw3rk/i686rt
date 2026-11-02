@@ -544,12 +544,6 @@ int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr,
         atomic_store(&ws->ulock_wait_addr, 0u);
     }
     if (rc == 0) {
-        /* Value mismatch and wake share rc 0: re-check below. */
-        if (atomic_load(pinned_host_uaddr) != host_endian_val &&
-            have_timeout) {
-            /* Timed wait that never slept still reports spurious wakeup
-             * as success; callers re-check the value per the futex idiom. */
-        }
         if (ws != NULL && atomic_load(&ws->sig_seq) != expected_seq) {
             return -EINTR;
         }

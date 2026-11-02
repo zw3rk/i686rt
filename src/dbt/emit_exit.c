@@ -22,10 +22,13 @@
  * prefix wins, else SS for BP-based EAs, else DS.  Clobbers w21..w22.
  */
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "dbt/emit.h"
+
+_Atomic uint32_t g_i686_tso_enabled = 0U;
 
 /* STP Wt1, Wt2, [Xn, #imm7*4] — 32-bit pair, unsigned offset form. */
 static void emit_stp_w(a64_buf_t *b, unsigned rt1, unsigned rt2, unsigned rn_x,
@@ -43,6 +46,9 @@ void i686_emit_begin(i686_emit_ctx_t *e, i686_ctx_t *ctx, uint8_t *code,
     e->buf.guest_start_pc = guest_eip;
     e->ctx = ctx;
     e->guest_eip = guest_eip;
+    e->insn_pc = guest_eip;
+    e->tso = (atomic_load_explicit(&g_i686_tso_enabled,
+                                   memory_order_relaxed) != 0U);
     e->block_open = true;
 }
 
