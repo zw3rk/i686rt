@@ -86,16 +86,78 @@ static long ret_guest_u32(uint32_t v)
 
 static long sys_read(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
+    extern int i686_subpage_range_ok(const i686_ctx_t *, uint32_t, uint64_t, uint8_t);
     if (count > 0U && buf_va < 0x1000U) {
         return -EFAULT;
+    }
+    if (count > 0U && ctx != NULL && ctx->vm_regime == I686_VM_REGIME_A2 &&
+        ctx->vm_host_page > 4096U) {
+        uint8_t sbuf[4096];
+        uint8_t *tmp;
+        ssize_t n;
+        int rc;
+        if (!i686_subpage_range_ok(ctx, buf_va, count, 0x02u)) {
+            return -EFAULT;
+        }
+        tmp = (count <= sizeof(sbuf)) ? sbuf : (uint8_t *)malloc(count);
+        if (tmp == NULL) {
+            return -ENOMEM;
+        }
+        n = read((int)fd, tmp, (size_t)count);
+        if (n < 0) {
+            long err = -(long)errno;
+            if (tmp != sbuf) {
+                free(tmp);
+            }
+            return err;
+        }
+        rc = (n > 0) ? i686_copy_to_guest(ctx, buf_va, tmp, (size_t)n) : 0;
+        if (tmp != sbuf) {
+            free(tmp);
+        }
+        return (rc != 0) ? (long)rc : (long)n;
     }
     return host_ret(read((int)fd, i686_guest_ptr(ctx, buf_va), (size_t)count));
 }
 
 static long sys_write(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
+    extern int i686_subpage_range_ok(const i686_ctx_t *, uint32_t, uint64_t, uint8_t);
     if (count > 0U && buf_va < 0x1000U) {
         return -EFAULT;
+    }
+    if (count > 0U && ctx != NULL && ctx->vm_regime == I686_VM_REGIME_A2 &&
+        ctx->vm_host_page > 4096U) {
+        uint8_t sbuf[4096];
+        uint8_t *tmp;
+        ssize_t n;
+        int rc;
+        if (!i686_subpage_range_ok(ctx, buf_va, count, 0x01u)) {
+            return -EFAULT;
+        }
+        tmp = (count <= sizeof(sbuf)) ? sbuf : (uint8_t *)malloc(count);
+        if (tmp == NULL) {
+            return -ENOMEM;
+        }
+        rc = i686_copy_from_guest(ctx, tmp, buf_va, (size_t)count);
+        if (rc != 0) {
+            if (tmp != sbuf) {
+                free(tmp);
+            }
+            return (long)rc;
+        }
+        n = write((int)fd, tmp, (size_t)count);
+        if (n < 0) {
+            long err = -(long)errno;
+            if (tmp != sbuf) {
+                free(tmp);
+            }
+            return err;
+        }
+        if (tmp != sbuf) {
+            free(tmp);
+        }
+        return (long)n;
     }
     return host_ret(write((int)fd, i686_guest_ptr(ctx, buf_va), (size_t)count));
 }

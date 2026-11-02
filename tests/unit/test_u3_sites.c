@@ -170,6 +170,31 @@ static void t_regime_file(void)
     CHECK((i686_vm_file_flags(0x08048000u) & 0x01u) != 0u, "flag sticks");
     i686_vm_file_flags_clear(0x08048000u, 4096u, 0x01u);
     CHECK((i686_vm_file_flags(0x08048000u) & 0x01u) == 0u, "flag clears");
+    {
+        int pfd[2] = { -1, -1 };
+        int out_fd = -1;
+        uint64_t out_off = 0u;
+        uint8_t out_kind = 0u;
+        CHECK(pipe(pfd) == 0, "pipe for file map test");
+        CHECK(i686_vm_file_track_map(pfd[0], 0x40000000u, 3u * 4096u, 4096u,
+                                     I686_BACKING_SHARED_FILE) == 0,
+              "track file map succeeds");
+        (void)close(pfd[0]);
+        (void)close(pfd[1]);
+        /* Interior hole split (I686-R2-7) + owned_fd retention (I686-R2-6). */
+        CHECK(i686_vm_file_untrack_map(0x40001000u, 4096u) == 0,
+              "interior hole split succeeds");
+        CHECK(i686_vm_file_lookup_map(0x40000000u, &out_fd, &out_off,
+                                      &out_kind) == 0 &&
+              out_fd >= 0 && out_fd != pfd[0] && out_off == 4096u &&
+              out_kind == I686_BACKING_SHARED_FILE,
+              "prefix retained after interior hole split");
+        CHECK(i686_vm_file_lookup_map(0x40002000u, &out_fd, &out_off,
+                                      &out_kind) == 0 &&
+              out_fd >= 0 && out_fd != pfd[0] && out_off == 12288u &&
+              out_kind == I686_BACKING_SHARED_FILE,
+              "suffix retained with adjusted file_off after hole split");
+    }
     i686_vm_file_fini();
 }
 

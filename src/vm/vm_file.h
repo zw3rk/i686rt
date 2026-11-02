@@ -88,7 +88,7 @@ uint32_t i686_vm_file_shrink_cut(uint32_t map_start, size_t map_len,
  * fixed registry is full (best effort: the hooks then skip the map). */
 int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
                            uint64_t file_offset, uint8_t kind);
-void i686_vm_file_untrack_map(uint32_t gva, size_t len);
+int i686_vm_file_untrack_map(uint32_t gva, size_t len);
 int i686_vm_file_lookup_map(uint32_t gva, int *out_fd,
                             uint64_t *out_file_offset, uint8_t *out_kind);
 

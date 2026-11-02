@@ -76,13 +76,13 @@ static int s_copy_fault_page(i686_ctx_t *ctx, uint32_t *out_page)
 }
 
 typedef void (*copy_op_fn)(void);
+static __thread uint32_t s_opened[64];
+
 static int s_copy_tolerant(i686_ctx_t *ctx, uint32_t va, copy_op_fn copy_op)
 {
     sigjmp_buf *outer = i686_fault_save();
     (void)va;
-    if (outer == NULL &&
-        (ctx == NULL || ctx->vm_regime != I686_VM_REGIME_A2 ||
-         ctx->vm_host_page <= 4096u)) {
+    if (ctx == NULL && outer == NULL) {
         copy_op();
         return 0;
     }
@@ -91,7 +91,6 @@ static int s_copy_tolerant(i686_ctx_t *ctx, uint32_t va, copy_op_fn copy_op)
     }
     {
         sigjmp_buf inner;
-        uint32_t opened[64];
         volatile int tries = 0;
         volatile int locked = 0;
         volatile uint32_t healed = 0xFFFFFFFFu;
@@ -103,7 +102,7 @@ static int s_copy_tolerant(i686_ctx_t *ctx, uint32_t va, copy_op_fn copy_op)
             if (tries >= 64 || s_copy_fault_page(ctx, &page) != 0 ||
                 page == healed) {
                 for (k = 0; k < tries; k++) {
-                    (void)i686_vm32_widen_prot(ctx, opened[k], opened[k] + hps);
+                    (void)i686_vm32_widen_prot(ctx, s_opened[k], s_opened[k] + hps);
                 }
                 if (locked) {
                     i686_vm32_subpage_unlock();
@@ -118,11 +117,11 @@ static int s_copy_tolerant(i686_ctx_t *ctx, uint32_t va, copy_op_fn copy_op)
                 locked = 1;
             }
             healed = page;
-            opened[tries] = page;
+            s_opened[tries] = page;
             tries++;
             if (i686_vm32_union_prot(ctx, page, page + hps) != 0) {
                 for (k = 0; k < tries; k++) {
-                    (void)i686_vm32_widen_prot(ctx, opened[k], opened[k] + hps);
+                    (void)i686_vm32_widen_prot(ctx, s_opened[k], s_opened[k] + hps);
                 }
                 i686_vm32_subpage_unlock();
                 if (outer != NULL) {
@@ -134,7 +133,7 @@ static int s_copy_tolerant(i686_ctx_t *ctx, uint32_t va, copy_op_fn copy_op)
             copy_op();
             i686_fault_arm(outer);
             for (k = 0; k < tries; k++) {
-                (void)i686_vm32_widen_prot(ctx, opened[k], opened[k] + hps);
+                (void)i686_vm32_widen_prot(ctx, s_opened[k], s_opened[k] + hps);
             }
             i686_vm32_subpage_unlock();
             return 0;
@@ -172,8 +171,7 @@ int i686_copy_from_guest(i686_ctx_t *ctx, void *dst, uint32_t va, size_t len)
     s_copy_args.len = len;
     s_copy_args.need_prot = 0x01u;
     s_copy_args.is_cstr = 0;
-    s_copy_tolerant(ctx, va, s_copy_from_run);
-    return 0;
+    return s_copy_tolerant(ctx, va, s_copy_from_run);
 }
 
 int i686_copy_to_guest(i686_ctx_t *ctx, uint32_t va, const void *src, size_t len)
@@ -190,8 +188,7 @@ int i686_copy_to_guest(i686_ctx_t *ctx, uint32_t va, const void *src, size_t len
     s_copy_args.len = len;
     s_copy_args.need_prot = 0x02u;
     s_copy_args.is_cstr = 0;
-    s_copy_tolerant(ctx, va, s_copy_to_run);
-    return 0;
+    return s_copy_tolerant(ctx, va, s_copy_to_run);
 }
 
 static __thread int s_fetch_rc;

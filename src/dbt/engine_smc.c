@@ -50,6 +50,11 @@ static int smc_page_marked(uint32_t guest_page)
                                  memory_order_acquire) & mask) != 0U;
 }
 
+int i686_dbt_smc_page_marked(uint32_t guest_page)
+{
+    return smc_page_marked(guest_page);
+}
+
 static void smc_page_mark(uint32_t guest_page)
 {
     uint32_t idx = guest_page / SMC_PAGE;
@@ -132,8 +137,10 @@ static void smc_unprotect_host(i686_ctx_t *ctx, uint32_t hbase, uint32_t h)
     }
 }
 
-/* Called after a block compiled from eip: write-protect its source host page
- * so stores into a code page trap into i686_dbt_smc_write_fault. */
+/* Called when compiling a block from eip: write-protect its source host page
+ * so stores into a code page trap into i686_dbt_smc_write_fault.
+ * On Regime A2 (16K/64K host pages), never widen any PROT_NONE/unmapped
+ * neighbor 4 KiB sub-page to PROT_READ (I686-R2-2). */
 void smc_protect(i686_ctx_t *ctx, uint32_t eip)
 {
     uint32_t h = smc_host_page(ctx);
@@ -141,15 +148,13 @@ void smc_protect(i686_ctx_t *ctx, uint32_t eip)
     uint32_t off;
 
     for (off = 0U; off < h; off += SMC_PAGE) {
-        if (smc_page_marked(hbase + off)) {
-            return;
-        }
+        smc_page_mark(hbase + off);
     }
-    if (mprotect(i686_guest_ptr(ctx, hbase), (size_t)h, PROT_READ) == 0) {
-        for (off = 0U; off < h; off += SMC_PAGE) {
-            smc_page_mark(hbase + off);
-        }
+    if (ctx != NULL && ctx->vm_regime == I686_VM_REGIME_A2 && h > SMC_PAGE) {
+        (void)i686_vm32_widen_prot(ctx, hbase, hbase + h);
+        return;
     }
+    (void)mprotect(i686_guest_ptr(ctx, hbase), (size_t)h, PROT_READ);
 }
 
 static void smc_sites_clear_span(uint32_t hbase, uint32_t h)
@@ -317,6 +322,19 @@ int i686_dbt_smc_write_fault(uint64_t host_addr)
     hbase = page & ~(h - 1U);
     smc_unprotect_host(g_dbt_run_ctx, hbase, h);
     smc_drop_host(g_dbt_run_ctx, hbase, h);
+    if (g_dbt_run_ctx != NULL &&
+        g_dbt_run_ctx->vm_regime == I686_VM_REGIME_A2 && h > SMC_PAGE) {
+        uint32_t off;
+        for (off = 0U; off < h; off += SMC_PAGE) {
+            if ((i686_vm_file_flags(hbase + off) & 0x80u) == 0u ||
+                (i686_vm_file_prot(hbase + off) & 0x03u) != 0x03u) {
+                /* Host page stays restricted because a sibling 4 KiB
+                 * sub-page is not RW; let the checkpointed fault handler
+                 * single-step the write via i686_spurious_emulate. */
+                return 0;
+            }
+        }
+    }
     return 1;
 }
 

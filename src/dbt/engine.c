@@ -168,10 +168,14 @@ static void dbt_sync_thread_cache(i686_ctx_t *ctx)
     } else {
         for (i = 0U; i < DBT_HT_SIZE; i++) {
             if (g_dbt_ht[i].len != 0U) {
-                uint32_t vpn = g_dbt_ht[i].eip >> 12U;
-                uint32_t pgen = atomic_load_explicit(&g_dbt_page_gen[vpn],
-                                                     memory_order_acquire);
-                if (pgen != g_dbt_ht[i].page_gen) {
+                uint32_t vpn0 = g_dbt_ht[i].eip >> 12U;
+                uint32_t vpn1 = (vpn0 + 1U) & 0xFFFFFU;
+                uint32_t pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
+                                                      memory_order_acquire);
+                uint32_t pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
+                                                      memory_order_acquire);
+                if (pgen0 != g_dbt_ht[i].page_gen ||
+                    pgen1 != g_dbt_ht[i].page_gen1) {
                     dbt_sites_clear_hash((uint32_t)i);
                     g_dbt_ht[i].eip = 0xFFFFFFFFU;
                     dbt_graveyard_push(g_dbt_ht[i].code, g_dbt_ht[i].cap);
@@ -349,16 +353,22 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
 {
     dbt_entry_t *e;
     size_t cap = 8192U;
+    uint32_t vpn0 = eip >> 12U;
+    uint32_t vpn1 = (vpn0 + 1U) & 0xFFFFFU;
     uint32_t cur_epoch;
-    uint32_t cur_pgen;
+    uint32_t cur_pgen0;
+    uint32_t cur_pgen1;
 
     dbt_sync_thread_cache(ctx);
     e = &g_dbt_ht[dbt_hash(eip)];
     cur_epoch = atomic_load_explicit(&g_dbt_cache_epoch, memory_order_acquire);
-    cur_pgen = atomic_load_explicit(&g_dbt_page_gen[eip >> 12U],
-                                    memory_order_acquire);
+    cur_pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
+                                     memory_order_acquire);
+    cur_pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
+                                     memory_order_acquire);
     if (e->len != 0U) {
-        if (e->eip == eip && e->page_gen == cur_pgen) {
+        if (e->eip == eip && e->page_gen == cur_pgen0 &&
+            e->page_gen1 == cur_pgen1) {
             i686_ibtc_entry_t *slot = &ctx->ibtc[i686_ibtc_hash(eip)];
             if (slot->key != eip || slot->epoch != cur_epoch) {
                 slot->key = eip;
@@ -386,21 +396,88 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
 #endif
         size_t len;
         size_t ring_before;
+        uint32_t pre_pgen0;
+        uint32_t pre_pgen1;
+        uint32_t pre_flush;
+        bool smc_on = (getenv("I686RT_SMC_OFF") == NULL);
         if (code == MAP_FAILED) {
             return NULL;
         }
+        /* I686-R2-4: arm SMC write-protection BEFORE sampling page_gen and
+         * BEFORE decoding guest bytes so any store or VMA invalidation
+         * during translation bumps g_dbt_page_gen and is caught below.
+         * On Regime A2 (16K/64K host pages), hold the sub-page lock and
+         * temporarily apply union_prot while decoding guest bytes so a
+         * widened neighbor sub-page does not SIGBUS the translator, then
+         * re-apply smc_protect / widen_prot before unlocking. */
+        {
+            extern int i686_fault_region_prot(const i686_ctx_t *, uint32_t,
+                                              uint32_t *, uint32_t *);
+            extern void i686_vm32_subpage_lock(void);
+            extern void i686_vm32_subpage_unlock(void);
+            extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t, uint32_t);
+            extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
+            bool a2_subpage = (ctx->vm_regime == I686_VM_REGIME_A2 &&
+                               ctx->vm_host_page > 4096U);
+            uint32_t rprot0 = 0U;
+            uint32_t rprot1 = 0U;
+            bool p0_ok = (i686_fault_region_prot(ctx, vpn0 << 12U, &rprot0,
+                                                 NULL) != 0 &&
+                          (rprot0 & 0x05U) != 0U);
+            bool p1_ok = ((eip & 0xFFFU) >= 0xC00U &&
+                          i686_fault_region_prot(ctx, vpn1 << 12U, &rprot1,
+                                                 NULL) != 0 &&
+                          (rprot1 & 0x05U) != 0U);
+
+            if (a2_subpage && p0_ok) {
+                i686_vm32_subpage_lock();
+                (void)i686_vm32_union_prot(ctx, vpn0 << 12U,
+                                           (vpn0 << 12U) + 0x1000U);
+                if (p1_ok) {
+                    (void)i686_vm32_union_prot(ctx, vpn1 << 12U,
+                                               (vpn1 << 12U) + 0x1000U);
+                }
+            } else if (smc_on && p0_ok) {
+                smc_protect(ctx, eip);
+                if (p1_ok) {
+                    smc_protect(ctx, vpn1 << 12U);
+                }
+            }
+            pre_pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
+                                             memory_order_acquire);
+            pre_pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
+                                             memory_order_acquire);
+            pre_flush = atomic_load_explicit(&g_dbt_flush_epoch,
+                                             memory_order_acquire);
 #ifdef __APPLE__
-        (void)pthread_mutex_lock(&s_jit_toggle_mutex);
-        s_jit_toggle_locked = true;
-        pthread_jit_write_protect_np(0);
+            (void)pthread_mutex_lock(&s_jit_toggle_mutex);
+            s_jit_toggle_locked = true;
+            pthread_jit_write_protect_np(0);
 #endif
-        ring_before = i686_aot_ring_count();
-        len = i686_dbt_translate(ctx, eip, code, cap);
+            ring_before = i686_aot_ring_count();
+            len = i686_dbt_translate(ctx, eip, code, cap);
 #ifdef __APPLE__
-        pthread_jit_write_protect_np(1);
-        s_jit_toggle_locked = false;
-        (void)pthread_mutex_unlock(&s_jit_toggle_mutex);
+            pthread_jit_write_protect_np(1);
+            s_jit_toggle_locked = false;
+            (void)pthread_mutex_unlock(&s_jit_toggle_mutex);
 #endif
+            if (a2_subpage && p0_ok) {
+                if (smc_on && len > 0U && len < cap) {
+                    smc_protect(ctx, eip);
+                    if (p1_ok) {
+                        smc_protect(ctx, vpn1 << 12U);
+                    }
+                } else {
+                    (void)i686_vm32_widen_prot(ctx, vpn0 << 12U,
+                                               (vpn0 << 12U) + 0x1000U);
+                    if (p1_ok) {
+                        (void)i686_vm32_widen_prot(ctx, vpn1 << 12U,
+                                                   (vpn1 << 12U) + 0x1000U);
+                    }
+                }
+                i686_vm32_subpage_unlock();
+            }
+        }
         if (len == 0U) {
             munmap(code, cap);
             dbt_sites_clear_hash(dbt_hash(eip));
@@ -408,6 +485,19 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
         }
         if (len < cap) {
             uint32_t h = dbt_hash(eip);
+            uint32_t post_pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
+                                                       memory_order_acquire);
+            uint32_t post_pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
+                                                       memory_order_acquire);
+            uint32_t post_flush = atomic_load_explicit(&g_dbt_flush_epoch,
+                                                       memory_order_acquire);
+            if (post_pgen0 != pre_pgen0 || post_pgen1 != pre_pgen1 ||
+                post_flush != pre_flush) {
+                munmap(code, cap);
+                dbt_sites_clear_hash(h);
+                dbt_sync_thread_cache(ctx);
+                continue;
+            }
 #ifdef __APPLE__
             sys_icache_invalidate(code, len);
 #else
@@ -421,11 +511,10 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
             ctx->wx_transitions++;
             cur_epoch = atomic_load_explicit(&g_dbt_cache_epoch,
                                              memory_order_acquire);
-            cur_pgen = atomic_load_explicit(&g_dbt_page_gen[eip >> 12U],
-                                            memory_order_acquire);
             e->eip = eip;
             e->len = (uint32_t)len;
-            e->page_gen = cur_pgen;
+            e->page_gen = pre_pgen0;
+            e->page_gen1 = pre_pgen1;
             e->code = code;
             e->cap = cap;
             g_dbt_site_start[h] = (uint64_t)ring_before;
@@ -437,9 +526,6 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
                 .host_code = code,
                 .entry = code
             };
-            if (getenv("I686RT_SMC_OFF") == NULL) {
-                smc_protect(ctx, eip);
-            }
             return e;
         }
         munmap(code, cap);
@@ -470,11 +556,13 @@ int i686_dbt_run(i686_ctx_t *ctx)
                           ctx->guest_base + 0x100000000ULL,
                           memory_order_relaxed);
     if (sigsetjmp(fj, 1) != 0) {
+        extern void i686_vm32_exec_leave(void);
         uint64_t fa = i686_fault_addr();
         extern int i686_deliver_sync(i686_ctx_t *, int);
         extern int i686_fault_region_prot(const i686_ctx_t *, uint32_t,
                                           uint32_t *, uint32_t *);
 
+        i686_vm32_exec_leave();
         i686_split_lock_release_if_held();
 #ifdef __APPLE__
         /* I686-12: only unlock s_jit_toggle_mutex when this thread owns it. */
@@ -532,6 +620,8 @@ int i686_dbt_run(i686_ctx_t *ctx)
     i686_fault_arm(&fj);
 dispatch:
     for (;;) {
+        extern void i686_vm32_exec_enter(const i686_ctx_t *);
+        extern void i686_vm32_exec_leave(void);
         dbt_sync_thread_cache(ctx);
         dbt_graveyard_drain();
         {
@@ -547,10 +637,12 @@ dispatch:
                 continue;
             }
         }
+        i686_vm32_exec_enter(ctx);
         dbt_entry_t *e = dbt_get_or_compile(ctx, ctx->eip);
         int r;
 
         if (e == NULL) {
+            i686_vm32_exec_leave();
             (void)fprintf(stderr, "DBTFALL eip=%08x\n", ctx->eip);
             i686_fault_disarm();
             return i686_interp_run(ctx);
@@ -562,6 +654,7 @@ dispatch:
         }
         (void)i686_jit_run_block(ctx, e->code, NULL,
                                  (const void *)&g_dbt_cache_epoch);
+        i686_vm32_exec_leave();
         ctx->blocks_executed++;
 
         r = (int)ctx->exit_reason;

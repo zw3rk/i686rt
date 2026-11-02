@@ -13,6 +13,7 @@
  */
 
 #include "dbt/aot/aot.h"
+#include "vm/vm_file.h"
 
 #include <string.h>
 
@@ -125,6 +126,17 @@ bool i686_span_mapped_writable(const i686_ctx_t *ctx, uint32_t ea,
     end = (uint64_t)ea + (uint64_t)bytes;
     if (end > UINT64_C(0x100000000)) {
         return false;
+    }
+    if (ctx->vm_reserved[0] != 0U) {
+        uint64_t p;
+        for (p = (uint64_t)(ea & ~0xFFFU); p < end; p += 0x1000ULL) {
+            uint32_t gva = (uint32_t)p;
+            if ((i686_vm_file_flags(gva) & 0x80u) == 0u ||
+                (i686_vm_file_prot(gva) & 0x03u) != 0x03u) {
+                return false;
+            }
+        }
+        return true;
     }
     cur = ea;
     while (cur < (uint32_t)end) {

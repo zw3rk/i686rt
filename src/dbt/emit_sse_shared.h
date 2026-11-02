@@ -34,9 +34,8 @@
  * arithmetic and out-of-range scalar CVTTSS2SI/CVTTSD2SI take the D2
  * interpret-one path instead (exact flags and 0x80000000), while
  * packed CVTT* NaN/overflow still produce NEON saturation instead of
- * x86's integer indefinite 0x80000000.  SSE memory ops stay plain
- * LDR/STR Q in TSO mode (x86 SSE non-atomic stores need TSO ordering
- * only for LOCK RMW, owned by the atomic module).  MMX-writing insns
+ * x86's integer indefinite 0x80000000.  SSE guest memory loads/stores
+ * emit dmb ishld / dmb ish barriers in TSO mode.  MMX-writing insns
  * set the x87 tag word to valid (0x0000) and EMMS sets it empty
  * (0xFFFF); fstat.TOP and the x87_st payload otherwise stay untouched.
  */

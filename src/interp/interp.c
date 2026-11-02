@@ -33,6 +33,7 @@
 #include "interp/flags.h"
 #include "interp/interp.h"
 #include "os/marshal.h"
+#include "vm/vm_file.h"
 
 /* x86 helpers owned by sibling lanes (same extern pattern as h_alu.c). */
 extern uint8_t x86_ea_seg(const x86_insn_t *insn);
@@ -211,29 +212,29 @@ int i686_fault_code(void)
 int i686_fault_region_prot(const i686_ctx_t *ctx, uint32_t ga,
                             uint32_t *out_prot, uint32_t *out_flags)
 {
-    extern void rt32_vm_sync_ctx(i686_ctx_t *);
     size_t i;
-    int pass;
     if (ctx == NULL) {
         return 0;
     }
-    for (pass = 0; pass < 2; pass++) {
-        for (i = 0U; i < ctx->region_count; i++) {
-            const i686_region_t *r = &ctx->regions[i];
-            if (r->start <= ga && ga < r->end) {
-                if (out_prot != NULL) {
-                    *out_prot = r->prot;
-                }
-                if (out_flags != NULL) {
-                    *out_flags = r->flags;
-                }
-                return 1;
-            }
+    if (ctx->vm_reserved[0] != 0U && out_flags == NULL) {
+        if ((i686_vm_file_flags(ga) & 0x80u) == 0u) {
+            return 0;
         }
-        if (pass == 0 && ctx->is_thread_clone) {
-            rt32_vm_sync_ctx((i686_ctx_t *)(uintptr_t)ctx);
-        } else {
-            break;
+        if (out_prot != NULL) {
+            *out_prot = (uint32_t)i686_vm_file_prot(ga);
+        }
+        return 1;
+    }
+    for (i = 0U; i < ctx->region_count; i++) {
+        const i686_region_t *r = &ctx->regions[i];
+        if (r->start <= ga && ga < r->end) {
+            if (out_prot != NULL) {
+                *out_prot = r->prot;
+            }
+            if (out_flags != NULL) {
+                *out_flags = r->flags;
+            }
+            return 1;
         }
     }
     return 0;
@@ -373,12 +374,16 @@ static void diag(const char *what, const i686_ctx_t *ctx, uint16_t op)
  * handlers (D2). Returns 0 on success, or the terminal exit reason. */
 int i686_interp_step(i686_ctx_t *ctx)
 {
+    extern void i686_vm32_exec_enter(const i686_ctx_t *);
+    extern void i686_vm32_exec_leave(void);
     x86_insn_t insn;
     i686_interp_fn fn;
     int r;
 
+    i686_vm32_exec_enter(ctx);
     if (x86_decode(ctx, ctx->eip, &insn) != 0) {
         uint32_t b;
+        i686_vm32_exec_leave();
         ctx->exit_reason = I686_EXIT_UNDEF;
         ctx->exit_arg = 0;
         diag("undecodable instruction", ctx, 0);
@@ -393,12 +398,14 @@ int i686_interp_step(i686_ctx_t *ctx)
     }
     fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
     if (fn == NULL) {
+        i686_vm32_exec_leave();
         ctx->exit_reason = I686_EXIT_UNDEF;
         ctx->exit_arg = insn.op;
         diag("unimplemented opcode", ctx, insn.op);
         return I686_EXIT_UNDEF;
     }
     r = fn(ctx, &insn);
+    i686_vm32_exec_leave();
     ctx->blocks_executed++;
     if (r == I686_INTERP_CONTINUE) {
         return 0;
@@ -422,6 +429,8 @@ int i686_interp_step(i686_ctx_t *ctx)
 
 int i686_interp_run(i686_ctx_t *ctx)
 {
+    extern void i686_vm32_exec_enter(const i686_ctx_t *);
+    extern void i686_vm32_exec_leave(void);
     static int s_faults_installed;
     sigjmp_buf fault_jmp;
     int faulted;
@@ -449,6 +458,7 @@ int i686_interp_run(i686_ctx_t *ctx)
         /* RC-U3: a fault inside a split-locked unaligned section must
          * not strand the lock, and a faulting stack op must not leave
          * ESP/EBP mutated (restored to the pre-instruction values). */
+        i686_vm32_exec_leave();
         i686_split_lock_release_if_held();
         ctx->gpr[I686_REG_ESP] = s_saved_esp;
         ctx->gpr[I686_REG_EBP] = s_saved_ebp;
@@ -492,8 +502,10 @@ int i686_interp_run(i686_ctx_t *ctx)
                     i686_fault_arm(&fault_jmp); /* re-arm: resume may fault */
                     goto run_loop; /* emulated; resume past the insn */
                 }
-                if (i686_vm32_widen_prot(ctx, rga & ~0xFFFU,
-                                        (rga & ~0xFFFU) + 0x1000U) == 0) {
+                if ((ctx->vm_regime != I686_VM_REGIME_A2 ||
+                     ctx->vm_host_page <= 4096u) &&
+                    i686_vm32_widen_prot(ctx, rga & ~0xFFFU,
+                                         (rga & ~0xFFFU) + 0x1000U) == 0) {
                     s_last_remap_ga = (uint64_t)rga;
                     i686_fault_arm(&fault_jmp);
                     goto run_loop; /* cover re-asserted; retry */
@@ -528,8 +540,10 @@ run_loop:
          * never restores a stale ESP/EBP from the previous insn). */
         s_saved_esp = ctx->gpr[I686_REG_ESP];
         s_saved_ebp = ctx->gpr[I686_REG_EBP];
+        i686_vm32_exec_enter(ctx);
         if (x86_decode(ctx, ctx->eip, &insn) != 0) {
             uint32_t b;
+            i686_vm32_exec_leave();
             ctx->exit_reason = I686_EXIT_UNDEF;
             ctx->exit_arg = 0;
             diag("undecodable instruction", ctx, 0);
@@ -544,6 +558,7 @@ run_loop:
         }
         fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
         if (fn == NULL) {
+            i686_vm32_exec_leave();
             ctx->exit_reason = I686_EXIT_UNDEF;
             ctx->exit_arg = insn.op;
             diag("unimplemented opcode", ctx, insn.op);
@@ -568,6 +583,7 @@ run_loop:
             (void)write(2, tl, strlen(tl));
         }
         r = fn(ctx, &insn);
+        i686_vm32_exec_leave();
         ctx->blocks_executed++;
 
         if (r == I686_INTERP_CONTINUE) {

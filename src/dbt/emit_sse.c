@@ -93,24 +93,32 @@ static int sse_emit_movx(i686_emit_ctx_t *e, const x86_insn_t *insn,
     }
 
     if (insn->pfx_rep != 0U) {
-        /* MOVSS (F3) / MOVSD (F2). Scalar lane-0 writes go straight
-         * into the cached slot (upper lanes preserved); no dst
-         * preimage load is needed since the lane is overwritten. */
+        /* MOVSS (F3) / MOVSD (F2). Register-to-register copies preserve
+         * the destination's upper lanes; memory loads zero upper lanes
+         * (127:32 for MOVSS, 127:64 for MOVSD; I686-R2-11). */
         if (load) {
             if (insn->modrm_mod == 3U) {
                 sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
+                if (insn->pfx_rep == 1U) {
+                    sse_s_str(e, insn->modrm_reg & 7U, 1U);
+                } else {
+                    sse_d_str(e, insn->modrm_reg & 7U, 1U);
+                }
             } else {
                 sse_guest_addr(e, insn);
                 if (insn->pfx_rep == 1U) {
                     sse_ldr_s(b, 1U, SSE_ADDR, 0U);
+                    if (e->tso) {
+                        a64_emit(b, 0xD50339BFU); /* dmb ishld */
+                    }
+                    sse_zero_s_str(e, insn->modrm_reg & 7U, 1U);
                 } else {
                     sse_ldr_d(b, 1U, SSE_ADDR, 0U);
+                    if (e->tso) {
+                        a64_emit(b, 0xD50339BFU); /* dmb ishld */
+                    }
+                    sse_zero_d_str(e, insn->modrm_reg & 7U, 1U);
                 }
-            }
-            if (insn->pfx_rep == 1U) {
-                sse_s_str(e, insn->modrm_reg & 7U, 1U);
-            } else {
-                sse_d_str(e, insn->modrm_reg & 7U, 1U);
             }
         } else {
             /* MOVSS/MOVSD xmm2/m32, xmm1: store the low lane only; the
@@ -130,6 +138,9 @@ static int sse_emit_movx(i686_emit_ctx_t *e, const x86_insn_t *insn,
                 } else {
                     sse_str_d(b, 1U, SSE_ADDR, 0U);
                 }
+                if (e->tso) {
+                    a64_emit(b, 0xD5033BBFU); /* dmb ish */
+                }
             }
         }
         return 0;
@@ -143,6 +154,9 @@ static int sse_emit_movx(i686_emit_ctx_t *e, const x86_insn_t *insn,
         } else {
             sse_guest_addr(e, insn);
             sse_ldr_q(b, 1U, SSE_ADDR, 0U);
+            if (e->tso) {
+                a64_emit(b, 0xD50339BFU); /* dmb ishld */
+            }
         }
         sse_q_str(e, insn->modrm_reg & 7U, 1U);
     } else {
@@ -152,6 +166,9 @@ static int sse_emit_movx(i686_emit_ctx_t *e, const x86_insn_t *insn,
         } else {
             sse_guest_addr(e, insn);
             sse_str_q(b, 0U, SSE_ADDR, 0U);
+            if (e->tso) {
+                a64_emit(b, 0xD5033BBFU); /* dmb ish */
+            }
         }
     }
     return 0;

@@ -32,6 +32,7 @@
 #include "dbt/emit.h"
 #include "interp/interp.h"
 #include "rt32/rt32_a64_emit.h"
+#include "vm/vm_file.h"
 
 #define I686_DBT_MAX_INSNS 64U
 
@@ -122,26 +123,28 @@ static int tr_is_block_end(const x86_insn_t *insn)
 
 static int tr_page_readable(const i686_ctx_t *ctx, uint32_t va)
 {
-    extern void rt32_vm_sync_ctx(i686_ctx_t *);
+    extern void rt32_vm_sync_ctx_if_stale(i686_ctx_t *);
     uint32_t page = va & ~0xFFFu;
     size_t i;
-    int pass;
 
+    if (ctx->vm_reserved[0] != 0U) {
+        if ((i686_vm_file_flags(page) & 0x80u) != 0u) {
+            return (i686_vm_file_prot(page) & 0x05u) != 0u ? 1 : 0;
+        }
+        rt32_vm_sync_ctx_if_stale((i686_ctx_t *)(uintptr_t)ctx);
+        if (ctx->region_count == 0U) {
+            return 1;
+        }
+        return 0;
+    }
     if (ctx->region_count == 0U && !ctx->is_thread_clone) {
         return 1;
     }
-    for (pass = 0; pass < 2; pass++) {
-        for (i = 0U; i < ctx->region_count; i++) {
-            uint32_t start = ctx->regions[i].start;
-            uint32_t end = ctx->regions[i].end;
-            if (end > start && page >= start && page < end) {
-                return (ctx->regions[i].prot & 0x05U) != 0U ? 1 : 0;
-            }
-        }
-        if (pass == 0 && ctx->is_thread_clone) {
-            rt32_vm_sync_ctx((i686_ctx_t *)(uintptr_t)ctx);
-        } else {
-            break;
+    for (i = 0U; i < ctx->region_count; i++) {
+        uint32_t start = ctx->regions[i].start;
+        uint32_t end = ctx->regions[i].end;
+        if (end > start && page >= start && page < end) {
+            return (ctx->regions[i].prot & 0x05U) != 0U ? 1 : 0;
         }
     }
     return 0;
@@ -348,6 +351,9 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
         if (rc < 0) {
             extern int i686_emit_sse(i686_emit_ctx_t *, const x86_insn_t *);
             rc = i686_emit_sse(&e, insn);
+            if (rc == 0 && e.tso && tr_is_regonly(insn) == 0) {
+                a64_emit(&e.buf, 0xD5033BBFU); /* dmb ish (I686-R2-8) */
+            }
         }
         if (rc < 0) {
             /* Not emittable: end block; the engine interprets ONE insn

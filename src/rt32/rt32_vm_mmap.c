@@ -205,6 +205,9 @@ static int vm_munmap_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len)
     }
 
     uint32_t start = i686_page_down(addr);
+    if (i686_vm_file_untrack_map(start, (size_t)aligned_len) != 0) {
+        return -ENOMEM;
+    }
     int rc = rt32_vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
     if (rc != 0) {
         return rc;
@@ -212,7 +215,6 @@ static int vm_munmap_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len)
 
     uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
     rt32_vm_unmap_regions_locked(start, end);
-    i686_vm_file_untrack_map(start, (size_t)aligned_len);
     rt32_vm_file_sync_prot_locked(start, end);
     (void)i686_vm32_widen_prot(ctx, start, end);
     if (g_vm_mmap_cursor == end && start >= RT32_MMAP_BASE_32) {
@@ -282,15 +284,25 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     uint32_t    anon_flags  = (((keep_flags & 0x01U) != 0U) ? 0x01U : 0x02U) | RT32_MAP_ANONYMOUS;
     const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
     int         map_fd      = -1;
+    int         hold_fd     = -1;
     uint64_t    map_foff    = 0ULL;
     uint8_t     map_kind    = 0U;
     bool        has_file    = ((keep_flags & RT32_MAP_ANONYMOUS) == 0U) &&
                               (i686_vm_file_lookup_map(old_addr, &map_fd,
                                                        &map_foff, &map_kind) == 0) &&
                               (map_fd >= 0);
+    if (has_file) {
+        hold_fd = dup(map_fd);
+        if (hold_fd >= 0) {
+            map_fd = hold_fd;
+        }
+    }
 
     if ((flags & RT32_MREMAP_FIXED) == 0U) {
         if (new_aligned == old_aligned) {
+            if (hold_fd >= 0) {
+                (void)close(hold_fd);
+            }
             rt32_vm_sync_to_ctx(ctx);
             rt32_vm_lock_release();
             return old_addr;
@@ -299,6 +311,9 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             uint32_t unmap_addr = old_addr + (uint32_t)new_aligned;
             uint32_t unmap_len  = (uint32_t)(old_aligned - new_aligned);
             int rc = vm_munmap_locked(ctx, unmap_addr, unmap_len);
+            if (hold_fd >= 0) {
+                (void)close(hold_fd);
+            }
             rt32_vm_sync_to_ctx(ctx);
             rt32_vm_lock_release();
             if (rc != 0) {
@@ -325,6 +340,9 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                     i686_vm_file_untrack_map(old_addr, (size_t)new_aligned);
                     i686_vm_file_track_map(map_fd, old_addr, (size_t)new_aligned,
                                            map_foff, map_kind);
+                    if (hold_fd >= 0) {
+                        (void)close(hold_fd);
+                    }
                 }
                 uint32_t ext_end = (uint32_t)new_end;
                 if (g_vm_mmap_cursor >= old_addr && g_vm_mmap_cursor < ext_end &&
@@ -341,6 +359,9 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         }
 
         if ((flags & RT32_MREMAP_MAYMOVE) == 0U) {
+            if (hold_fd >= 0) {
+                (void)close(hold_fd);
+            }
             rt32_vm_sync_to_ctx(ctx);
             rt32_vm_lock_release();
             return (uint32_t)(-ENOMEM);
@@ -350,6 +371,9 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             (uint64_t)new_addr + new_aligned > (uint64_t)I686_TASK_SIZE_TOP ||
             ((uint64_t)new_addr < (uint64_t)old_addr + old_aligned &&
              (uint64_t)old_addr < (uint64_t)new_addr + new_aligned)) {
+            if (hold_fd >= 0) {
+                (void)close(hold_fd);
+            }
             rt32_vm_sync_to_ctx(ctx);
             rt32_vm_lock_release();
             return (uint32_t)(-EINVAL);
@@ -366,15 +390,33 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                          (uint32_t)new_aligned, rw_prot,
                                          rel_flags, rel_fd, rel_pgoff);
     if (new_va > 0xFFFFF000U) {
+        if (hold_fd >= 0) {
+            (void)close(hold_fd);
+        }
         rt32_vm_sync_to_ctx(ctx);
         rt32_vm_lock_release();
         return new_va;
     }
 
     /* Copy existing bytes for anonymous/private mappings, or for Regime A2
-     * staged shared mappings where host MAP_SHARED could not be used. */
-    if (!has_file || (keep_flags & 0x01U) == 0U ||
-        rt32_vm_a2_staged_needed(ctx, new_va, new_aligned, rel_flags, map_foff)) {
+     * staged shared mappings where host MAP_SHARED could not be used.
+     * On Linux, moving a MAP_SHARED | MAP_ANONYMOUS region uses host mremap
+     * so shared identity across fork() is preserved (X-R2-2). */
+    bool moved_via_host_mremap = false;
+#ifdef __linux__
+    if (!has_file && (keep_flags & 0x01U) != 0U &&
+        !rt32_vm_a2_staged_needed(ctx, new_va, new_aligned, rel_flags, 0ULL)) {
+        void *mr = mremap(i686_guest_ptr(ctx, old_addr), (size_t)old_aligned,
+                          (size_t)new_aligned, MREMAP_MAYMOVE | MREMAP_FIXED,
+                          i686_guest_ptr(ctx, new_va));
+        if (mr != MAP_FAILED) {
+            moved_via_host_mremap = true;
+        }
+    }
+#endif
+    if (!moved_via_host_mremap &&
+        (!has_file || (keep_flags & 0x01U) == 0U ||
+         rt32_vm_a2_staged_needed(ctx, new_va, new_aligned, rel_flags, map_foff))) {
         if ((prot & 0x1U) == 0U) {
             (void)mprotect(i686_guest_ptr(ctx, old_addr), (size_t)old_aligned,
                            PROT_READ);
@@ -388,6 +430,9 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     (void)rt32_vm_record_region_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
                                        prot, keep_flags, region_name);
     (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
+    if (hold_fd >= 0) {
+        (void)close(hold_fd);
+    }
     rt32_vm_sync_to_ctx(ctx);
     rt32_vm_lock_release();
 

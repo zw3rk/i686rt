@@ -51,7 +51,16 @@ if [ -f "$root/${src%.c}_cases.c" ]; then
     extra_src="${src%.c}_cases.c"
 fi
 
-docker run --rm --platform linux/386 \
+cname="i686rt-fixture-$$-$(date +%s)"
+cleanup_container() {
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+}
+trap cleanup_container EXIT INT TERM HUP
+
+timeout --kill-after=30s 120s docker run --rm \
+    --name "$cname" \
+    --cpus=2 --memory=1g \
+    --platform linux/386 \
     -v "$root":/w \
     alpine:3.20 \
     sh -c "apk add --no-cache gcc musl-dev >/dev/null &&

@@ -110,33 +110,53 @@ static void l3s_emit_cset_w11(i686_emit_ctx_t *e, unsigned cond)
                  (31U << 5) | L3S_W11);
 }
 
-/* Load width-sized operand from [x20, wAddr uxtw] into wR, then shift
- * it so the width's sign bit lands on bit 31 (width 32: plain move).
- * LSL #n = UBFM #((32-n) MOD 32), #(31-n). */
-static void l3s_load_shifted(i686_emit_ctx_t *e, unsigned w_r,
-                             unsigned w_addr, unsigned bytes)
+/* Load width-sized operand from [x20, wAddr uxtw] into wR with TSO
+ * load-acquire ordering when e->tso is active (I686-R2-8). */
+static void l3s_guest_load(i686_emit_ctx_t *e, unsigned w_r,
+                           unsigned w_addr, unsigned bytes)
 {
     a64_buf_t *b = &e->buf;
 
     if (bytes == 1U) {
         a64_emit_guest_ldrb_w(b, w_r, w_addr);
-        a64_emit_ubfm_w(b, w_r, w_r, 8U, 7U);   /* lsl #24 */
     } else if (bytes == 2U) {
         a64_emit_guest_ldrh_w(b, w_r, w_addr);
-        a64_emit_ubfm_w(b, w_r, w_r, 16U, 15U); /* lsl #16 */
     } else {
         a64_emit_guest_ldr_w(b, w_r, w_addr);
     }
+    if (e->tso) {
+        a64_emit(b, 0xD50339BFU); /* dmb ishld */
+    }
 }
 
-/* Materialize the SUBS-derived x86 flags (SF/ZF/CF/OF; CF = !C borrow
- * polarity) into ctx->eflags; PF/AF are left as-is (see header note). */
+/* Store width-sized operand from wR into [x20, wAddr uxtw] with TSO
+ * store-release ordering when e->tso is active (I686-R2-8). */
+static void l3s_guest_store(i686_emit_ctx_t *e, unsigned w_r,
+                            unsigned w_addr, unsigned bytes)
+{
+    a64_buf_t *b = &e->buf;
+
+    if (bytes == 1U) {
+        a64_emit_guest_strb_w(b, w_r, w_addr);
+    } else if (bytes == 2U) {
+        a64_emit_guest_strh_w(b, w_r, w_addr);
+    } else {
+        a64_emit_guest_str_w(b, w_r, w_addr);
+    }
+    if (e->tso) {
+        a64_emit(b, 0xD5033BBFU); /* dmb ish */
+    }
+}
+
+/* Materialize all six SUBS-derived x86 flags (CF/PF/AF/ZF/SF/OF; CF = !C
+ * borrow polarity) into ctx->eflags from NZCV and unshifted operands
+ * w12 (a), w13 (b), w14 (a - b), and clear ctx->lazy_op (I686-R2-12). */
 static void l3s_store_flags(i686_emit_ctx_t *e)
 {
     a64_buf_t *b = &e->buf;
 
     a64_emit_mrs_nzcv(b, L3S_W8);
-    a64_emit_mov_w(b, L3S_W9, A64_ZR); /* w9 = new SF|ZF|CF|OF bits */
+    a64_emit_mov_w(b, L3S_W9, A64_ZR); /* w9 = new CF|PF|AF|ZF|SF|OF bits */
     a64_emit_ubfm_w(b, L3S_W11, L3S_W8, 31U, 31U);
     a64_emit_bfm_w(b, L3S_W9, L3S_W11, 25U, 0U); /* SF <- N, bit 7 */
     a64_emit_ubfm_w(b, L3S_W11, L3S_W8, 30U, 30U);
@@ -145,12 +165,46 @@ static void l3s_store_flags(i686_emit_ctx_t *e)
     a64_emit_bfm_w(b, L3S_W9, L3S_W11, 0U, 0U);  /* bit 0 */
     a64_emit_ubfm_w(b, L3S_W11, L3S_W8, 28U, 28U);
     a64_emit_bfm_w(b, L3S_W9, L3S_W11, 21U, 0U); /* OF <- V, bit 11 */
+    /* PF: even parity of low byte of w14 (a - b). */
+    a64_emit_ubfm_w(b, L3S_W11, 14U, 0U, 7U);
+    a64_emit_eor_reg_w(b, L3S_W11, L3S_W11, L3S_W11, A64_SHIFT_LSR, 4U);
+    a64_emit_eor_reg_w(b, L3S_W11, L3S_W11, L3S_W11, A64_SHIFT_LSR, 2U);
+    a64_emit_eor_reg_w(b, L3S_W11, L3S_W11, L3S_W11, A64_SHIFT_LSR, 1U);
+    a64_emit(b, 0x52000000U | (L3S_W11 << 5) | L3S_W11); /* eor w11, w11, #1 */
+    a64_emit_bfm_w(b, L3S_W9, L3S_W11, 30U, 0U); /* PF <- bit 2 */
+    /* AF: bit 4 of (a ^ b ^ (a - b)). */
+    a64_emit_eor_reg_w(b, L3S_W11, 12U, 13U, A64_SHIFT_LSL, 0U);
+    a64_emit_eor_reg_w(b, L3S_W11, L3S_W11, 14U, A64_SHIFT_LSL, 0U);
+    a64_emit_ubfm_w(b, L3S_W11, L3S_W11, 4U, 4U);
+    a64_emit_bfm_w(b, L3S_W9, L3S_W11, 28U, 0U); /* AF <- bit 4 */
     a64_emit_ldr_imm_w(b, L3S_W10, A64_XCTX, 36U);
-    a64_emit_movz_w(b, L3S_W11, 0x08C1U, 0U); /* CF|ZF|SF|OF mask */
+    a64_emit_movz_w(b, L3S_W11, 0x08D5U, 0U); /* CF|PF|AF|ZF|SF|OF mask */
     a64_emit_bic_reg_w(b, false, L3S_W10, L3S_W10, L3S_W11,
                        A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, L3S_W10, L3S_W10, L3S_W9, A64_SHIFT_LSL, 0U);
     a64_emit_str_imm_w(b, L3S_W10, A64_XCTX, 36U);
+    a64_emit_str_imm_w(b, A64_ZR, A64_XCTX, 76U); /* lazy_op = NONE */
+    e->flags_src = I686_FLAGS_EFLAGS;
+}
+
+static void l3s_compare_and_store_flags(i686_emit_ctx_t *e, unsigned bytes)
+{
+    a64_buf_t *b = &e->buf;
+
+    a64_emit_sub_reg_w(b, false, 14U, 12U, 13U, A64_SHIFT_LSL, 0U);
+    if (bytes == 1U) {
+        a64_emit_ubfm_w(b, L3S_W10, 12U, 8U, 7U);
+        a64_emit_ubfm_w(b, L3S_W11, 13U, 8U, 7U);
+    } else if (bytes == 2U) {
+        a64_emit_ubfm_w(b, L3S_W10, 12U, 16U, 15U);
+        a64_emit_ubfm_w(b, L3S_W11, 13U, 16U, 15U);
+    } else {
+        a64_emit_mov_w(b, L3S_W10, 12U);
+        a64_emit_mov_w(b, L3S_W11, 13U);
+    }
+    a64_emit_sub_reg_w(b, true, A64_ZR, L3S_W10, L3S_W11,
+                       A64_SHIFT_LSL, 0U); /* SUBS wzr, a_sh, b_sh */
+    l3s_store_flags(e);
 }
 
 /* CSET w11 helper used above is shared; width in bytes for this insn. */
@@ -178,16 +232,8 @@ int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn)
         bytes = l3s_bytes(insn, insn->op == I686_OP_MOVSw);
         l3s_src_addr(e, insn);
         l3s_dst_addr(e);
-        if (bytes == 1U) {
-            a64_emit_guest_ldrb_w(b, L3S_W10, L3S_A0);
-            a64_emit_guest_strb_w(b, L3S_W10, L3S_A1);
-        } else if (bytes == 2U) {
-            a64_emit_guest_ldrh_w(b, L3S_W10, L3S_A0);
-            a64_emit_guest_strh_w(b, L3S_W10, L3S_A1);
-        } else {
-            a64_emit_guest_ldr_w(b, L3S_W10, L3S_A0);
-            a64_emit_guest_str_w(b, L3S_W10, L3S_A1);
-        }
+        l3s_guest_load(e, L3S_W10, L3S_A0, bytes);
+        l3s_guest_store(e, L3S_W10, L3S_A1, bytes);
         l3s_bump_df(e, true, true, (uint16_t)bytes);
         return 0;
 
@@ -195,13 +241,7 @@ int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn)
     case I686_OP_STOSw:
         bytes = l3s_bytes(insn, insn->op == I686_OP_STOSw);
         l3s_dst_addr(e);
-        if (bytes == 1U) {
-            a64_emit_guest_strb_w(b, I686_REG_EAX, L3S_A1);
-        } else if (bytes == 2U) {
-            a64_emit_guest_strh_w(b, I686_REG_EAX, L3S_A1);
-        } else {
-            a64_emit_guest_str_w(b, I686_REG_EAX, L3S_A1);
-        }
+        l3s_guest_store(e, I686_REG_EAX, L3S_A1, bytes);
         l3s_bump_df(e, false, true, (uint16_t)bytes);
         return 0;
 
@@ -210,13 +250,15 @@ int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn)
         bytes = l3s_bytes(insn, insn->op == I686_OP_LODSw);
         l3s_src_addr(e, insn);
         if (bytes == 1U) {
-            a64_emit_guest_ldrb_w(b, I686_REG_EAX, L3S_A0);
+            l3s_guest_load(e, L3S_W10, L3S_A0, 1U);
+            a64_emit_bfm_w(b, I686_REG_EAX, L3S_W10, 0U, 7U);
         } else if (bytes == 2U) {
-            a64_emit_guest_ldrh_w(b, I686_REG_EAX, L3S_A0);
+            l3s_guest_load(e, L3S_W10, L3S_A0, 2U);
+            a64_emit_bfm_w(b, I686_REG_EAX, L3S_W10, 0U, 15U);
         } else {
-            a64_emit_guest_ldr_w(b, I686_REG_EAX, L3S_A0);
+            l3s_guest_load(e, I686_REG_EAX, L3S_A0, 4U);
         }
-        /* ldrb/ldrh zero-extend, matching x86_reg_write(EAX, width). */
+        /* LODSB/LODSW merge into AL/AX via BFI, preserving upper EAX bits (I686-R2-10). */
         l3s_bump_df(e, true, false, (uint16_t)bytes);
         return 0;
 
@@ -225,11 +267,9 @@ int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn)
         bytes = l3s_bytes(insn, insn->op == I686_OP_CMPSw);
         l3s_src_addr(e, insn);
         l3s_dst_addr(e);
-        l3s_load_shifted(e, L3S_W10, L3S_A0, bytes); /* [DS:ESI] */
-        l3s_load_shifted(e, L3S_W11, L3S_A1, bytes); /* [ES:EDI] */
-        a64_emit_sub_reg_w(b, true, A64_ZR, L3S_W10, L3S_W11,
-                           A64_SHIFT_LSL, 0U); /* SUBS wzr, a, b */
-        l3s_store_flags(e);
+        l3s_guest_load(e, 12U, L3S_A0, bytes); /* [DS:ESI] */
+        l3s_guest_load(e, 13U, L3S_A1, bytes); /* [ES:EDI] */
+        l3s_compare_and_store_flags(e, bytes);
         l3s_bump_df(e, true, true, (uint16_t)bytes);
         return 0;
 
@@ -237,20 +277,15 @@ int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn)
     case I686_OP_SCASw:
         bytes = l3s_bytes(insn, insn->op == I686_OP_SCASw);
         l3s_dst_addr(e);
-        /* a = AL/eAX masked and sign-positioned (LSL via UBFM, above) */
         if (bytes == 1U) {
-            a64_emit_ubfm_w(b, L3S_W10, I686_REG_EAX, 0U, 7U);
-            a64_emit_ubfm_w(b, L3S_W10, L3S_W10, 8U, 7U);
+            a64_emit_ubfm_w(b, 12U, I686_REG_EAX, 0U, 7U);
         } else if (bytes == 2U) {
-            a64_emit_ubfm_w(b, L3S_W10, I686_REG_EAX, 0U, 15U);
-            a64_emit_ubfm_w(b, L3S_W10, L3S_W10, 16U, 15U);
+            a64_emit_ubfm_w(b, 12U, I686_REG_EAX, 0U, 15U);
         } else {
-            a64_emit_mov_w(b, L3S_W10, I686_REG_EAX);
+            a64_emit_mov_w(b, 12U, I686_REG_EAX);
         }
-        l3s_load_shifted(e, L3S_W11, L3S_A1, bytes); /* [ES:EDI] */
-        a64_emit_sub_reg_w(b, true, A64_ZR, L3S_W10, L3S_W11,
-                           A64_SHIFT_LSL, 0U); /* SUBS wzr, a, b */
-        l3s_store_flags(e);
+        l3s_guest_load(e, 13U, L3S_A1, bytes); /* [ES:EDI] */
+        l3s_compare_and_store_flags(e, bytes);
         l3s_bump_df(e, false, true, (uint16_t)bytes);
         return 0;
 

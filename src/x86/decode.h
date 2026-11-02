@@ -78,4 +78,23 @@ void     x86_rm_write(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width, u
 /* EA (post segment-base addition, still a 32-bit wrapping guest VA). */
 uint32_t x86_ea_compute(i686_ctx_t *ctx, const x86_insn_t *insn);
 
+/* Phase-7 synthetic opcode ids (shared across decode.c, h_seg.c, and
+ * subpage recovery; I686-R2-16). */
+enum {
+    I686_OP7_POP_SS   = 460, /* 17                                      */
+    I686_OP7_CALLF    = 461, /* 9A Ap: m16:16 / m16:32 far pointer      */
+    I686_OP7_JMPF     = 462, /* EA Ap                                   */
+    I686_OP7_LES      = 463, /* C4 Gv,mp                                */
+    I686_OP7_LDS      = 464, /* C5 Gv,mp                                */
+    I686_OP7_RETF     = 465, /* CB                                      */
+    I686_OP7_LSS      = 466, /* 0F B2 Gv,mp                             */
+    I686_OP7_LFS      = 467, /* 0F B4 Gv,mp                             */
+    I686_OP7_LGS      = 468, /* 0F B5 Gv,mp                             */
+    I686_OP7_PRIV     = 469, /* E4-E7/EC-EF, 0F 20-23 (16-bit code)     */
+    I686_OP7_UNPCKLPS = 470, /* 0F 14 Vps,Wps / 66 Vpd,Wpd              */
+    I686_OP7_UNPCKHPS = 471, /* 0F 15 Vps,Wps / 66 Vpd,Wpd              */
+    I686_OP7_PACKUSWB = 472, /* 0F 67 Pq,Qd / 66 Vdq,Wdq                */
+    I686_OP7_SHUFPS   = 473  /* 0F C6 Vps,Wps,Ib / 66 Vpd,Wpd,Ib        */
+};
+
 #endif /* I686RT_X86_DECODE_H */

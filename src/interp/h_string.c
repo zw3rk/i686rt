@@ -106,16 +106,17 @@ static void str_bump(i686_ctx_t *ctx, uint8_t reg, int32_t delta, uint8_t addr16
     uint32_t v = ctx->gpr[reg] + (uint32_t)delta;
 
     if (addr16 != 0U) {
-        v &= 0xffffU;
+        ctx->gpr[reg] = (ctx->gpr[reg] & 0xffff0000U) | (v & 0xffffU);
+    } else {
+        ctx->gpr[reg] = v;
     }
-    ctx->gpr[reg] = v;
 }
 
 /* REP count and decrement: ECX plain, CX (low half, upper preserved)
- * under the 66 prefix.  Zero count => the loop body never runs. */
+ * under the 67 (16-bit address-size) prefix.  Zero count => the loop body never runs. */
 static uint32_t rep_count_get(const i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_addrsize != 0U) {
         return ctx->gpr[I686_REG_ECX] & 0xffffU;
     }
     return ctx->gpr[I686_REG_ECX];
@@ -123,7 +124,7 @@ static uint32_t rep_count_get(const i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static void rep_count_dec(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_addrsize != 0U) {
         ctx->gpr[I686_REG_ECX] = (ctx->gpr[I686_REG_ECX] & 0xffff0000U) |
                                  ((ctx->gpr[I686_REG_ECX] - 1U) & 0xffffU);
     } else {

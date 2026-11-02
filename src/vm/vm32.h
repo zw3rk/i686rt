@@ -72,9 +72,12 @@ int i686_vm32_init(i686_ctx_t *ctx, uint64_t requested_window);
 void i686_vm32_fini(i686_ctx_t *ctx);
 
 /* Serialize temporary Regime A2 union_prot -> emulate/copy -> widen_prot
- * transitions across threads. */
+ * transitions across threads, pausing guest execution on sibling threads
+ * while a mixed-permission host page is widened. */
 void i686_vm32_subpage_lock(void);
 void i686_vm32_subpage_unlock(void);
+void i686_vm32_exec_enter(const i686_ctx_t *ctx);
+void i686_vm32_exec_leave(void);
 
 /* Union host protection of one host page covering guest [start, end):
  * PROT_READ | PROT_WRITE when any sub-page is writable, never PROT_EXEC. */
@@ -90,10 +93,12 @@ int i686_vm32_union_prot(i686_ctx_t *ctx, uint32_t start, uint32_t end);
  * lock, and immediately re-widen.  Never PROT_EXEC. */
 int i686_vm32_widen_prot(i686_ctx_t *ctx, uint32_t start, uint32_t end);
 
-/* Pin/unpin the host page covering guest address gva at union protection
- * across blocking host futex operations on Regime A2 (no-op on A1). */
-int i686_vm32_pin_page(i686_ctx_t *ctx, uint32_t gva);
-void i686_vm32_unpin_page(i686_ctx_t *ctx, uint32_t gva);
+struct timespec;
+long i686_vm32_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op,
+                     uint32_t val, const struct timespec *timeout,
+                     uint32_t val2, uint32_t uaddr2, uint32_t val3);
+long i686_vm32_futex_wake(i686_ctx_t *ctx, uint32_t uaddr, uint32_t max_wake,
+                          uint32_t bitset);
 
 /* Canonical host address of a guest VA (HVA = arena_base + gva; stable
  * across COW promotion, fable C2). */

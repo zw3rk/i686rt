@@ -27,27 +27,33 @@
 #include "vm/vm_file.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 /* 4 GiB arena at 4 KiB granule: 2^20 sub-pages. */
 #define I686_FILE_NPAGES (1u << 20)
 
-static uint8_t *s_prot;   /* guest PROT_READ/PROT_WRITE per sub-page */
+static uint8_t *s_prot;   /* guest PROT_READ/WRITE/EXEC per sub-page */
 static uint8_t *s_state;  /* i686_page_state_t per sub-page */
 static uint8_t *s_flags;  /* I686_PAGE_HAS_* per sub-page */
 static int s_ready;
 static uint64_t s_arena_base; /* canonical HVA base (arena_base + gva) */
 
-/* Tracked file-backed mappings for the pwrite/ftruncate hooks. */
-#define I686_FILE_MAX_MAPS 64u
+/* Tracked file-backed mappings for the pwrite/ftruncate/mremap hooks. */
+#define I686_FILE_MAX_MAPS 256u
 
 typedef struct {
     int used;
     int fd;
+    int owned_fd;
+    dev_t dev;
+    ino_t ino;
+    uint8_t has_ino;
     uint32_t gva;
     size_t len;
     uint64_t file_offset;
@@ -55,6 +61,30 @@ typedef struct {
 } file_map_t;
 
 static file_map_t s_maps[I686_FILE_MAX_MAPS];
+
+static int dup_map_fd(int fd)
+{
+    int dfd;
+    if (fd < 0) {
+        return -1;
+    }
+#ifdef F_DUPFD_CLOEXEC
+    dfd = fcntl(fd, F_DUPFD_CLOEXEC, 512);
+    if (dfd >= 0) {
+        return dfd;
+    }
+#endif
+    return dup(fd);
+}
+
+static void close_map_slot(file_map_t *m)
+{
+    if (m->owned_fd >= 0) {
+        (void)close(m->owned_fd);
+        m->owned_fd = -1;
+    }
+    m->used = 0;
+}
 
 static uint32_t page_index(uint32_t gva)
 {
@@ -112,6 +142,12 @@ int i686_vm_file_init(uint64_t arena_base)
 
 void i686_vm_file_fini(void)
 {
+    uint32_t i;
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        if (s_maps[i].used != 0) {
+            close_map_slot(&s_maps[i]);
+        }
+    }
     if (s_ready == 0) {
         return;
     }
@@ -127,12 +163,13 @@ void i686_vm_file_fini(void)
 void i686_vm_file_set_prot(uint32_t gva, size_t len, uint8_t prot)
 {
     uint32_t first, count;
+    uint8_t masked = (uint8_t)(prot & 0x07u);
     if (s_ready == 0) {
         return;
     }
     touch_span(gva, len, &first, &count);
     for (uint32_t i = 0u; i < count; i++) {
-        s_prot[first + i] = (uint8_t)(prot & 0x03u);
+        __atomic_store_n(&s_prot[first + i], masked, __ATOMIC_RELEASE);
     }
 }
 
@@ -141,7 +178,7 @@ uint8_t i686_vm_file_prot(uint32_t gva)
     if (s_ready == 0) {
         return 0u;
     }
-    return s_prot[page_index(gva)];
+    return __atomic_load_n(&s_prot[page_index(gva)], __ATOMIC_ACQUIRE);
 }
 
 void i686_vm_file_set_state(uint32_t gva, size_t len, uint8_t state)
@@ -152,7 +189,7 @@ void i686_vm_file_set_state(uint32_t gva, size_t len, uint8_t state)
     }
     touch_span(gva, len, &first, &count);
     for (uint32_t i = 0u; i < count; i++) {
-        s_state[first + i] = state;
+        __atomic_store_n(&s_state[first + i], state, __ATOMIC_RELEASE);
     }
 }
 
@@ -161,7 +198,7 @@ uint8_t i686_vm_file_state(uint32_t gva)
     if (s_ready == 0) {
         return 0u;
     }
-    return s_state[page_index(gva)];
+    return __atomic_load_n(&s_state[page_index(gva)], __ATOMIC_ACQUIRE);
 }
 
 void i686_vm_file_flags_add(uint32_t gva, size_t len, uint8_t flags)
@@ -172,19 +209,20 @@ void i686_vm_file_flags_add(uint32_t gva, size_t len, uint8_t flags)
     }
     touch_span(gva, len, &first, &count);
     for (uint32_t i = 0u; i < count; i++) {
-        s_flags[first + i] = (uint8_t)(s_flags[first + i] | flags);
+        (void)__atomic_fetch_or(&s_flags[first + i], flags, __ATOMIC_RELEASE);
     }
 }
 
 void i686_vm_file_flags_clear(uint32_t gva, size_t len, uint8_t flags)
 {
     uint32_t first, count;
+    uint8_t mask = (uint8_t)~flags;
     if (s_ready == 0) {
         return;
     }
     touch_span(gva, len, &first, &count);
     for (uint32_t i = 0u; i < count; i++) {
-        s_flags[first + i] = (uint8_t)(s_flags[first + i] & (uint8_t)~flags);
+        (void)__atomic_fetch_and(&s_flags[first + i], mask, __ATOMIC_RELEASE);
     }
 }
 
@@ -193,7 +231,7 @@ uint8_t i686_vm_file_flags(uint32_t gva)
     if (s_ready == 0) {
         return 0u;
     }
-    return s_flags[page_index(gva)];
+    return __atomic_load_n(&s_flags[page_index(gva)], __ATOMIC_ACQUIRE);
 }
 
 size_t i686_vm_file_promote_cow(uint32_t gva, size_t len)
@@ -295,8 +333,23 @@ int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
     uint32_t i;
     for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
         if (s_maps[i].used == 0) {
+            struct stat st;
+            int owned = (fd >= 0) ? dup_map_fd(fd) : -1;
+            if (fd >= 0 && owned < 0) {
+                return -1;
+            }
             s_maps[i].used = 1;
             s_maps[i].fd = fd;
+            s_maps[i].owned_fd = owned;
+            if (fd >= 0 && fstat(fd, &st) == 0) {
+                s_maps[i].dev = st.st_dev;
+                s_maps[i].ino = st.st_ino;
+                s_maps[i].has_ino = 1u;
+            } else {
+                s_maps[i].dev = 0;
+                s_maps[i].ino = 0;
+                s_maps[i].has_ino = 0u;
+            }
             s_maps[i].gva = gva;
             s_maps[i].len = len;
             s_maps[i].file_offset = file_offset;
@@ -307,10 +360,28 @@ int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
     return -1;
 }
 
-void i686_vm_file_untrack_map(uint32_t gva, size_t len)
+int i686_vm_file_untrack_map(uint32_t gva, size_t len)
 {
     uint64_t end = (uint64_t)gva + (uint64_t)len;
+    uint32_t splits_needed = 0u;
+    uint32_t free_slots = 0u;
     uint32_t i;
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        if (s_maps[i].used == 0) {
+            free_slots++;
+        } else {
+            uint64_t m_start = (uint64_t)s_maps[i].gva;
+            uint64_t m_end = m_start + (uint64_t)s_maps[i].len;
+            if (m_start < (uint64_t)gva && m_end > end) {
+                splits_needed++;
+            } else if (m_start >= (uint64_t)gva && m_end <= end) {
+                free_slots++;
+            }
+        }
+    }
+    if (splits_needed > free_slots) {
+        return -1;
+    }
     for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
         uint64_t m_start;
         uint64_t m_end;
@@ -323,7 +394,7 @@ void i686_vm_file_untrack_map(uint32_t gva, size_t len)
             continue;
         }
         if (m_start >= (uint64_t)gva && m_end <= end) {
-            s_maps[i].used = 0;
+            close_map_slot(&s_maps[i]);
         } else if (m_start < (uint64_t)gva && m_end <= end) {
             s_maps[i].len = (size_t)((uint64_t)gva - m_start);
         } else if (m_start >= (uint64_t)gva && m_end > end) {
@@ -332,9 +403,36 @@ void i686_vm_file_untrack_map(uint32_t gva, size_t len)
             s_maps[i].len = (size_t)(m_end - end);
             s_maps[i].file_offset += delta;
         } else {
+            /* Interior hole unmap (I686-R2-7): split into [m_start, gva)
+             * and [end, m_end) with adjusted file_offset and duplicated FD. */
+            uint64_t tail_delta = end - m_start;
+            size_t tail_len = (size_t)(m_end - end);
+            uint32_t j;
+            int src_fd = (s_maps[i].owned_fd >= 0) ? s_maps[i].owned_fd
+                                                   : s_maps[i].fd;
+            int new_fd = (src_fd >= 0) ? dup_map_fd(src_fd) : -1;
+            if (src_fd >= 0 && new_fd < 0) {
+                return -1;
+            }
             s_maps[i].len = (size_t)((uint64_t)gva - m_start);
+            for (j = 0u; j < I686_FILE_MAX_MAPS; j++) {
+                if (s_maps[j].used == 0) {
+                    s_maps[j].used = 1;
+                    s_maps[j].fd = s_maps[i].fd;
+                    s_maps[j].owned_fd = new_fd;
+                    s_maps[j].dev = s_maps[i].dev;
+                    s_maps[j].ino = s_maps[i].ino;
+                    s_maps[j].has_ino = s_maps[i].has_ino;
+                    s_maps[j].gva = (uint32_t)end;
+                    s_maps[j].len = tail_len;
+                    s_maps[j].file_offset = s_maps[i].file_offset + tail_delta;
+                    s_maps[j].kind = s_maps[i].kind;
+                    break;
+                }
+            }
         }
     }
+    return 0;
 }
 
 int i686_vm_file_lookup_map(uint32_t gva, int *out_fd,
@@ -352,7 +450,8 @@ int i686_vm_file_lookup_map(uint32_t gva, int *out_fd,
         if ((uint64_t)gva >= m_start && (uint64_t)gva < m_end) {
             uint64_t delta = (uint64_t)gva - m_start;
             if (out_fd != NULL) {
-                *out_fd = s_maps[i].fd;
+                *out_fd = (s_maps[i].owned_fd >= 0) ? s_maps[i].owned_fd
+                                                    : s_maps[i].fd;
             }
             if (out_file_offset != NULL) {
                 *out_file_offset = s_maps[i].file_offset + delta;
@@ -366,26 +465,41 @@ int i686_vm_file_lookup_map(uint32_t gva, int *out_fd,
     return -1;
 }
 
+static int map_matches_fd(const file_map_t *m, int fd, int have_st,
+                          const struct stat *st)
+{
+    if (have_st && m->has_ino != 0u) {
+        return (m->dev == st->st_dev && m->ino == st->st_ino) ? 1 : 0;
+    }
+    return (m->fd == fd || m->owned_fd == fd) ? 1 : 0;
+}
+
 size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len)
 {
     uint64_t w_end = file_offset + (uint64_t)len;
     size_t refreshed = 0u;
+    struct stat st;
+    int have_st;
     uint32_t i;
     if (s_ready == 0 || len == 0u) {
         return 0u;
     }
+    have_st = (fd >= 0 && fstat(fd, &st) == 0) ? 1 : 0;
     for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
         uint64_t m_start;
         uint64_t m_end;
         uint64_t o_start;
         uint64_t o_end;
         uint64_t f;
-        if (s_maps[i].used == 0 || s_maps[i].fd != fd ||
+        int rfd;
+        if (s_maps[i].used == 0 ||
+            !map_matches_fd(&s_maps[i], fd, have_st, &st) ||
             (s_maps[i].kind != 1u &&
                 s_maps[i].kind != 2u)) { /* file image (private or A2
             staged shared); anonymous mappings carry no file bytes */
             continue;
         }
+        rfd = (s_maps[i].owned_fd >= 0) ? s_maps[i].owned_fd : fd;
         m_start = s_maps[i].file_offset;
         m_end = m_start + (uint64_t)s_maps[i].len;
         o_start = (file_offset > m_start) ? file_offset : m_start;
@@ -410,7 +524,7 @@ size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len)
             }
             dst = (uint8_t *)(uintptr_t)(s_arena_base + (uint64_t)gva);
             while (r_start < r_end) {
-                ssize_t n = pread(fd, dst + (r_start - (f & ~0xFFFULL)),
+                ssize_t n = pread(rfd, dst + (r_start - (f & ~0xFFFULL)),
                                   (size_t)(r_end - r_start),
                                   (off_t)r_start);
                 if (n <= 0) {
@@ -427,12 +541,16 @@ size_t i686_vm_file_note_pwrite(int fd, uint64_t file_offset, size_t len)
 size_t i686_vm_file_note_ftruncate(int fd, uint64_t new_size)
 {
     size_t shrunk = 0u;
+    struct stat st;
+    int have_st;
     uint32_t i;
     if (s_ready == 0) {
         return 0u;
     }
+    have_st = (fd >= 0 && fstat(fd, &st) == 0) ? 1 : 0;
     for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
-        if (s_maps[i].used != 0 && s_maps[i].fd == fd &&
+        if (s_maps[i].used != 0 &&
+            map_matches_fd(&s_maps[i], fd, have_st, &st) &&
             s_maps[i].kind == 1u && /* MAP_PRIVATE file image only */
             new_size < s_maps[i].file_offset + (uint64_t)s_maps[i].len) {
             i686_vm_file_note_shrink(s_arena_base, s_maps[i].gva,

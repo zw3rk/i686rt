@@ -49,29 +49,7 @@ static uint8_t eff_default16(const i686_ctx_t *ctx)
     return (ctx->ldt != NULL && ctx->cs_d == 0U) ? 1u : 0u;
 }
 
-/*
- * Phase-7 synthetic opcode ids (registry-only; the enum ends at
- * I686_OP_COUNT = 359 after the RC7b T1 union extension, the interp
- * registry holds 512 slots; the block moved up from 350 with that
- * extension — docs/lanes/phase-7.md T1 record).  MUST match the
- * identical table in src/interp/h_seg.c (which registers handlers).
- */
-enum {
-    I686_OP7_POP_SS = 460, /* 17                                      */
-    I686_OP7_CALLF  = 461, /* 9A Ap: m16:16 / m16:32 far pointer      */
-    I686_OP7_JMPF   = 462, /* EA Ap                                   */
-    I686_OP7_LES    = 463, /* C4 Gv,mp                                */
-    I686_OP7_LDS    = 464, /* C5 Gv,mp                                */
-    I686_OP7_RETF   = 465, /* CB                                      */
-    I686_OP7_LSS    = 466, /* 0F B2 Gv,mp                             */
-    I686_OP7_LFS    = 467, /* 0F B4 Gv,mp                             */
-    I686_OP7_LGS    = 468, /* 0F B5 Gv,mp                             */
-    I686_OP7_PRIV   = 469, /* E4-E7/EC-EF, 0F 20-23 (16-bit code)     */
-    I686_OP7_UNPCKLPS = 470, /* 0F 14 Vps,Wps / 66 Vpd,Wpd            */
-    I686_OP7_UNPCKHPS = 471, /* 0F 15 Vps,Wps / 66 Vpd,Wpd            */
-    I686_OP7_PACKUSWB = 472, /* 0F 67 Pq,Qd / 66 Vdq,Wdq              */
-    I686_OP7_SHUFPS   = 473  /* 0F C6 Vps,Wps,Ib / 66 Vpd,Wpd,Ib      */
-};
+/* Phase-7 synthetic opcode ids (I686_OP7_*) are declared in decode.h. */
 
 static uint8_t fetch8(i686_ctx_t *ctx, uint32_t va)
 {

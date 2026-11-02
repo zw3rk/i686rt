@@ -122,7 +122,8 @@
  * recovery emulates exactly once.  Delta comes from translate.c's
  * per-insn e->insn_pc (no cursor walk: cursor state is shared while
  * e->insn_pc is per-emission).  mem is the LSE/CASAL offset itself;
- * there is no TSO pair for AL atomics (e->tso never set), so no +4. */
+ * AL atomics carry their own acquire-release ordering so no extra TSO
+ * barrier precedes them and no +4 offset adjustment is needed. */
 static void em_atomic_site(i686_emit_ctx_t *e, const x86_insn_t *insn,
                            uint32_t seq, uint32_t mem, uint32_t cont,
                            unsigned width)

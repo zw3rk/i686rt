@@ -205,8 +205,9 @@ static long sys_personality(i686_ctx_t *ctx, uint32_t persona)
 static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val)
 {
     extern int i686_subpage_range_ok(const i686_ctx_t *, uint32_t, uint64_t, uint8_t);
-    extern int i686_vm32_pin_page(i686_ctx_t *, uint32_t);
-    extern void i686_vm32_unpin_page(i686_ctx_t *, uint32_t);
+    extern long i686_vm32_futex(i686_ctx_t *, uint32_t, uint32_t, uint32_t,
+                                const struct timespec *, uint32_t, uint32_t,
+                                uint32_t);
     static const uint32_t timeout_cmds =
         (1u << FUTEX_WAIT_) | (1u << FUTEX_LOCK_PI_) |
         (1u << FUTEX_WAIT_BITSET_) | (1u << FUTEX_WAIT_REQUEUE_PI_);
@@ -224,7 +225,6 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
     struct timespec ts;
     void *arg4;
     void *huaddr2 = NULL;
-    int has_uaddr2 = 0;
     long rc;
 
     if (guest_ptr_bad(uaddr)) {
@@ -255,57 +255,34 @@ static long sys_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op, uint32_t val
             return -EFAULT;
         }
         huaddr2 = i686_guest_ptr(ctx, uaddr2_va);
-        has_uaddr2 = 1;
-    }
-    (void)i686_vm32_pin_page(ctx, uaddr);
-    if (has_uaddr2) {
-        (void)i686_vm32_pin_page(ctx, uaddr2_va);
     }
 #ifdef __linux__
-    rc = (long)syscall(SYS_futex, i686_guest_ptr(ctx, uaddr), (unsigned int)op,
-                       (unsigned int)val, arg4, huaddr2, (unsigned int)val3);
-    if (rc < 0) {
-        rc = (errno == EWOULDBLOCK) ? -EAGAIN : -errno;
+    if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
+        const struct timespec *tp =
+            (cmd < 32u && ((timeout_cmds >> cmd) & 1u) != 0u && utime_va != 0U)
+                ? &ts
+                : NULL;
+        rc = i686_vm32_futex(ctx, uaddr, op, val, tp,
+                             ctx->gpr[I686_REG_ESI], uaddr2_va, val3);
+    } else {
+        rc = (long)syscall(SYS_futex, i686_guest_ptr(ctx, uaddr),
+                           (unsigned int)op, (unsigned int)val, arg4,
+                           huaddr2, (unsigned int)val3);
+        if (rc < 0) {
+            rc = (errno == EWOULDBLOCK) ? -EAGAIN : -errno;
+        }
     }
 #else
+    (void)huaddr2;
     {
-        _Atomic uint32_t *hp = (_Atomic uint32_t *)i686_guest_ptr(ctx, uaddr);
-        switch (cmd) {
-        case FUTEX_WAIT_:
-        case FUTEX_WAIT_BITSET_: {
-            uint32_t bitset = (cmd == FUTEX_WAIT_BITSET_) ? val3 : 0xFFFFFFFFu;
-            int abs_time = (cmd == FUTEX_WAIT_BITSET_) ? 1 : 0;
-            int clk_rt = ((op & 256u) != 0u) ? 1 : 0;
-            rc = (long)rt_host_futex_wait_bitset(
-                hp, NULL, val, (arg4 != NULL) ? &ts : NULL,
-                abs_time, clk_rt, bitset, NULL, 0u);
-            break;
-        }
-        case FUTEX_WAKE_:
-        case FUTEX_WAKE_BITSET_: {
-            uint32_t bitset = (cmd == FUTEX_WAKE_BITSET_) ? val3 : 0xFFFFFFFFu;
-            rc = (long)rt_host_futex_wake_bitset(hp, NULL, (int)val, bitset);
-            break;
-        }
-        case FUTEX_REQUEUE_:
-        case FUTEX_CMP_REQUEUE_: {
-            _Atomic uint32_t *hp2 = (_Atomic uint32_t *)huaddr2;
-            uint32_t *cmp = (cmd == FUTEX_CMP_REQUEUE_) ? &val3 : NULL;
-            rc = (long)rt_host_futex_requeue(
-                hp, NULL, (int)val, hp2, NULL,
-                (int)ctx->gpr[I686_REG_ESI], cmp);
-            break;
-        }
-        default:
-            rc = -ENOSYS;
-            break;
-        }
+        const struct timespec *tp =
+            (cmd < 32u && ((timeout_cmds >> cmd) & 1u) != 0u && utime_va != 0U)
+                ? &ts
+                : NULL;
+        rc = i686_vm32_futex(ctx, uaddr, op, val, tp,
+                             ctx->gpr[I686_REG_ESI], uaddr2_va, val3);
     }
 #endif
-    if (has_uaddr2) {
-        i686_vm32_unpin_page(ctx, uaddr2_va);
-    }
-    i686_vm32_unpin_page(ctx, uaddr);
     return rc;
 }
 

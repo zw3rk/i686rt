@@ -136,6 +136,7 @@ static int create_anon_file(const char *name, const void *data, size_t len)
 
 size_t i686_proc_render_maps(const i686_ctx_t *ctx, char *buf, size_t cap)
 {
+    extern void rt32_vm_sync_ctx_if_stale(i686_ctx_t *);
     if (buf == NULL || cap == 0U) {
         return 0U;
     }
@@ -143,6 +144,7 @@ size_t i686_proc_render_maps(const i686_ctx_t *ctx, char *buf, size_t cap)
     if (ctx == NULL) {
         return 0U;
     }
+    rt32_vm_sync_ctx_if_stale((i686_ctx_t *)(uintptr_t)ctx);
     size_t off = 0U;
     for (size_t i = 0U; i < ctx->region_count; i++) {
         const i686_region_t *r = &ctx->regions[i];

@@ -22,9 +22,10 @@
 
 typedef struct dbt_entry {
     uint32_t eip;
-    uint32_t len;      /* 0 = empty */
-    uint32_t page_gen; /* snapshot of g_dbt_page_gen[eip >> 12] */
-    uint8_t *code;     /* mmap RX */
+    uint32_t len;       /* 0 = empty */
+    uint32_t page_gen;  /* snapshot of g_dbt_page_gen[eip >> 12] */
+    uint32_t page_gen1; /* snapshot of g_dbt_page_gen[((eip >> 12) + 1) & 0xFFFFF] */
+    uint8_t *code;      /* mmap RX */
     size_t   cap;
 } dbt_entry_t;
 

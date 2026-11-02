@@ -24,12 +24,22 @@
 #include <unistd.h>
 
 static _Atomic uint32_t g_vm_lock = 0U;
+static _Atomic uint32_t g_vm_epoch = 1U;
 static i686_ctx_t       *g_vm_root_ctx = NULL;
 static uint32_t         g_vm_brk_base = 0U;
 static uint32_t         g_vm_brk_curr = 0U;
 uint32_t                g_vm_mmap_cursor = RT32_MMAP_BASE_32;
 static i686_region_t    g_vm_regions[I686_MAX_REGIONS];
 static size_t           g_vm_region_count = 0U;
+
+static void vm_bump_epoch(void)
+{
+    uint32_t next = atomic_fetch_add_explicit(&g_vm_epoch, 1U,
+                                              memory_order_acq_rel) + 1U;
+    if (next == 0U) {
+        atomic_fetch_add_explicit(&g_vm_epoch, 1U, memory_order_acq_rel);
+    }
+}
 
 void rt32_vm_lock_acquire(void)
 {
@@ -167,6 +177,7 @@ static void vm_copy_state_to_ctx(i686_ctx_t *dst)
                        : I686_MAX_REGIONS;
     dst->mmap_cursor  = g_vm_mmap_cursor;
     dst->region_count = count;
+    dst->vm_reserved[0] = (uint64_t)atomic_load_explicit(&g_vm_epoch, memory_order_acquire);
     if (count > 0U) {
         memcpy(dst->regions, g_vm_regions, count * sizeof(i686_region_t));
     }
@@ -195,6 +206,8 @@ static void vm_remove_region_at(size_t idx)
 void rt32_vm_file_sync_prot_locked(uint32_t start, uint32_t end)
 {
     uint32_t cur = start;
+    (void)i686_vm_file_init((g_vm_root_ctx != NULL) ? g_vm_root_ctx->guest_base
+                                                    : 0ULL);
     while (cur < end) {
         bool hit = false;
         size_t i;
@@ -204,6 +217,7 @@ void rt32_vm_file_sync_prot_locked(uint32_t start, uint32_t end)
                 uint32_t seg_end = (r->end < end) ? r->end : end;
                 i686_vm_file_set_prot(cur, seg_end - cur,
                                       (uint8_t)(r->prot & 0x7U));
+                i686_vm_file_flags_add(cur, seg_end - cur, 0x80u);
                 cur = seg_end;
                 hit = true;
                 break;
@@ -218,9 +232,11 @@ void rt32_vm_file_sync_prot_locked(uint32_t start, uint32_t end)
                 }
             }
             i686_vm_file_set_prot(cur, next - cur, 0U);
+            i686_vm_file_flags_clear(cur, next - cur, 0x80u);
             cur = next;
         }
     }
+    vm_bump_epoch();
 }
 
 void rt32_vm_union_protect_a2(i686_ctx_t *ctx, uint32_t start, uint32_t end)
@@ -260,6 +276,26 @@ static int vm_insert_region_raw(uint32_t start, uint32_t end,
     return 0;
 }
 
+static bool vm_file_contiguous(uint32_t end_a, uint32_t start_b)
+{
+    int fd_a = -1;
+    int fd_b = -1;
+    uint64_t off_a = 0ULL;
+    uint64_t off_b = 0ULL;
+    uint8_t kind_a = 0U;
+    uint8_t kind_b = 0U;
+    if (end_a < I686_PAGE_SIZE || end_a != start_b) {
+        return false;
+    }
+    if (i686_vm_file_lookup_map(end_a - I686_PAGE_SIZE, &fd_a, &off_a,
+                                &kind_a) != 0 ||
+        i686_vm_file_lookup_map(start_b, &fd_b, &off_b, &kind_b) != 0) {
+        return false;
+    }
+    return (fd_a == fd_b) && (kind_a == kind_b) &&
+           (off_a + (uint64_t)I686_PAGE_SIZE == off_b);
+}
+
 static void vm_coalesce_regions_locked(void)
 {
     if (g_vm_region_count < 2U) {
@@ -270,7 +306,9 @@ static void vm_coalesce_regions_locked(void)
         i686_region_t *prev = &g_vm_regions[dst];
         const i686_region_t *curr = &g_vm_regions[src];
         if (prev->end == curr->start && prev->prot == curr->prot &&
-            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0) {
+            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0 &&
+            ((prev->flags & RT32_MAP_ANONYMOUS) != 0U ||
+             vm_file_contiguous(prev->end, curr->start))) {
             prev->end = curr->end;
         } else {
             dst++;
@@ -439,7 +477,10 @@ bool rt32_vm_check_mapped_range_locked(uint32_t start, uint32_t end,
             }
             first = false;
         } else if ((out_prot != NULL && r->prot != first_prot) ||
-                   (out_flags != NULL && (r->flags & 0x23U) != first_flags)) {
+                   (out_flags != NULL &&
+                    ((r->flags & 0x23U) != first_flags ||
+                     ((first_flags & RT32_MAP_ANONYMOUS) == 0U &&
+                      !vm_file_contiguous(cur, r->start))))) {
             return false;
         }
         if (r->end >= end) {
@@ -585,6 +626,12 @@ int rt32_vm_init(i686_ctx_t *ctx, uint64_t requested_window)
     g_vm_region_count = 0U;
     ctx->mmap_cursor  = RT32_MMAP_BASE_32;
     ctx->region_count = 0U;
+    (void)i686_vm_file_init(ctx->guest_base);
+    rt32_vm_file_sync_prot_locked(0U, 0x80000000U);
+    rt32_vm_file_sync_prot_locked(0x80000000U, 0xFFFFF000U);
+    i686_vm_file_set_prot(0xFFFFF000U, 0x1000U, 0U);
+    i686_vm_file_flags_clear(0xFFFFF000U, 0x1000U, 0x80u);
+    ctx->vm_reserved[0] = (uint64_t)atomic_load_explicit(&g_vm_epoch, memory_order_acquire);
     rt32_vm_lock_release();
     return 0;
 }
@@ -617,6 +664,11 @@ void rt32_vm_reset_for_exec(i686_ctx_t *ctx)
     g_vm_brk_base  = 0U;
     g_vm_brk_curr  = 0U;
     g_vm_mmap_cursor = RT32_MMAP_BASE_32;
+    i686_vm_file_untrack_map(0U, 0xFFFFF000U);
+    rt32_vm_file_sync_prot_locked(0U, 0x80000000U);
+    rt32_vm_file_sync_prot_locked(0x80000000U, 0xFFFFF000U);
+    i686_vm_file_set_prot(0xFFFFF000U, 0x1000U, 0U);
+    i686_vm_file_flags_clear(0xFFFFF000U, 0x1000U, 0x80u);
     rt32_vm_lock_release();
 
     (void)munmap((void *)(uintptr_t)I686_LOW_GUARD_SIZE,
@@ -627,6 +679,7 @@ void rt32_vm_reset_for_exec(i686_ctx_t *ctx)
     ctx->mmap_cursor = RT32_MMAP_BASE_32;
     ctx->vdso_base   = 0U;
     ctx->region_count = (w <= I686_MAX_REGIONS) ? w : I686_MAX_REGIONS;
+    ctx->vm_reserved[0] = (uint64_t)atomic_load_explicit(&g_vm_epoch, memory_order_acquire);
     if (ctx->region_count > 0U) {
         memcpy(ctx->regions, g_vm_regions, ctx->region_count * sizeof(i686_region_t));
     }
@@ -724,4 +777,16 @@ void rt32_vm_sync_ctx(i686_ctx_t *ctx)
     rt32_vm_sync_from_ctx(ctx);
     rt32_vm_sync_to_ctx(ctx);
     rt32_vm_lock_release();
+}
+
+void rt32_vm_sync_ctx_if_stale(i686_ctx_t *ctx)
+{
+    uint32_t ep;
+    if (!ctx || ctx->vm_reserved[0] == 0U) {
+        return;
+    }
+    ep = atomic_load_explicit(&g_vm_epoch, memory_order_acquire);
+    if (ctx->vm_reserved[0] != (uint64_t)ep) {
+        rt32_vm_sync_ctx(ctx);
+    }
 }

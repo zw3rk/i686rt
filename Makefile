@@ -300,7 +300,7 @@ U3_TEST_SRCS := tests/unit/test_u3_sites.c src/dbt/aot/aot.c \
 test-u3: ## Build and run the Wave U3 host check (must print U3-I686 OK)
 	@mkdir -p $(BUILD_DIR)
 	$(HOST_CC) $(CFLAGS) $(HOST_DEFS) -DI686RT_NO_DBT $(U3_TEST_SRCS) -o $(BUILD_DIR)/test_u3_sites -pthread
-	./$(BUILD_DIR)/test_u3_sites
+	timeout --kill-after=10s 30s ./$(BUILD_DIR)/test_u3_sites
 
 .PHONY: check-line-limits build-darwin test-u3
 

@@ -34,23 +34,13 @@
 extern int i686_fault_region_prot(const i686_ctx_t *ctx, uint32_t ga,
                                   uint32_t *out_prot, uint32_t *out_flags);
 extern void i686_fault_arm(sigjmp_buf *jb);
+extern void i686_fault_disarm(void);
 extern sigjmp_buf *i686_fault_save(void);
 extern uint64_t i686_fault_addr(void);
-
-enum {
-    SUBPAGE_OP7_POP_SS = 460,
-    SUBPAGE_OP7_CALLF  = 461,
-    SUBPAGE_OP7_LES    = 463,
-    SUBPAGE_OP7_LDS    = 464,
-    SUBPAGE_OP7_RETF   = 465,
-    SUBPAGE_OP7_LSS    = 466,
-    SUBPAGE_OP7_LFS    = 467,
-    SUBPAGE_OP7_LGS    = 468,
-    SUBPAGE_OP7_UNPCKLPS = 470,
-    SUBPAGE_OP7_UNPCKHPS = 471,
-    SUBPAGE_OP7_PACKUSWB = 472,
-    SUBPAGE_OP7_SHUFPS   = 473
-};
+#ifndef I686RT_NO_DBT
+extern void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start,
+                                      uint32_t end);
+#endif
 
 typedef struct {
     uint32_t va;
@@ -133,14 +123,18 @@ static int span_touches_page(const subpage_span_t *s, uint32_t page_va)
 
 /* Safely decode the instruction at ctx->eip, temporarily opening the
  * covering host page(s) under the subpage lock if the code sub-page is
- * readable in the mirror but its host cover is widened shut. */
-static int safe_decode_eip(i686_ctx_t *ctx, x86_insn_t *out)
+ * readable in the mirror but its host cover is widened shut.
+ * An inner sigsetjmp guard ensures any decode fault restores widened
+ * pages and releases the subpage lock (I686-R2-3). */
+static int safe_decode_eip(i686_ctx_t *ctx, x86_insn_t *out,
+                           uint8_t out_bytes[16])
 {
     uint32_t fetch_va = ctx->seg_base[I686_SEG_CS] + ctx->eip;
     uint32_t max_len = 15u;
     uint32_t hps = (ctx->vm_host_page != 0u) ? ctx->vm_host_page : 4096u;
-    int rc;
+    volatile int rc = -1;
 
+    memset(out_bytes, 0, 16u);
     if (!i686_subpage_range_ok(ctx, fetch_va, 1u, 0x01u)) {
         return -1;
     }
@@ -151,16 +145,64 @@ static int safe_decode_eip(i686_ctx_t *ctx, x86_insn_t *out)
     if (ctx->vm_regime == I686_VM_REGIME_A2 && hps > 4096u) {
         uint32_t p0 = fetch_va & ~(hps - 1u);
         uint32_t p1 = (fetch_va + max_len - 1u) & ~(hps - 1u);
+        sigjmp_buf *outer = i686_fault_save();
+        sigjmp_buf inner;
         i686_vm32_subpage_lock();
         if (i686_vm32_union_prot(ctx, p0, p1 + hps) != 0) {
             i686_vm32_subpage_unlock();
             return -1;
         }
+        if (sigsetjmp(inner, 1) != 0) {
+            if (outer != NULL) {
+                i686_fault_arm(outer);
+            } else {
+                i686_fault_disarm();
+            }
+            (void)i686_vm32_widen_prot(ctx, p0, p1 + hps);
+            i686_vm32_subpage_unlock();
+            return -1;
+        }
+        i686_fault_arm(&inner);
         rc = x86_decode(ctx, ctx->eip, out);
+        if (rc == 0 && out->len > 0u && out->len <= max_len) {
+            uint32_t k;
+            for (k = 0u; k < out->len && k < 15u; k++) {
+                out_bytes[k] =
+                    *(const uint8_t *)i686_guest_ptr(ctx, fetch_va + k);
+            }
+        }
+        if (outer != NULL) {
+            i686_fault_arm(outer);
+        } else {
+            i686_fault_disarm();
+        }
         (void)i686_vm32_widen_prot(ctx, p0, p1 + hps);
         i686_vm32_subpage_unlock();
     } else {
+        sigjmp_buf *outer = i686_fault_save();
+        sigjmp_buf inner;
+        if (sigsetjmp(inner, 1) != 0) {
+            if (outer != NULL) {
+                i686_fault_arm(outer);
+            } else {
+                i686_fault_disarm();
+            }
+            return -1;
+        }
+        i686_fault_arm(&inner);
         rc = x86_decode(ctx, ctx->eip, out);
+        if (rc == 0 && out->len > 0u && out->len <= max_len) {
+            uint32_t k;
+            for (k = 0u; k < out->len && k < 15u; k++) {
+                out_bytes[k] =
+                    *(const uint8_t *)i686_guest_ptr(ctx, fetch_va + k);
+            }
+        }
+        if (outer != NULL) {
+            i686_fault_arm(outer);
+        } else {
+            i686_fault_disarm();
+        }
     }
     if (rc != 0 || out->len == 0u || out->len > max_len) {
         return -1;
@@ -171,7 +213,8 @@ static int safe_decode_eip(i686_ctx_t *ctx, x86_insn_t *out)
     return 0;
 }
 
-static void classify_sse_x87_modrm(i686_ctx_t *ctx, const x86_insn_t *insn,
+static void classify_sse_x87_modrm(const x86_insn_t *insn,
+                                   const uint8_t insn_bytes[16],
                                    uint32_t ea, uint32_t op_bytes,
                                    subpage_access_t *acc)
 {
@@ -244,9 +287,9 @@ static void classify_sse_x87_modrm(i686_ctx_t *ctx, const x86_insn_t *insn,
         span_add(acc, ea, 8u, 0x03u);
         return;
     }
-    if (op == SUBPAGE_OP7_LES || op == SUBPAGE_OP7_LDS ||
-        op == SUBPAGE_OP7_LSS || op == SUBPAGE_OP7_LFS ||
-        op == SUBPAGE_OP7_LGS) {
+    if (op == I686_OP7_LES || op == I686_OP7_LDS ||
+        op == I686_OP7_LSS || op == I686_OP7_LFS ||
+        op == I686_OP7_LGS) {
         span_add(acc, ea, op_bytes + 2u, 0x01u);
         return;
     }
@@ -263,18 +306,17 @@ static void classify_sse_x87_modrm(i686_ctx_t *ctx, const x86_insn_t *insn,
         return;
     }
     if ((op >= I686_OP_MOVUPS && op <= I686_OP_PMOVMSKB) ||
-        (op >= SUBPAGE_OP7_UNPCKLPS && op <= SUBPAGE_OP7_SHUFPS)) {
+        (op >= I686_OP7_UNPCKLPS && op <= I686_OP7_SHUFPS)) {
         /* Determine SSE/MMX store vs load and width. */
         uint32_t w = 16u;
         uint8_t need = 0x01u;
-        /* Inspect the opcode byte after 0x0F in the instruction stream. */
-        uint32_t cs_base = ctx->seg_base[I686_SEG_CS];
+        /* Inspect the opcode byte after 0x0F from the captured insn_bytes. */
         uint32_t b_idx;
         uint8_t op_byte = 0u;
-        for (b_idx = 0u; b_idx + 1u < insn->len; b_idx++) {
-            uint8_t b = *(const uint8_t *)i686_guest_ptr(ctx, cs_base + ctx->eip + b_idx);
+        for (b_idx = 0u; b_idx + 1u < insn->len && b_idx + 1u < 16u; b_idx++) {
+            uint8_t b = insn_bytes[b_idx];
             if (b == 0x0Fu) {
-                op_byte = *(const uint8_t *)i686_guest_ptr(ctx, cs_base + ctx->eip + b_idx + 1u);
+                op_byte = insn_bytes[b_idx + 1u];
                 break;
             }
         }
@@ -302,7 +344,7 @@ static void classify_sse_x87_modrm(i686_ctx_t *ctx, const x86_insn_t *insn,
                     op == I686_OP_PSHUFW ||
                     (op >= I686_OP_PUNPCKLBW && op <= I686_OP_PUNPCKHDQ) ||
                     (op >= I686_OP_PCMPGTB && op <= I686_OP_PSUBB) ||
-                    op == SUBPAGE_OP7_PACKUSWB)) {
+                    op == I686_OP7_PACKUSWB)) {
             w = (op >= I686_OP_PUNPCKLBW && op <= I686_OP_PUNPCKLDQ) ? 4u : 8u;
         }
         span_add(acc, ea, w, need);
@@ -310,6 +352,7 @@ static void classify_sse_x87_modrm(i686_ctx_t *ctx, const x86_insn_t *insn,
 }
 
 static int build_insn_access(i686_ctx_t *ctx, const x86_insn_t *insn,
+                             const uint8_t insn_bytes[16],
                              subpage_access_t *acc)
 {
     uint32_t op_bytes = (insn->pfx_opsize != 0u) ? 2u : 4u;
@@ -335,7 +378,7 @@ static int build_insn_access(i686_ctx_t *ctx, const x86_insn_t *insn,
                          op == I686_OP_STOSb || op == I686_OP_LODSb ||
                          op == I686_OP_SCASb) ? 1u : op_bytes;
         uint32_t count = (insn->pfx_rep != 0u)
-                             ? (insn->pfx_opsize != 0u
+                             ? (insn->pfx_addrsize != 0u
                                     ? (ctx->gpr[I686_REG_ECX] & 0xFFFFu)
                                     : ctx->gpr[I686_REG_ECX])
                              : 1u;
@@ -408,7 +451,7 @@ static int build_insn_access(i686_ctx_t *ctx, const x86_insn_t *insn,
     case I686_OP_CALL_Jz:
         span_add(acc, ss + esp - op_bytes, op_bytes, 0x02u);
         return 0;
-    case SUBPAGE_OP7_CALLF:
+    case I686_OP7_CALLF:
         span_add(acc, ss + esp - 2u * op_bytes, 2u * op_bytes, 0x02u);
         return 0;
     case I686_OP_PUSHA:
@@ -420,12 +463,12 @@ static int build_insn_access(i686_ctx_t *ctx, const x86_insn_t *insn,
     case I686_OP_POP_DS:
     case I686_OP_POP_FS:
     case I686_OP_POP_GS:
-    case SUBPAGE_OP7_POP_SS:
+    case I686_OP7_POP_SS:
     case I686_OP_RET:
     case I686_OP_RET_Iw:
         span_add(acc, ss + esp, op_bytes, 0x01u);
         return 0;
-    case SUBPAGE_OP7_RETF:
+    case I686_OP7_RETF:
         span_add(acc, ss + esp, 2u * op_bytes, 0x01u);
         return 0;
     case I686_OP_IRET:
@@ -526,7 +569,7 @@ static int build_insn_access(i686_ctx_t *ctx, const x86_insn_t *insn,
             span_add(acc, ea, w, need);
             return 0;
         }
-        classify_sse_x87_modrm(ctx, insn, ea, op_bytes, acc);
+        classify_sse_x87_modrm(insn, insn_bytes, ea, op_bytes, acc);
     }
     return 0;
 }
@@ -534,6 +577,7 @@ static int build_insn_access(i686_ctx_t *ctx, const x86_insn_t *insn,
 int i686_spurious_allow(i686_ctx_t *ctx, uint32_t ga)
 {
     x86_insn_t insn;
+    uint8_t insn_bytes[16];
     subpage_access_t acc;
     unsigned i;
     int matched = 0;
@@ -545,10 +589,10 @@ int i686_spurious_allow(i686_ctx_t *ctx, uint32_t ga)
         (i686_vm_file_prot(ga & ~0xFFFu) & 0x03u) == 0u) {
         return 0;
     }
-    if (safe_decode_eip(ctx, &insn) != 0) {
+    if (safe_decode_eip(ctx, &insn, insn_bytes) != 0) {
         return 0;
     }
-    (void)build_insn_access(ctx, &insn, &acc);
+    (void)build_insn_access(ctx, &insn, insn_bytes, &acc);
     for (i = 0u; i < acc.count; i++) {
         if (!i686_subpage_range_ok(ctx, acc.spans[i].va, acc.spans[i].len,
                                    acc.spans[i].need)) {
@@ -594,7 +638,7 @@ static int emulate_rep_string(i686_ctx_t *ctx, const x86_insn_t *insn,
                               const subpage_access_t *acc, uint32_t hps)
 {
     uint32_t orig_eip = ctx->eip;
-    uint32_t rem = (insn->pfx_opsize != 0u)
+    uint32_t rem = (insn->pfx_addrsize != 0u)
                        ? (ctx->gpr[I686_REG_ECX] & 0xFFFFu)
                        : ctx->gpr[I686_REG_ECX];
     uint8_t src_seg = (insn->pfx_seg != 0xFFu) ? insn->pfx_seg : I686_SEG_DS;
@@ -618,6 +662,8 @@ static int emulate_rep_string(i686_ctx_t *ctx, const x86_insn_t *insn,
         uint32_t s_p1 = ((src_va + acc->str_unit - 1u) & ~(hps - 1u)) + hps;
         uint32_t d_p0 = dst_va & ~(hps - 1u);
         uint32_t d_p1 = ((dst_va + acc->str_unit - 1u) & ~(hps - 1u)) + hps;
+        sigjmp_buf *outer;
+        sigjmp_buf inner;
         int ir;
 
         if (acc->str_has_esi &&
@@ -655,13 +701,46 @@ static int emulate_rep_string(i686_ctx_t *ctx, const x86_insn_t *insn,
             (void)i686_vm32_widen_prot(ctx, fetch_p0, fetch_p1);
             return -1;
         }
-        if (insn->pfx_opsize != 0u) {
+        if (insn->pfx_addrsize != 0u) {
             ctx->gpr[I686_REG_ECX] = (ctx->gpr[I686_REG_ECX] & 0xFFFF0000u) | 1u;
         } else {
             ctx->gpr[I686_REG_ECX] = 1u;
         }
         ctx->eip = orig_eip;
+        outer = i686_fault_save();
+        if (sigsetjmp(inner, 1) != 0) {
+            if (outer != NULL) {
+                i686_fault_arm(outer);
+            } else {
+                i686_fault_disarm();
+            }
+            if (insn->pfx_addrsize != 0u) {
+                ctx->gpr[I686_REG_ECX] =
+                    (ctx->gpr[I686_REG_ECX] & 0xFFFF0000u) | (rem & 0xFFFFu);
+            } else {
+                ctx->gpr[I686_REG_ECX] = rem;
+            }
+            if (acc->str_has_edi) {
+                (void)i686_vm32_widen_prot(ctx, d_p0, d_p1);
+            }
+            if (acc->str_has_esi) {
+                (void)i686_vm32_widen_prot(ctx, s_p0, s_p1);
+            }
+            (void)i686_vm32_widen_prot(ctx, fetch_p0, fetch_p1);
+            return -1;
+        }
+        i686_fault_arm(&inner);
         ir = i686_interp_step(ctx);
+        if (outer != NULL) {
+            i686_fault_arm(outer);
+        } else {
+            i686_fault_disarm();
+        }
+#ifndef I686RT_NO_DBT
+        if (acc->str_has_edi && (acc->str_edi_need & 0x02u) != 0u) {
+            i686_dbt_invalidate_range(ctx, dst_va, dst_va + acc->str_unit);
+        }
+#endif
         if (acc->str_has_edi) {
             (void)i686_vm32_widen_prot(ctx, d_p0, d_p1);
         }
@@ -669,7 +748,7 @@ static int emulate_rep_string(i686_ctx_t *ctx, const x86_insn_t *insn,
             (void)i686_vm32_widen_prot(ctx, s_p0, s_p1);
         }
         rem--;
-        if (insn->pfx_opsize != 0u) {
+        if (insn->pfx_addrsize != 0u) {
             ctx->gpr[I686_REG_ECX] = (ctx->gpr[I686_REG_ECX] & 0xFFFF0000u) |
                                      (rem & 0xFFFFu);
         } else {
@@ -695,6 +774,7 @@ static int emulate_rep_string(i686_ctx_t *ctx, const x86_insn_t *insn,
 int i686_spurious_emulate(i686_ctx_t *ctx, uint32_t ga)
 {
     x86_insn_t insn;
+    uint8_t insn_bytes[16];
     subpage_access_t acc;
     uint32_t hps;
     unsigned i;
@@ -709,10 +789,10 @@ int i686_spurious_emulate(i686_ctx_t *ctx, uint32_t ga)
         (i686_vm_file_prot(ga & ~0xFFFu) & 0x03u) == 0u) {
         return -1;
     }
-    if (safe_decode_eip(ctx, &insn) != 0) {
+    if (safe_decode_eip(ctx, &insn, insn_bytes) != 0) {
         return -1;
     }
-    (void)build_insn_access(ctx, &insn, &acc);
+    (void)build_insn_access(ctx, &insn, insn_bytes, &acc);
     for (i = 0u; i < acc.count; i++) {
         if (!i686_subpage_range_ok(ctx, acc.spans[i].va, acc.spans[i].len,
                                    acc.spans[i].need)) {
@@ -756,20 +836,34 @@ int i686_spurious_emulate(i686_ctx_t *ctx, uint32_t ga)
     {
         sigjmp_buf *outer = i686_fault_save();
         sigjmp_buf inner;
-        if (outer != NULL) {
-            if (sigsetjmp(inner, 1) != 0) {
-                widen_acc_covers(ctx, &acc, hps);
-                i686_vm32_subpage_unlock();
+        if (sigsetjmp(inner, 1) != 0) {
+            widen_acc_covers(ctx, &acc, hps);
+            i686_vm32_subpage_unlock();
+            if (outer != NULL) {
                 i686_fault_arm(outer);
                 siglongjmp(*outer, 1);
             }
-            i686_fault_arm(&inner);
+            i686_fault_disarm();
+            return -1;
         }
+        i686_fault_arm(&inner);
         ir = i686_interp_step(ctx);
         if (outer != NULL) {
             i686_fault_arm(outer);
+        } else {
+            i686_fault_disarm();
         }
     }
+#ifndef I686RT_NO_DBT
+    if (ir == I686_INTERP_CONTINUE) {
+        for (i = 0u; i < acc.count; i++) {
+            if ((acc.spans[i].need & 0x02u) != 0u) {
+                i686_dbt_invalidate_range(ctx, acc.spans[i].va,
+                                          acc.spans[i].va + acc.spans[i].len);
+            }
+        }
+    }
+#endif
     widen_acc_covers(ctx, &acc, hps);
     i686_vm32_subpage_unlock();
     return (ir == I686_INTERP_CONTINUE) ? 0 : -1;

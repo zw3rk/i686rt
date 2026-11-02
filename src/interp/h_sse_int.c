@@ -635,6 +635,7 @@ static int h_sfence(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod != 3U) {
         return I686_EXIT_UNDEF;
     }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return sse_done(ctx, insn);
 }
 

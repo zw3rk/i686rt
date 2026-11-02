@@ -344,10 +344,14 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
                                 uint32_t tid, int pending)
 {
     extern int i686_subpage_range_ok(const i686_ctx_t *, uint32_t, uint64_t, uint8_t);
-    extern int i686_vm32_pin_page(i686_ctx_t *, uint32_t);
-    extern void i686_vm32_unpin_page(i686_ctx_t *, uint32_t);
+    extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t, uint32_t);
+    extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
+    extern void i686_vm32_subpage_lock(void);
+    extern void i686_vm32_subpage_unlock(void);
+    extern long i686_vm32_futex_wake(i686_ctx_t *, uint32_t, uint32_t, uint32_t);
     volatile void *hp;
     uint32_t uval;
+    uint32_t after = 0u;
     int tries;
 
     if (robust_fetch_u32(ctx, futex_va, &uval) != 0) {
@@ -356,11 +360,31 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
     if ((uval & FUTEX_TID_MASK_) != tid) {
         return; /* not ours (or already recovered) */
     }
-    if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u &&
-        i686_subpage_range_ok(ctx, futex_va, 4u, 0x03u) == 0) {
+    if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
+        uint32_t hps = ctx->vm_host_page;
+        uint32_t gbase = futex_va & ~(hps - 1u);
+        if (i686_subpage_range_ok(ctx, futex_va, 4u, 0x03u) == 0) {
+            return;
+        }
+        i686_vm32_subpage_lock();
+        (void)i686_vm32_union_prot(ctx, gbase, gbase + hps);
+        hp = i686_guest_ptr(ctx, futex_va);
+        for (tries = 0; tries < 8; tries++) {
+            uint32_t cur = uval;
+            if (atomic_compare_exchange_strong((_Atomic uint32_t *)hp, &cur,
+                                               uval | FUTEX_OWNER_DIED_BIT_)) {
+                break;
+            }
+            uval = cur;
+        }
+        after = atomic_load((_Atomic uint32_t *)hp);
+        (void)i686_vm32_widen_prot(ctx, gbase, gbase + hps);
+        i686_vm32_subpage_unlock();
+        if (!pending && (after & FUTEX_WAITERS_BIT_) != 0u) {
+            (void)i686_vm32_futex_wake(ctx, futex_va, 1u, 0xFFFFFFFFu);
+        }
         return;
     }
-    (void)i686_vm32_pin_page(ctx, futex_va);
     hp = i686_guest_ptr(ctx, futex_va);
     for (tries = 0; tries < 8; tries++) {
         uint32_t cur = uval;
@@ -371,19 +395,16 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
         uval = cur; /* raced; retry like the kernel cmpxchg loop */
     }
     if (!pending) {
-        uint32_t after;
         if (robust_fetch_u32(ctx, futex_va, &after) == 0 &&
             (after & FUTEX_WAITERS_BIT_) != 0u) {
 #ifdef __linux__
             long hcmd = 1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/;
             (void)syscall(SYS_futex, (void *)hp, hcmd, 1, NULL, NULL, 0);
 #else
-            (void)rt_host_futex_wake_bitset((_Atomic uint32_t *)hp, NULL, 1,
-                                            0xFFFFFFFFu);
+            (void)i686_vm32_futex_wake(ctx, futex_va, 1u, 0xFFFFFFFFu);
 #endif
         }
     }
-    i686_vm32_unpin_page(ctx, futex_va);
 }
 
 static void robust_exit_walk(i686_ctx_t *ctx, uint32_t tid)
@@ -502,10 +523,12 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
      * hanging the joiner forever.  Robust recovery stays at-most-once
      * (a faulted walk simply degrades, as before); the clear+wake is
      * idempotent and retried until it completes. */
+    extern void i686_vm32_exec_leave(void);
     static __thread int s_robust_done;
     static __thread int s_clear_done;
     uint32_t tid;
 
+    i686_vm32_exec_leave();
     if (s_robust_done == 0) {
         s_robust_done = 1;
         tid = clone_host_gettid();
@@ -520,54 +543,37 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
     i686_thread_registry_remove(tid);
     if (ctx->clear_child_tid != 0U && s_clear_done == 0) {
         uint32_t zero = 0U;
-        /* C2-2: pin the tid word's host page open across the clear+wake.
-         * The page may be widened-NONE (thread-stack guard cover); the
-         * clear would fault (handled, retried) but the host-side wake
-         * on a NONE page fails EFAULT and the joiner is lost.  Union
-         * here, re-widen after.  Single-threaded teardown (the joiner
-         * is blocked in the kernel) so the transient open is safe. */
+        uint32_t ctid_va = ctx->clear_child_tid;
         extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t, uint32_t);
         extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
         extern void i686_vm32_subpage_lock(void);
         extern void i686_vm32_subpage_unlock(void);
+        extern long i686_vm32_futex_wake(i686_ctx_t *, uint32_t, uint32_t,
+                                         uint32_t);
         i686_vm32_subpage_lock();
         {
             uint32_t hps = (ctx->vm_host_page != 0u) ?
                 ctx->vm_host_page : 4096u;
-            uint32_t cpage = ctx->clear_child_tid & ~(hps - 1u);
+            uint32_t cpage = ctid_va & ~(hps - 1u);
             (void)i686_vm32_union_prot(ctx, cpage, cpage + hps);
-            memcpy(i686_guest_ptr(ctx, ctx->clear_child_tid), &zero, 4U);
+            memcpy(i686_guest_ptr(ctx, ctid_va), &zero, 4U);
             s_clear_done = 1;
-        }
-        {
-            /* Wake the joiner.  musl waits private (FUTEX_WAKE|PRIVATE)
-             * but glibc's joiner waits SHARED (observed C10:
-             * WAIT_BITSET|CLOCK_REALTIME without the private bit), and
-             * the two hash buckets do not overlap — the private-only
-             * wake left glibc's pthread_join blocked forever.  The
-             * kernel's mm_release cleartid wake is a shared wake, which
-             * is why both libcs work on real Linux. */
-#ifdef __linux__
-            (void)syscall(SYS_futex,
-                          i686_guest_ptr(ctx, ctx->clear_child_tid),
-                          1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/, 1,
-                          NULL, NULL, 0);
-            (void)syscall(SYS_futex,
-                          i686_guest_ptr(ctx, ctx->clear_child_tid),
-                          1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
-#else
-            (void)rt_host_futex_wake_bitset(
-                (_Atomic uint32_t *)i686_guest_ptr(ctx, ctx->clear_child_tid),
-                NULL, 1, 0xFFFFFFFFu);
-#endif
-        }
-        {
-            uint32_t hps = (ctx->vm_host_page != 0u) ?
-                ctx->vm_host_page : 4096u;
-            uint32_t cpage = ctx->clear_child_tid & ~(hps - 1u);
             (void)i686_vm32_widen_prot(ctx, cpage, cpage + hps);
         }
         i686_vm32_subpage_unlock();
+        if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
+            (void)i686_vm32_futex_wake(ctx, ctid_va, 1u, 0xFFFFFFFFu);
+        } else {
+#ifdef __linux__
+            (void)syscall(SYS_futex, i686_guest_ptr(ctx, ctid_va),
+                          1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/, 1,
+                          NULL, NULL, 0);
+            (void)syscall(SYS_futex, i686_guest_ptr(ctx, ctid_va),
+                          1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
+#else
+            (void)i686_vm32_futex_wake(ctx, ctid_va, 1u, 0xFFFFFFFFu);
+#endif
+        }
         ctx->clear_child_tid = 0U;
     }
 }

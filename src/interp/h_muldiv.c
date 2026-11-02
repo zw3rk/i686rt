@@ -154,7 +154,7 @@ static int h_imul1(i686_ctx_t *ctx, const x86_insn_t *insn)
 /* 0F AF — two-operand signed multiply, result truncated to Gv. */
 
 /* S1 ratified amendment: three-operand IMUL (0x69 Iz / 0x6B IbSX) —
- * dest = dest * rm * imm, truncated, with the two-operand overflow rule. */
+ * dest = rm * imm, truncated, with the two-operand overflow rule. */
 static int h_imul3(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     unsigned w = insn->pfx_opsize ? 16U : 32U;

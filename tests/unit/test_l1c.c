@@ -720,13 +720,14 @@ static void test_strings(i686_ctx_t *ctx)
     CHECK(ctx->gpr[I686_REG_ESI] == 0x1014);
     CHECK(ctx->gpr[I686_REG_EDI] == 0x2014);
 
-    /* rep movsw under 66: word width, CX count, upper ECX preserved. */
+    /* rep movsw under 66+67: word width, CX count, upper ECX preserved. */
     t_reset(ctx);
     seed(ctx, 0x1000, 4, 0x89abcdef);
     seed(ctx, 0x1004, 4, 0x01234567);
     i = mk_insn(I686_OP_MOVSw);
     i.pfx_rep = 1;
     i.pfx_opsize = 1;
+    i.pfx_addrsize = 1;
     ctx->gpr[I686_REG_ESI] = 0x1000;
     ctx->gpr[I686_REG_EDI] = 0x2000;
     ctx->gpr[I686_REG_ECX] = 0x00050003; /* count = 3 */
