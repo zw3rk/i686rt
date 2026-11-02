@@ -56,6 +56,7 @@ static _Atomic uint32_t s_subpage_writers;
 static _Atomic uint32_t s_exec_readers;
 static __thread volatile int s_in_guest_exec;
 static __thread volatile int s_holds_subpage_lock;
+static __thread volatile int s_subpage_dropped_exec;
 
 static pthread_mutex_t s_futex_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct vm32_futex_slot s_futex_slots[I686_VM32_FUTEX_SLOTS];
@@ -70,6 +71,7 @@ static void vm32_atfork_child(void)
     atomic_store_explicit(&s_exec_readers, 0u, memory_order_relaxed);
     s_in_guest_exec = 0;
     s_holds_subpage_lock = 0;
+    s_subpage_dropped_exec = 0;
     for (i = 0u; i < I686_VM32_FUTEX_SLOTS; i++) {
         s_futex_slots[i].in_use = 0;
         s_futex_slots[i].gva = 0u;
@@ -115,6 +117,12 @@ void i686_vm32_exec_leave(void)
 
 void i686_vm32_subpage_lock(void)
 {
+    /* I686-R2-1 follow-up: remember whether this thread dropped its own
+     * exec-reader registration so unlock can restore it. Without the
+     * restore, the first execution of every freshly compiled A2 block
+     * runs unregistered and a sibling's transient union_prot window is
+     * visible to it. */
+    s_subpage_dropped_exec = (s_in_guest_exec != 0) ? 1 : 0;
     if (s_in_guest_exec != 0) {
         s_in_guest_exec = 0;
         atomic_fetch_sub_explicit(&s_exec_readers, 1u, memory_order_release);
@@ -129,9 +137,33 @@ void i686_vm32_subpage_lock(void)
 
 void i686_vm32_subpage_unlock(void)
 {
+    int dropped = s_subpage_dropped_exec;
+    s_subpage_dropped_exec = 0;
     s_holds_subpage_lock = 0;
     (void)pthread_mutex_unlock(&s_subpage_mtx);
     atomic_fetch_sub_explicit(&s_subpage_writers, 1u, memory_order_release);
+    if (dropped != 0) {
+        /* Re-register as an exec reader with the same wait/add/recheck
+         * handshake as i686_vm32_exec_enter (no ctx is available here,
+         * and the registration was known-good before the lock dropped
+         * it, so no regime check is needed). */
+        for (;;) {
+            while (atomic_load_explicit(&s_subpage_writers,
+                                        memory_order_acquire) != 0u) {
+                (void)pthread_mutex_lock(&s_subpage_mtx);
+                (void)pthread_mutex_unlock(&s_subpage_mtx);
+            }
+            atomic_fetch_add_explicit(&s_exec_readers, 1u,
+                                      memory_order_seq_cst);
+            if (atomic_load_explicit(&s_subpage_writers,
+                                     memory_order_seq_cst) == 0u) {
+                s_in_guest_exec = 1;
+                return;
+            }
+            atomic_fetch_sub_explicit(&s_exec_readers, 1u,
+                                      memory_order_seq_cst);
+        }
+    }
 }
 
 int i686_vm32_init(i686_ctx_t *ctx, uint64_t requested_window)

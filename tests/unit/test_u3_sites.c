@@ -198,6 +198,50 @@ static void t_regime_file(void)
     i686_vm_file_fini();
 }
 
+/* I686-R2-7 follow-up: pass 1 must free fully covered entries before
+ * pass 2 splits a straddling entry, so the split reuses the freed slot
+ * even when the only free slot sits at a higher index than the
+ * straddling entry. The old single-pass order silently dropped the
+ * suffix in that layout. */
+static void t_file_untrack_high_slot(void)
+{
+    uint32_t k;
+    int fill_ok = 1;
+    int out_fd = -2;
+    uint64_t out_off = 0u;
+    uint8_t out_kind = 0u;
+    CHECK(i686_vm_file_init(0x100000000ULL) == 0, "vm_file re-init");
+    /* Slot 0: straddling entry needing an interior split. */
+    CHECK(i686_vm_file_track_map(-1, 0x50000000u, 5u * 4096u, 0u,
+                                 I686_BACKING_SHARED_FILE) == 0,
+          "track straddler");
+    /* Slots 1..254: dummies outside the untrack range. */
+    for (k = 0u; k < 254u; k++) {
+        if (i686_vm_file_track_map(-1, 0x60000000u + k * 4096u, 4096u, 0u,
+                                   I686_BACKING_SHARED_FILE) != 0) {
+            fill_ok = 0;
+        }
+    }
+    CHECK(fill_ok, "fill registry 1..254");
+    /* Slot 255: fully covered entry inside the untrack range. */
+    CHECK(i686_vm_file_track_map(-1, 0x50002000u, 4096u, 0x2000u,
+                                 I686_BACKING_SHARED_FILE) == 0,
+          "track covered high slot");
+    CHECK(i686_vm_file_untrack_map(0x50002000u, 2u * 4096u) == 0,
+          "high-slot interior untrack succeeds");
+    CHECK(i686_vm_file_lookup_map(0x50000000u, &out_fd, &out_off,
+                                  &out_kind) == 0 && out_off == 0u &&
+          out_kind == I686_BACKING_SHARED_FILE,
+          "prefix retained after high-slot split");
+    CHECK(i686_vm_file_lookup_map(0x50004000u, &out_fd, &out_off,
+                                  &out_kind) == 0 && out_off == 0x4000u &&
+          out_kind == I686_BACKING_SHARED_FILE,
+          "suffix split into freed high slot");
+    CHECK(i686_vm_file_lookup_map(0x50002000u, NULL, NULL, NULL) != 0,
+          "covered high entry freed");
+    i686_vm_file_fini();
+}
+
 /* ---- backend smoke -------------------------------------------------- */
 
 static void t_backend_mem(void)
@@ -326,6 +370,7 @@ int main(void)
     t_site_ring();
     t_aot_roundtrip();
     t_regime_file();
+    t_file_untrack_high_slot();
     t_backend_mem();
     t_backend_jit();
     t_backend_sync();

@@ -18,7 +18,7 @@ endif
 # src/main.c calls setenv(3), which musl hides under strict -std=c11 unless a
 # POSIX feature-test macro is visible; expose exactly that (keeps -pedantic
 # and every prescribed warning intact).
-CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
+CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 LDFLAGS ?= -static-pie
 HOST_CC ?= cc
 # Host-toolchain builds (build-darwin, test-u3) widen strict POSIX to the

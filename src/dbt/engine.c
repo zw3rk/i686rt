@@ -403,9 +403,13 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
         if (code == MAP_FAILED) {
             return NULL;
         }
-        /* I686-R2-4: arm SMC write-protection BEFORE sampling page_gen and
-         * BEFORE decoding guest bytes so any store or VMA invalidation
-         * during translation bumps g_dbt_page_gen and is caught below.
+        /* I686-R2-4: sample page_gen BEFORE arming SMC write-protection
+         * and BEFORE decoding guest bytes so a concurrent SMC write-fault
+         * between smc_protect and the sample cannot bump the generation
+         * undetected (its later stores during translation would no longer
+         * fault and post == pre would publish mixed bytes). Any store or
+         * VMA invalidation during translation bumps g_dbt_page_gen and is
+         * caught below.
          * On Regime A2 (16K/64K host pages), hold the sub-page lock and
          * temporarily apply union_prot while decoding guest bytes so a
          * widened neighbor sub-page does not SIGBUS the translator, then
@@ -429,6 +433,12 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
                                                  NULL) != 0 &&
                           (rprot1 & 0x05U) != 0U);
 
+            pre_pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
+                                             memory_order_acquire);
+            pre_pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
+                                             memory_order_acquire);
+            pre_flush = atomic_load_explicit(&g_dbt_flush_epoch,
+                                             memory_order_acquire);
             if (a2_subpage && p0_ok) {
                 i686_vm32_subpage_lock();
                 (void)i686_vm32_union_prot(ctx, vpn0 << 12U,
@@ -443,12 +453,6 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
                     smc_protect(ctx, vpn1 << 12U);
                 }
             }
-            pre_pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
-                                             memory_order_acquire);
-            pre_pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
-                                             memory_order_acquire);
-            pre_flush = atomic_load_explicit(&g_dbt_flush_epoch,
-                                             memory_order_acquire);
 #ifdef __APPLE__
             (void)pthread_mutex_lock(&s_jit_toggle_mutex);
             s_jit_toggle_locked = true;

@@ -382,6 +382,26 @@ int i686_vm_file_untrack_map(uint32_t gva, size_t len)
     if (splits_needed > free_slots) {
         return -1;
     }
+    /* Pass 1: free fully covered entries first so an interior split in
+     * pass 2 can always reuse a slot the pre-check counted as free,
+     * even when the only such slot sits at a higher index than the
+     * straddling entry (I686-R2-7 follow-up). */
+    for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
+        uint64_t m_start;
+        uint64_t m_end;
+        if (s_maps[i].used == 0) {
+            continue;
+        }
+        m_start = (uint64_t)s_maps[i].gva;
+        m_end = m_start + (uint64_t)s_maps[i].len;
+        if (m_start >= end || m_end <= (uint64_t)gva) {
+            continue;
+        }
+        if (m_start >= (uint64_t)gva && m_end <= end) {
+            close_map_slot(&s_maps[i]);
+        }
+    }
+    /* Pass 2: truncate or split the remaining straddling entries. */
     for (i = 0u; i < I686_FILE_MAX_MAPS; i++) {
         uint64_t m_start;
         uint64_t m_end;
@@ -408,28 +428,37 @@ int i686_vm_file_untrack_map(uint32_t gva, size_t len)
             uint64_t tail_delta = end - m_start;
             size_t tail_len = (size_t)(m_end - end);
             uint32_t j;
+            uint32_t free_slot = I686_FILE_MAX_MAPS;
             int src_fd = (s_maps[i].owned_fd >= 0) ? s_maps[i].owned_fd
                                                    : s_maps[i].fd;
             int new_fd = (src_fd >= 0) ? dup_map_fd(src_fd) : -1;
             if (src_fd >= 0 && new_fd < 0) {
                 return -1;
             }
-            s_maps[i].len = (size_t)((uint64_t)gva - m_start);
             for (j = 0u; j < I686_FILE_MAX_MAPS; j++) {
                 if (s_maps[j].used == 0) {
-                    s_maps[j].used = 1;
-                    s_maps[j].fd = s_maps[i].fd;
-                    s_maps[j].owned_fd = new_fd;
-                    s_maps[j].dev = s_maps[i].dev;
-                    s_maps[j].ino = s_maps[i].ino;
-                    s_maps[j].has_ino = s_maps[i].has_ino;
-                    s_maps[j].gva = (uint32_t)end;
-                    s_maps[j].len = tail_len;
-                    s_maps[j].file_offset = s_maps[i].file_offset + tail_delta;
-                    s_maps[j].kind = s_maps[i].kind;
+                    free_slot = j;
                     break;
                 }
             }
+            if (free_slot >= I686_FILE_MAX_MAPS) {
+                if (new_fd >= 0) {
+                    (void)close(new_fd);
+                }
+                return -1;
+            }
+            s_maps[i].len = (size_t)((uint64_t)gva - m_start);
+            s_maps[free_slot].used = 1;
+            s_maps[free_slot].fd = s_maps[i].fd;
+            s_maps[free_slot].owned_fd = new_fd;
+            s_maps[free_slot].dev = s_maps[i].dev;
+            s_maps[free_slot].ino = s_maps[i].ino;
+            s_maps[free_slot].has_ino = s_maps[i].has_ino;
+            s_maps[free_slot].gva = (uint32_t)end;
+            s_maps[free_slot].len = tail_len;
+            s_maps[free_slot].file_offset = s_maps[i].file_offset +
+                                            tail_delta;
+            s_maps[free_slot].kind = s_maps[i].kind;
         }
     }
     return 0;
