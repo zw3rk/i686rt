@@ -786,8 +786,7 @@ static int64_t r_execve(i686_ctx_t *ctx)
 
     memset(ctx->gpr, 0, sizeof(ctx->gpr));
     ctx->gpr[I686_REG_ESP] = sp;
-    ctx->eip = ctx->elf_entry; /* rt32_elf_load sets the interpreter
-                                * entry when PT_INTERP (launch parity) */
+    ctx->eip = ctx->elf_entry; /* interp entry when PT_INTERP */
     ctx->eflags = 0x202U;
     ctx->lazy_op = I686_FOP_NONE;
     ctx->seg_sel[I686_SEG_CS] = 0x23U;
@@ -797,9 +796,10 @@ static int64_t r_execve(i686_ctx_t *ctx)
     ctx->seg_sel[I686_SEG_FS] = 0U;
     ctx->seg_sel[I686_SEG_GS] = 0U;
     memset(ctx->seg_base, 0, sizeof(ctx->seg_base));
-    ctx->cs_d = 1U; /* exec reloads flat segment regs; the LDT itself
-                     * persists (per-mm on i386), segment state resets */
+    ctx->cs_d = 1U; /* exec reloads flat segment regs; LDT persists */
     ctx->ss_b = 1U; /* R7-11: flat stack is 32-bit */
+    ctx->mxcsr = 0x1F80U;
+    ctx->mxcsr_mask = 0xFFFFU;
     {
         extern void i686_seg_exec_reset_tls(i686_ctx_t *ctx);
         i686_seg_exec_reset_tls(ctx);

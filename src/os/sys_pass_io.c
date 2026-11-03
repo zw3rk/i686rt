@@ -499,7 +499,7 @@ static long sys_pwrite64(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
         return -EFAULT;
     }
     if (count == 0U) {
-        return host_ret_(pwrite((int)fd, stk, 0, pos));
+        return host_ret_(pwrite((int)fd, "", 0, pos));
     }
     while (total < (uint64_t)count) {
         uint64_t left = (uint64_t)count - total;

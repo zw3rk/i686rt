@@ -111,7 +111,7 @@ void i686_x87_op_fyl2x(i686_ctx_t *ctx, int p1)
                 return;
             }
             {
-                double l = log1p(a) * M_LOG2E;
+                double l = log1p(a) * 1.44269504088896340736;
                 if (l == 0.0 && isinf(b)) {
                     /* R7-30: an unmasked raise inhibits the
                      * store/pop below (dispatch returns #MF). */

@@ -130,8 +130,8 @@ static int safe_decode_eip(i686_ctx_t *ctx, x86_insn_t *out,
                            uint8_t out_bytes[16])
 {
     uint32_t fetch_va = ctx->seg_base[I686_SEG_CS] + ctx->eip;
-    uint32_t max_len = 15u;
-    uint32_t hps = (ctx->vm_host_page != 0u) ? ctx->vm_host_page : 4096u;
+    volatile uint32_t max_len = 15u;
+    volatile uint32_t hps = (ctx->vm_host_page != 0u) ? ctx->vm_host_page : 4096u;
     volatile int rc = -1;
 
     memset(out_bytes, 0, 16u);
@@ -652,10 +652,10 @@ static int emulate_rep_string(i686_ctx_t *ctx, const x86_insn_t *insn,
                               const subpage_access_t *acc, uint32_t hps)
 {
     uint32_t orig_eip = ctx->eip;
-    uint32_t rem = (insn->pfx_addrsize != 0u)
-                       ? (ctx->gpr[I686_REG_ECX] & 0xFFFFu)
-                       : ctx->gpr[I686_REG_ECX];
-    uint8_t src_seg = (insn->pfx_seg != 0xFFu) ? insn->pfx_seg : I686_SEG_DS;
+    volatile uint32_t rem = (insn->pfx_addrsize != 0u)
+                                ? (ctx->gpr[I686_REG_ECX] & 0xFFFFu)
+                                : ctx->gpr[I686_REG_ECX];
+    volatile uint8_t src_seg = (insn->pfx_seg != 0xFFu) ? insn->pfx_seg : I686_SEG_DS;
     uint32_t fetch_p0 = (ctx->seg_base[I686_SEG_CS] + orig_eip) & ~(hps - 1u);
     uint32_t fetch_p1 = ((ctx->seg_base[I686_SEG_CS] + orig_eip + insn->len - 1u) &
                          ~(hps - 1u)) + hps;

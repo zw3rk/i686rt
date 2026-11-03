@@ -127,8 +127,12 @@ static inline int sse_done_nocheck(i686_ctx_t *ctx,
  * Every raising handler snapshots this FIRST, before any fetch or
  * compute that may set status bits (sse_f32_src/sse_f64_src set DE,
  * arithmetic/convert helpers set IE/ZE/OE/UE/PE). */
-static inline uint32_t sse_entry(const i686_ctx_t *ctx)
+static inline uint32_t sse_entry(i686_ctx_t *ctx)
 {
+    if (ctx->mxcsr == 0U && ctx->mxcsr_mask == 0U) {
+        ctx->mxcsr = 0x1F80U;
+        ctx->mxcsr_mask = 0xFFFFU;
+    }
     return ctx->mxcsr & 0x3fU;
 }
 

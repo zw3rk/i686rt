@@ -752,7 +752,7 @@ int i686_deliver_pending(i686_ctx_t *ctx)
                 (void)kill(getpid(), SIGSTOP);
                 continue;
             }
-            if (sig > 0 && sig < NSIG) {
+            if (sig > 0 && sig < 32) {
                 (void)signal(sig, SIG_DFL);
                 (void)raise(sig);
             }

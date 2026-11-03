@@ -614,11 +614,7 @@ static int64_t r_madvise(i686_ctx_t *ctx)
     }
     r = fixup((int64_t)madvise(i686_guest_ptr(ctx, addr), (size_t)len,
                                (int)behavior));
-    if (r == 0 && (behavior == MADV_DONTNEED
-#ifdef MADV_REMOVE
-                   || behavior == MADV_REMOVE
-#endif
-                   )) {
+    if (r == 0 && (behavior == 4U || behavior == 8U || behavior == 9U)) {
         rt32_vm_invalidate_jit(ctx, addr, (uint32_t)end64);
     }
     return r;
