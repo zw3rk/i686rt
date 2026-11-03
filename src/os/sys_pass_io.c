@@ -425,35 +425,95 @@ int64_t i686_pass_r_pipe2(i686_ctx_t *ctx)
     return sys_pipe2(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX]);
 }
 
+/* I686-R4-8: positioned I/O never touches guest memory directly. A
+ * guest buffer on a restrictive A2 covering page faults the host with
+ * EFAULT instead of entering the runtime healing checkpoint, and raw
+ * pointers skip guest-span overflow validation. Every byte therefore
+ * travels through a bounded host buffer plus the checked copy helpers
+ * (which validate the span and heal A2 covers), in chunks so huge counts
+ * stay bounded. Short counts are preserved: host short reads/writes and
+ * guest copy faults after partial progress return the bytes moved. */
 static long sys_pread64(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
                         uint32_t count, uint32_t pos_lo, uint32_t pos_hi)
 {
     off_t pos = (off_t)(((uint64_t)pos_hi << 32) | (uint64_t)pos_lo);
+    uint8_t stk[4096];
+    uint64_t total = 0u;
 
     if (count > 0U && buf_va < 0x1000U) {
         return -EFAULT;
     }
-    return host_ret_(pread((int)fd, i686_guest_ptr(ctx, buf_va),
-                           (size_t)count, pos));
+    if (count > 0U &&
+        (uint64_t)buf_va + (uint64_t)count > UINT64_C(0x100000000)) {
+        return -EFAULT;
+    }
+    if (count == 0U) {
+        return host_ret_(pread((int)fd, stk, 0, pos));
+    }
+    while (total < (uint64_t)count) {
+        uint64_t left = (uint64_t)count - total;
+        size_t chunk = (left > sizeof(stk)) ? sizeof(stk) : (size_t)left;
+        ssize_t n = pread((int)fd, stk, chunk, pos + (off_t)total);
+        int rc;
+        if (n < 0) {
+            return (total > 0u) ? (long)total : -(long)errno;
+        }
+        if (n == 0) {
+            break;
+        }
+        rc = i686_copy_to_guest(ctx, buf_va + (uint32_t)total, stk,
+                                (size_t)n);
+        if (rc != 0) {
+            return (total > 0u) ? (long)total : -EFAULT;
+        }
+        total += (uint64_t)n;
+        if ((size_t)n < chunk) {
+            break;
+        }
+    }
+    return (long)total;
 }
 
 static long sys_pwrite64(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
                          uint32_t count, uint32_t pos_lo, uint32_t pos_hi)
 {
     off_t pos = (off_t)(((uint64_t)pos_hi << 32) | (uint64_t)pos_lo);
+    uint8_t stk[4096];
+    uint64_t total = 0u;
 
     if (count > 0U && buf_va < 0x1000U) {
         return -EFAULT;
     }
-    {
-        long rc = host_ret_(pwrite((int)fd, i686_guest_ptr(ctx, buf_va),
-                                   (size_t)count, pos));
-        if (rc > 0) {
-            (void)i686_vm_file_note_pwrite(ctx, (int)fd, (uint64_t)pos,
-                                           (size_t)rc);
-        }
-        return rc;
+    if (count > 0U &&
+        (uint64_t)buf_va + (uint64_t)count > UINT64_C(0x100000000)) {
+        return -EFAULT;
     }
+    if (count == 0U) {
+        return host_ret_(pwrite((int)fd, stk, 0, pos));
+    }
+    while (total < (uint64_t)count) {
+        uint64_t left = (uint64_t)count - total;
+        size_t chunk = (left > sizeof(stk)) ? sizeof(stk) : (size_t)left;
+        ssize_t n;
+        int rc = i686_copy_from_guest(ctx, stk, buf_va + (uint32_t)total,
+                                      chunk);
+        if (rc != 0) {
+            return (total > 0u) ? (long)total : -EFAULT;
+        }
+        n = pwrite((int)fd, stk, chunk, pos + (off_t)total);
+        if (n < 0) {
+            return (total > 0u) ? (long)total : -(long)errno;
+        }
+        total += (uint64_t)n;
+        if ((size_t)n < chunk) {
+            break;
+        }
+    }
+    if (total > 0u) {
+        (void)i686_vm_file_note_pwrite(ctx, (int)fd, (uint64_t)pos,
+                                       (size_t)total);
+    }
+    return (long)total;
 }
 
 int64_t i686_pass_r_pread64(i686_ctx_t *ctx)
@@ -476,7 +536,7 @@ int64_t i686_pass_r_ftruncate64(i686_ctx_t *ctx)
                         (uint64_t)ctx->gpr[I686_REG_ECX]);
     long rc = host_ret_(ftruncate((int)ctx->gpr[I686_REG_EBX], len));
     if (rc == 0 && len >= 0) {
-        i686_vm_file_note_ftruncate((int)ctx->gpr[I686_REG_EBX],
+        i686_vm_file_note_ftruncate(ctx, (int)ctx->gpr[I686_REG_EBX],
                                     (uint64_t)len);
     }
     return (int64_t)rc;

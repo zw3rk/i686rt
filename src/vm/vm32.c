@@ -86,16 +86,21 @@ static void vm32_atfork_child(void)
     }
 }
 
+/* Lock order (I686-R4-1): the futex mutex is OUTER, the subpage mutex
+ * INNER (VM spinlock > registry > futex > subpage globally).  FUTEX_WAIT
+ * and FUTEX_CMP_REQUEUE hold s_futex_mtx across vm32_futex_load_u32(),
+ * which takes the subpage lock for its A2 healing window; fork_prepare
+ * must nest the same way or a concurrent waiter deadlocks the fork. */
 void i686_vm32_fork_prepare(void)
 {
-    (void)pthread_mutex_lock(&s_subpage_mtx);
     (void)pthread_mutex_lock(&s_futex_mtx);
+    (void)pthread_mutex_lock(&s_subpage_mtx);
 }
 
 void i686_vm32_fork_parent(void)
 {
-    (void)pthread_mutex_unlock(&s_futex_mtx);
     (void)pthread_mutex_unlock(&s_subpage_mtx);
+    (void)pthread_mutex_unlock(&s_futex_mtx);
 }
 
 void i686_vm32_fork_child(void)

@@ -285,8 +285,9 @@ static bool vm_file_contiguous(uint32_t end_a, uint32_t start_b)
         return false;
     }
     if (i686_vm_file_lookup_map(end_a - I686_PAGE_SIZE, &fd_a, &off_a,
-                                &kind_a) != 0 ||
-        i686_vm_file_lookup_map(start_b, &fd_b, &off_b, &kind_b) != 0) {
+                                &kind_a, NULL) != 0 ||
+        i686_vm_file_lookup_map(start_b, &fd_b, &off_b, &kind_b,
+                                NULL) != 0) {
         return false;
     }
     return (fd_a == fd_b) && (kind_a == kind_b) &&

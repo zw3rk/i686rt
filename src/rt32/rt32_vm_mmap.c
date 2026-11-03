@@ -137,7 +137,8 @@ static uint32_t vm_mmap2_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len,
         uint8_t kind = is_shared ? I686_BACKING_SHARED_FILE
                                  : I686_BACKING_PRIVATE_FILE;
         if (i686_vm_file_track_map(fd, target_va, (size_t)aligned_len,
-                                   (uint64_t)pgoffset * 4096u, kind) != 0) {
+                                   (uint64_t)pgoffset * 4096u, kind,
+                                   (uint8_t)(staged ? 1 : 0)) != 0) {
             (void)rt32_vm_unmap_regions_locked(target_va, target_end);
             rt32_vm_file_sync_prot_locked(target_va, target_end);
             if (!staged) {
@@ -353,7 +354,8 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     uint8_t     map_kind    = 0U;
     bool        has_file    = ((keep_flags & RT32_MAP_ANONYMOUS) == 0U) &&
                               (i686_vm_file_lookup_map(old_addr, &map_fd,
-                                                       &map_foff, &map_kind) == 0) &&
+                                                       &map_foff, &map_kind,
+                                                       NULL) == 0) &&
                               (map_fd >= 0);
     if (has_file) {
         hold_fd = dup(map_fd);
@@ -405,13 +407,25 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                 int ok = 0;
                 if (rec_rc == 0 && has_file == false) {
                     ok = 1;
-                } else if (rec_rc == 0 && has_file &&
-                           i686_vm_file_untrack_map(old_addr,
-                                                    (size_t)new_aligned) == 0 &&
-                           i686_vm_file_track_map(map_fd, old_addr,
-                                                  (size_t)new_aligned,
-                                                  map_foff, map_kind) == 0) {
-                    ok = 1;
+                } else if (rec_rc == 0 && has_file) {
+                    /* Transactional replacement (I686-R4-5): the record
+                     * and its owned descriptor are prepared before any
+                     * existing record is deleted, so a failure keeps the
+                     * original tracking (and the extension record added
+                     * above is removed with the extension below). */
+                    uint8_t orig_staged = 0u;
+                    uint8_t ext_staged = 0u;
+                    (void)i686_vm_file_lookup_map(old_addr, NULL, NULL, NULL,
+                                                  &orig_staged);
+                    (void)i686_vm_file_lookup_map(old_end, NULL, NULL, NULL,
+                                                  &ext_staged);
+                    if (i686_vm_file_replace_map(map_fd, old_addr,
+                                                 (size_t)new_aligned,
+                                                 map_foff, map_kind,
+                                                 (uint8_t)(orig_staged |
+                                                           ext_staged)) == 0) {
+                        ok = 1;
+                    }
                 }
                 if (!ok) {
                     (void)vm_munmap_locked(ctx, old_end,
@@ -525,12 +539,75 @@ uint32_t rt32_vm_mremap(i686_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     if (!moved_via_host_mremap &&
         (!has_file || (keep_flags & 0x01U) == 0U ||
          rt32_vm_a2_staged_needed(ctx, new_va, new_aligned, rel_flags, map_foff))) {
-        if ((prot & 0x1U) == 0U) {
-            (void)mprotect(i686_guest_ptr(ctx, old_addr), (size_t)old_aligned,
-                           PROT_READ);
-        }
-        {
-            size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
+        size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
+        if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
+            /* Staged/A2 copy under the subpage exclusion protocol
+             * (I686-R4-4, VM lock outer, subpage lock inner): open the
+             * host-page-aligned source and destination covers writable,
+             * check both changes, copy, and widen every opened cover
+             * back on success and on failure. */
+            uint64_t h = (uint64_t)ctx->vm_host_page;
+            uint64_t s_lo = (uint64_t)old_addr & ~(h - 1u);
+            uint64_t s_hi = ((uint64_t)old_addr + (uint64_t)copy_bytes +
+                             h - 1u) & ~(h - 1u);
+            uint64_t d_lo = (uint64_t)new_va & ~(h - 1u);
+            uint64_t d_hi = ((uint64_t)new_va + (uint64_t)copy_bytes +
+                             h - 1u) & ~(h - 1u);
+            void *s_cov = (void *)(uintptr_t)(ctx->guest_base + s_lo);
+            void *d_cov = (void *)(uintptr_t)(ctx->guest_base + d_lo);
+            size_t s_len = (size_t)(s_hi - s_lo);
+            size_t d_len = (size_t)(d_hi - d_lo);
+            int src_open = 0;
+            int dst_open = 0;
+            i686_vm32_subpage_lock();
+            if (mprotect(s_cov, s_len, PROT_READ | PROT_WRITE) == 0) {
+                src_open = 1;
+            }
+            if (mprotect(d_cov, d_len, PROT_READ | PROT_WRITE) == 0) {
+                dst_open = 1;
+            }
+            if (src_open == 0 || dst_open == 0) {
+                if (src_open != 0) {
+                    (void)i686_vm32_widen_prot(ctx, old_addr,
+                                               (uint32_t)((uint64_t)old_addr +
+                                                          copy_bytes));
+                }
+                if (dst_open != 0) {
+                    (void)i686_vm32_widen_prot(ctx, new_va,
+                                               (uint32_t)((uint64_t)new_va +
+                                                          copy_bytes));
+                }
+                i686_vm32_subpage_unlock();
+                (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+                if (hold_fd >= 0) {
+                    (void)close(hold_fd);
+                }
+                rt32_vm_sync_to_ctx(ctx);
+                rt32_vm_lock_release();
+                return (uint32_t)(-ENOMEM);
+            }
+            memcpy(i686_guest_ptr(ctx, new_va), i686_guest_ptr(ctx, old_addr),
+                   copy_bytes);
+            (void)i686_vm32_widen_prot(ctx, old_addr,
+                                       (uint32_t)((uint64_t)old_addr +
+                                                  copy_bytes));
+            (void)i686_vm32_widen_prot(ctx, new_va,
+                                       (uint32_t)((uint64_t)new_va +
+                                                  copy_bytes));
+            i686_vm32_subpage_unlock();
+        } else {
+            if ((prot & 0x1U) == 0U) {
+                if (mprotect(i686_guest_ptr(ctx, old_addr),
+                             (size_t)old_aligned, PROT_READ) != 0) {
+                    (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+                    if (hold_fd >= 0) {
+                        (void)close(hold_fd);
+                    }
+                    rt32_vm_sync_to_ctx(ctx);
+                    rt32_vm_lock_release();
+                    return (uint32_t)(-errno);
+                }
+            }
             memcpy(i686_guest_ptr(ctx, new_va), i686_guest_ptr(ctx, old_addr),
                    copy_bytes);
         }

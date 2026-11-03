@@ -149,26 +149,6 @@ void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
     (void)pthread_mutex_unlock(&s_registry_lock);
 }
 
-/* Record the host tid running a guest ctx without changing the guest
- * tid namespace (I686-R3-1: the namespace is the host one throughout,
- * so the entry is added under the child's host tid and never rekeyed;
- * PI futex words and robust-list recovery compare against that same
- * value). Kept for compatibility; new clones publish the host tid
- * before the parent returns. */
-void i686_thread_registry_set_host_tid(uint32_t tid, int host_tid);
-void i686_thread_registry_set_host_tid(uint32_t tid, int host_tid)
-{
-    size_t i;
-    (void)pthread_mutex_lock(&s_registry_lock);
-    for (i = 0; i < s_registry_n; i++) {
-        if (s_registry[i].tid == tid) {
-            s_registry[i].host_tid = host_tid;
-            break;
-        }
-    }
-    (void)pthread_mutex_unlock(&s_registry_lock);
-}
-
 void i686_thread_registry_remove(uint32_t tid);
 void i686_thread_registry_remove(uint32_t tid)
 {
@@ -381,10 +361,18 @@ static void robust_handle_death(i686_ctx_t *ctx, uint32_t futex_va,
             uval = cur;
         }
         after = atomic_load((_Atomic uint32_t *)hp);
-        (void)i686_vm32_widen_prot(ctx, gbase, gbase + hps);
-        i686_vm32_subpage_unlock();
-        if (!pending && (after & FUTEX_WAITERS_BIT_) != 0u) {
-            (void)i686_vm32_futex_wake(ctx, futex_va, 1u, 0xFFFFFFFFu);
+        {
+            /* I686-R4-1: release the subpage lock BEFORE the futex wake.
+             * Lock order is futex-outer/subpage-inner everywhere; waking
+             * while holding the subpage lock inverts FUTEX_WAIT's nesting
+             * (futex -> subpage) and can deadlock a concurrent fork. */
+            int need_wake =
+                (!pending && (after & FUTEX_WAITERS_BIT_) != 0u) ? 1 : 0;
+            (void)i686_vm32_widen_prot(ctx, gbase, gbase + hps);
+            i686_vm32_subpage_unlock();
+            if (need_wake) {
+                (void)i686_vm32_futex_wake(ctx, futex_va, 1u, 0xFFFFFFFFu);
+            }
         }
         return;
     }
@@ -741,6 +729,12 @@ static int64_t r_clone(i686_ctx_t *ctx)
     return (int64_t)r_val; /* parent sees the child's host tid */
 }
 
+/* Global fork lock order (I686-R4-1): VM spinlock > registry >
+ * futex > subpage. fork_prepare nests in that order; the futex and
+ * subpage pair inside i686_vm32_fork_prepare nests futex-outer to match
+ * FUTEX_WAIT/FUTEX_CMP_REQUEUE (futex held across the subpage healing
+ * window). Truncate/pwrite paths nest VM-outer/subpage-inner and never
+ * take the futex lock, so no cycle exists. */
 static void fork_prepare(void)
 {
     extern void rt32_vm_fork_prepare(void);
@@ -764,12 +758,16 @@ static void fork_child(void)
     extern void rt32_vm_fork_child(void);
     extern void i686_vm32_fork_child(void);
     extern void i686_aot_fork_child(void);
+    extern void i686_gsig_fork_child(void);
 #ifndef I686RT_NO_DBT
     extern void i686_dbt_fork_child(void);
 #endif
     i686_ctx_t *surviving;
     rt32_vm_fork_child();
     i686_vm32_fork_child();
+    /* The signal-action mutex may be held by a dead thread; reinitialize
+     * it like the other runtime-owned mutexes (I686-R4-6). */
+    i686_gsig_fork_child();
 #ifndef I686RT_NO_DBT
     i686_dbt_fork_child();
 #endif

@@ -71,7 +71,7 @@ I686RT_X64 := $(BUILD_DIR)/i686rt-x86_64
 build-x86_64: $(I686RT_X64) ## Interpreter-only x86_64-host build (D3 tier 2, H4)
 $(I686RT_X64): $(OBJS_X64)
 	$(CC) $(CFLAGS) -Werror -DI686RT_NO_DBT $(OBJS_X64) $(LDFLAGS) -o $@
-$(OBJ_DIR)-x64/%.o: src/%.c
+$(OBJ_DIR)-x64/%.o: src/%.c $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Werror -DI686RT_NO_DBT -c $< -o $@
 

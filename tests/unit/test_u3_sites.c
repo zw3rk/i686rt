@@ -177,7 +177,7 @@ static void t_regime_file(void)
         uint8_t out_kind = 0u;
         CHECK(pipe(pfd) == 0, "pipe for file map test");
         CHECK(i686_vm_file_track_map(pfd[0], 0x40000000u, 3u * 4096u, 4096u,
-                                     I686_BACKING_SHARED_FILE) == 0,
+                                     I686_BACKING_SHARED_FILE, 0u) == 0,
               "track file map succeeds");
         (void)close(pfd[0]);
         (void)close(pfd[1]);
@@ -185,12 +185,12 @@ static void t_regime_file(void)
         CHECK(i686_vm_file_untrack_map(0x40001000u, 4096u) == 0,
               "interior hole split succeeds");
         CHECK(i686_vm_file_lookup_map(0x40000000u, &out_fd, &out_off,
-                                      &out_kind) == 0 &&
+                                      &out_kind, NULL) == 0 &&
               out_fd >= 0 && out_fd != pfd[0] && out_off == 4096u &&
               out_kind == I686_BACKING_SHARED_FILE,
               "prefix retained after interior hole split");
         CHECK(i686_vm_file_lookup_map(0x40002000u, &out_fd, &out_off,
-                                      &out_kind) == 0 &&
+                                      &out_kind, NULL) == 0 &&
               out_fd >= 0 && out_fd != pfd[0] && out_off == 12288u &&
               out_kind == I686_BACKING_SHARED_FILE,
               "suffix retained with adjusted file_off after hole split");
@@ -213,31 +213,32 @@ static void t_file_untrack_high_slot(void)
     CHECK(i686_vm_file_init(0x100000000ULL) == 0, "vm_file re-init");
     /* Slot 0: straddling entry needing an interior split. */
     CHECK(i686_vm_file_track_map(-1, 0x50000000u, 5u * 4096u, 0u,
-                                 I686_BACKING_SHARED_FILE) == 0,
+                                 I686_BACKING_SHARED_FILE, 0u) == 0,
           "track straddler");
     /* Slots 1..254: dummies outside the untrack range. */
     for (k = 0u; k < 254u; k++) {
         if (i686_vm_file_track_map(-1, 0x60000000u + k * 4096u, 4096u, 0u,
-                                   I686_BACKING_SHARED_FILE) != 0) {
+                                   I686_BACKING_SHARED_FILE, 0u) != 0) {
             fill_ok = 0;
         }
     }
     CHECK(fill_ok, "fill registry 1..254");
     /* Slot 255: fully covered entry inside the untrack range. */
     CHECK(i686_vm_file_track_map(-1, 0x50002000u, 4096u, 0x2000u,
-                                 I686_BACKING_SHARED_FILE) == 0,
+                                 I686_BACKING_SHARED_FILE, 0u) == 0,
           "track covered high slot");
     CHECK(i686_vm_file_untrack_map(0x50002000u, 2u * 4096u) == 0,
           "high-slot interior untrack succeeds");
     CHECK(i686_vm_file_lookup_map(0x50000000u, &out_fd, &out_off,
-                                  &out_kind) == 0 && out_off == 0u &&
+                                  &out_kind, NULL) == 0 && out_off == 0u &&
           out_kind == I686_BACKING_SHARED_FILE,
           "prefix retained after high-slot split");
     CHECK(i686_vm_file_lookup_map(0x50004000u, &out_fd, &out_off,
-                                  &out_kind) == 0 && out_off == 0x4000u &&
+                                  &out_kind, NULL) == 0 && out_off == 0x4000u &&
           out_kind == I686_BACKING_SHARED_FILE,
           "suffix split into freed high slot");
-    CHECK(i686_vm_file_lookup_map(0x50002000u, NULL, NULL, NULL) != 0,
+    CHECK(i686_vm_file_lookup_map(0x50002000u, NULL, NULL, NULL,
+                                  NULL) != 0,
           "covered high entry freed");
     i686_vm_file_fini();
 }

@@ -527,23 +527,104 @@ void i686_x87_op_fyl2x(i686_ctx_t *ctx, int p1)
         return;
     }
     {
+        /* I686-R4-7: FYL2X (p1 == 0) computes b * log2(a) valid for
+         * a >= 0; FYL2XP1 (p1 != 0) computes b * log2(a + 1) valid for
+         * a >= -1, so -1 < a < 0 is legal input there. A zero logarithm
+         * argument yields a signed infinity (b * -Inf, opposite sign to
+         * b) with #Z, except 0 * -Inf which is #I; an infinite argument
+         * yields b * +Inf (b's sign) with no flag, except 0 * +Inf which
+         * is #I. A zero logarithm with an infinite multiplier is #I. */
         double a = x87_get_f64(ctx, 0);
         double b = x87_get_f64(ctx, 1);
         double r;
 
-        if (isnan(a) || isnan(b) || a < 0.0 || (p1 && a <= -1.0)) {
+        if (isnan(a) || isnan(b)) {
             x87_set_exc(ctx, SW_IE);
             x87_set_f64(ctx, 1, (double)NAN);
             x87_pop(ctx);
             return;
         }
-        if (!p1 && a == 0.0) {
-            x87_set_exc(ctx, SW_ZE);
-            x87_set_f64(ctx, 1, signbit(b) ? -HUGE_VAL : HUGE_VAL);
-            x87_pop(ctx);
-            return;
+        if (p1) {
+            if (a < -1.0) {
+                x87_set_exc(ctx, SW_IE);
+                x87_set_f64(ctx, 1, (double)NAN);
+                x87_pop(ctx);
+                return;
+            }
+            if (a == -1.0) {
+                if (b == 0.0) {
+                    x87_set_exc(ctx, SW_IE);
+                    x87_set_f64(ctx, 1, (double)NAN);
+                } else {
+                    x87_set_exc(ctx, SW_ZE);
+                    x87_set_f64(ctx, 1,
+                                signbit(b) ? HUGE_VAL : -HUGE_VAL);
+                }
+                x87_pop(ctx);
+                return;
+            }
+            if (isinf(a)) {
+                if (b == 0.0) {
+                    x87_set_exc(ctx, SW_IE);
+                    x87_set_f64(ctx, 1, (double)NAN);
+                } else {
+                    x87_set_f64(ctx, 1,
+                                signbit(b) ? -HUGE_VAL : HUGE_VAL);
+                }
+                x87_pop(ctx);
+                return;
+            }
+            {
+                double l = log2(a + 1.0);
+                if (l == 0.0 && isinf(b)) {
+                    x87_set_exc(ctx, SW_IE);
+                    x87_set_f64(ctx, 1, (double)NAN);
+                    x87_pop(ctx);
+                    return;
+                }
+                r = d_mul(ctx, b, l);
+            }
+        } else {
+            if (a < 0.0) {
+                x87_set_exc(ctx, SW_IE);
+                x87_set_f64(ctx, 1, (double)NAN);
+                x87_pop(ctx);
+                return;
+            }
+            if (a == 0.0) {
+                if (b == 0.0) {
+                    x87_set_exc(ctx, SW_IE);
+                    x87_set_f64(ctx, 1, (double)NAN);
+                } else {
+                    x87_set_exc(ctx, SW_ZE);
+                    x87_set_f64(ctx, 1,
+                                signbit(b) ? HUGE_VAL : -HUGE_VAL);
+                }
+                x87_pop(ctx);
+                return;
+            }
+            if (isinf(a)) {
+                if (b == 0.0) {
+                    x87_set_exc(ctx, SW_IE);
+                    x87_set_f64(ctx, 1, (double)NAN);
+                } else {
+                    x87_set_f64(ctx, 1,
+                                signbit(b) ? -HUGE_VAL : HUGE_VAL);
+                }
+                x87_pop(ctx);
+                return;
+            }
+            {
+                double l = log2(a);
+                if (l == 0.0 && isinf(b)) {
+                    x87_set_exc(ctx, SW_IE);
+                    x87_set_f64(ctx, 1, (double)NAN);
+                    x87_pop(ctx);
+                    return;
+                }
+                r = d_mul(ctx, b, l);
+            }
         }
-        r = d_mul(ctx, b, p1 ? log2(a + 1.0) : log2(a));
         x87_set_f64(ctx, 1, r);
         x87_pop(ctx);
     }

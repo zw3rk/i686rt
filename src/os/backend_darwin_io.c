@@ -267,30 +267,58 @@ int64_t rt_host_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 int64_t rt_host_copy_file_range(int fd_in, int64_t *off_in, int fd_out,
                                 int64_t *off_out, size_t len, unsigned int flags)
 {
-    /* Clone/extent sharing is advisory; plain copy preserves semantics. */
+    /* Clone/extent sharing is advisory; plain copy preserves semantics.
+     * I686-R4-9: honour an explicit output offset with positioned writes
+     * so the descriptor position is left unchanged; a NULL output offset
+     * keeps write(2) semantics (use and advance the position). */
+    uint8_t chunk[8192];
     int64_t in = (off_in != NULL) ? *off_in : lseek(fd_in, 0, SEEK_CUR);
     int64_t out = (off_out != NULL) ? *off_out : lseek(fd_out, 0, SEEK_CUR);
-    int64_t saved_in = in;
-    int64_t saved_out = out;
-    int64_t rc;
-    (void)flags;
+    int64_t done = 0;
+    if (flags != 0u) {
+        return (int64_t)-EINVAL;
+    }
     if (in < 0 || out < 0) {
         return (int64_t)-errno;
     }
-    rc = rt_host_sendfile(fd_out, fd_in, &saved_in, len);
-    if (rc < 0) {
-        return rc;
+    while ((size_t)done < len) {
+        size_t want = len - (size_t)done;
+        ssize_t n;
+        size_t wdone = 0u;
+        if (want > sizeof(chunk)) {
+            want = sizeof(chunk);
+        }
+        n = pread(fd_in, chunk, want, (off_t)(in + done));
+        if (n < 0) {
+            return (int64_t)-errno;
+        }
+        if (n == 0) {
+            break;
+        }
+        while (wdone < (size_t)n) {
+            ssize_t w;
+            if (off_out != NULL) {
+                w = pwrite(fd_out, chunk + wdone, (size_t)n - wdone,
+                           (off_t)(out + done + (int64_t)wdone));
+            } else {
+                w = write(fd_out, chunk + wdone, (size_t)n - wdone);
+            }
+            if (w < 0) {
+                return (int64_t)-errno;
+            }
+            wdone += (size_t)w;
+        }
+        done += (int64_t)n;
     }
     if (off_in != NULL) {
-        *off_in = saved_in;
-    } else {
-        (void)lseek(fd_in, saved_in, SEEK_SET);
+        *off_in = in + done;
+    } else if (done != 0) {
+        (void)lseek(fd_in, in + done, SEEK_SET);
     }
     if (off_out != NULL) {
-        *off_out = out + rc;
+        *off_out = out + done;
     }
-    (void)saved_out;
-    return rc;
+    return done;
 }
 
 int64_t rt_host_fsync(int fd, int datasync_only)

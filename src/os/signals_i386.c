@@ -45,15 +45,21 @@ static long sig_host_gettid(void)
  * reads the handler value through the SA_SIGINFO-selected union
  * member, so a cast SIG_DFL stores the same zero value either way. */
 
-/* Guest sigaction table (frozen in sys_pass.c Phase 2 v1: single static).
- * Phase 4 moves it here per-thread via the ctx tail. */
+/* Guest sigaction table (owned by sys_pass.c). Delivery takes a coherent
+ * snapshot into caller-owned storage (I686-R4-6): the old static scratch
+ * action was overwritten by concurrent deliveries mid-frame-build.
+ * i686_gsig_consume_oneshot additionally applies the SA_RESETHAND reset
+ * BEFORE the frame is built, returning the pre-reset handler for EIP. */
 struct i686_gsigaction {
     uint32_t handler;
     uint32_t flags;
     uint32_t restorer;
     uint32_t mask[2];
 };
-extern struct i686_gsigaction *i686_gsig_tab(int signum); /* sys_pass.c */
+extern int i686_gsig_snapshot(int signum,
+                              struct i686_gsigaction *out); /* sys_pass.c */
+extern int i686_gsig_consume_oneshot(int signum,
+                                     struct i686_gsigaction *out);
 
 static const uint8_t retcode_nonrt[8] = {
     0x58, 0xb8, 0x77, 0x00, 0x00, 0x00, 0xcd, 0x80
@@ -80,15 +86,18 @@ static uint32_t push_bytes(i686_ctx_t *ctx, uint32_t *sp, const void *b,
     return *sp;
 }
 
-int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
-                        uint32_t restorer, int sa_siginfo, uint32_t info_va,
-                        uint32_t uc_va)
+/* Snapshot-carrying frame builder (I686-R4-6): the delivery path
+ * consumes one action snapshot and this builder uses exactly that copy
+ * for handler, flags, mask, and restorer — no re-fetch mid-build. */
+static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
+                                   const struct i686_gsigaction *ga,
+                                   int sa_siginfo, uint32_t info_va,
+                                   uint32_t uc_va)
 {
     i686_sigcontext_t sc;
     i686_fpstate_32_t fp;
     uint32_t sp = ctx->gpr[I686_REG_ESP];
     uint32_t fp_va, frame_va;
-    struct i686_gsigaction *ga = i686_gsig_tab(sig);
     int i;
 
     if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
@@ -332,8 +341,24 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
     ctx->sig_last_frame_va = frame_va;
     ctx->sig_last_frame_rt = (uint32_t)sa_siginfo;
     ctx->eip = ga->handler;
-    (void)handler; (void)restorer; (void)info_va; (void)uc_va; (void)i;
+    (void)info_va; (void)uc_va; (void)i;
     return 0;
+}
+
+/* Frozen exported entry (sigframe_i386.h): snapshots the current action
+ * and delegates. In-tree delivery uses sigframe_build_snapshot with the
+ * already-consumed (possibly RESETHAND-reset) snapshot instead. */
+int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
+                        uint32_t restorer, int sa_siginfo, uint32_t info_va,
+                        uint32_t uc_va)
+{
+    struct i686_gsigaction ga;
+    (void)handler; (void)restorer;
+    if (i686_gsig_snapshot(sig, &ga) != 0) {
+        return -1;
+    }
+    return sigframe_build_snapshot(ctx, sig, &ga, sa_siginfo, info_va,
+                                   uc_va);
 }
 
 int i686_sigreturn(i686_ctx_t *ctx, int rt)
@@ -570,26 +595,27 @@ int i686_deliver_sync(i686_ctx_t *ctx, int reason)
     default:             sig = 4; break; /* SIGILL */
     }
     {
-        struct i686_gsigaction *ga = i686_gsig_tab(sig);
-        if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
+        /* One consumed snapshot for the whole delivery (I686-R4-6): the
+         * IGN/DFL decision, the SA_RESETHAND reset, and the frame below
+         * all use this copy, so a concurrent rt_sigaction cannot swap
+         * the action mid-delivery. */
+        struct i686_gsigaction ga;
+        int rt;
+        if (i686_gsig_consume_oneshot(sig, &ga) != 0 ||
+            ga.handler == 0U || ga.handler == 1U) {
             return -1;
         }
-    }
-    if (sig == 11) {
-        /* Segment faults (#GP 13 / #NP 11 / #SS 12, seg.c/h_seg.c) carry
-         * their trapno in exit_arg and the error code in exit_dest;
-         * every other FAULT is a page fault (#PF 14). */
-        if (ctx->exit_arg != 11U && ctx->exit_arg != 12U &&
-            ctx->exit_arg != 13U) {
-            ctx->exit_arg = 14; /* trapno = #PF: page fault */
+        if (sig == 11) {
+            /* Segment faults (#GP 13 / #NP 11 / #SS 12, seg.c/h_seg.c)
+             * carry their trapno in exit_arg and the error code in
+             * exit_dest; every other FAULT is a page fault (#PF 14). */
+            if (ctx->exit_arg != 11U && ctx->exit_arg != 12U &&
+                ctx->exit_arg != 13U) {
+                ctx->exit_arg = 14; /* trapno = #PF: page fault */
+            }
         }
-    }
-    {
-        int rt = 0; /* SA_SIGINFO detection via flags */
-        struct i686_gsigaction *ga = i686_gsig_tab(sig);
-        rt = (ga->flags & SA_SIGINFO_) ? 1 : 0;
-        return i686_sigframe_build(ctx, sig, ga->handler, ga->restorer,
-                                   rt, 0U, 0U);
+        rt = (ga.flags & SA_SIGINFO_) ? 1 : 0;
+        return sigframe_build_snapshot(ctx, sig, &ga, rt, 0U, 0U);
     }
 }
 
@@ -613,7 +639,7 @@ int i686_deliver_pending(i686_ctx_t *ctx)
     uint64_t pend = ctx->pending_signals;
     while (pend != 0ULL) {
         uint64_t bit = pend & (~pend + 1ULL); /* lowest set bit */
-        struct i686_gsigaction *ga;
+        struct i686_gsigaction ga;
         int sig = 1;
         uint64_t scan;
 
@@ -624,12 +650,19 @@ int i686_deliver_pending(i686_ctx_t *ctx)
         if ((ctx->sig_mask & bit) != 0ULL && sig != 9 && sig != 19) {
             continue; /* blocked: stays pending until unmasked */
         }
-        ga = i686_gsig_tab(sig);
-        if (ga != NULL && ga->handler == 1U && sig != 9 && sig != 19) {
+        /* One consumed snapshot per signal (I686-R4-6): the IGN/DFL
+         * decision, the SA_RESETHAND reset, and the frame below all use
+         * this copy. The snapshot's handler is the installed EIP even
+         * after the reset flips the table back to SIG_DFL. */
+        if (i686_gsig_consume_oneshot(sig, &ga) != 0) {
+            ctx->pending_signals &= ~bit;
+            continue;
+        }
+        if (ga.handler == 1U && sig != 9 && sig != 19) {
             ctx->pending_signals &= ~bit; /* SIG_IGN: drop */
             continue;
         }
-        if (ga == NULL || ga->handler == 0U || sig == 9 || sig == 19) {
+        if (ga.handler == 0U || sig == 9 || sig == 19) {
             ctx->pending_signals &= ~bit;
             if (sig == 17 || sig == 18 || sig == 23 || sig == 28) {
                 continue; /* Ign / Cont */
@@ -646,8 +679,8 @@ int i686_deliver_pending(i686_ctx_t *ctx)
         }
         ctx->pending_signals &= ~bit;
         ctx->exit_arg = 0; /* no trapno for async */
-        return i686_sigframe_build(ctx, sig, ga->handler, ga->restorer,
-                                   (ga->flags & 0x4U) ? 1 : 0, 0U, 0U);
+        return sigframe_build_snapshot(ctx, sig, &ga,
+                                       (ga.flags & 0x4U) ? 1 : 0, 0U, 0U);
     }
     return -1;
 }

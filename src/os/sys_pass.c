@@ -7,14 +7,27 @@
 
 #include "sys_pass_internal.h"
 
+#include <pthread.h>
+
 /* rt_sigaction store: guest kernel sigaction (20 B, structs_i386.h
- * i686_sigaction_t) per signum 1..64. */
+ * i686_sigaction_t) per signum 1..64.
+ *
+ * I686-R4-6: concurrent delivery threads retained pointers to one static
+ * scratch action while another thread's delivery overwrote it, and
+ * rt_sigaction raced delivery's unsynchronized reads. Every consumer now
+ * takes a snapshot into caller-owned storage under s_sigact_mtx; the
+ * async-signal host bridge (host_sigalrm_handler) reads only the handler
+ * word via lock-free atomics. The child side of fork() reinitializes the
+ * mutex (i686_gsig_fork_child, called from clone.c) since a dead thread
+ * may hold it. */
 static struct {
     uint32_t handler;
     uint32_t flags;
     uint32_t restorer;
     uint64_t mask;
 } s_sigact[65];
+
+static pthread_mutex_t s_sigact_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 uint64_t i686_sigmask_get(void);
 
@@ -24,23 +37,63 @@ struct i686_gsigaction {
     uint32_t restorer;
     uint32_t mask[2];
 };
-struct i686_gsigaction *i686_gsig_tab(int signum)
+
+/* Snapshot one action into caller-owned storage. Returns 0 on success,
+ * -1 for a bad signum or NULL out. */
+int i686_gsig_snapshot(int signum, struct i686_gsigaction *out)
 {
-    static struct i686_gsigaction v;
-    if (signum < 1 || signum > 64) {
-        return NULL;
+    if (signum < 1 || signum > 64 || out == NULL) {
+        return -1;
     }
-    v.handler = s_sigact[signum].handler;
-    v.flags = s_sigact[signum].flags;
-    v.restorer = s_sigact[signum].restorer;
-    memcpy(v.mask, &s_sigact[signum].mask, sizeof(v.mask));
-    return &v;
+    (void)pthread_mutex_lock(&s_sigact_mtx);
+    out->handler = s_sigact[signum].handler;
+    out->flags = s_sigact[signum].flags;
+    out->restorer = s_sigact[signum].restorer;
+    memcpy(out->mask, &s_sigact[signum].mask, sizeof(out->mask));
+    (void)pthread_mutex_unlock(&s_sigact_mtx);
+    return 0;
+}
+
+/* Snapshot one action for delivery, applying SA_RESETHAND one-shot reset
+ * (handler back to SIG_DFL) BEFORE the frame is built so a nested
+ * delivery for the same signal sees the reset disposition. The returned
+ * snapshot carries the pre-reset handler the frame must install.
+ * SIG_IGN dispositions are never reset. Returns 0 on success, -1 for a
+ * bad signum or NULL out. */
+int i686_gsig_consume_oneshot(int signum, struct i686_gsigaction *out)
+{
+    if (signum < 1 || signum > 64 || out == NULL) {
+        return -1;
+    }
+    (void)pthread_mutex_lock(&s_sigact_mtx);
+    out->handler = s_sigact[signum].handler;
+    out->flags = s_sigact[signum].flags;
+    out->restorer = s_sigact[signum].restorer;
+    memcpy(out->mask, &s_sigact[signum].mask, sizeof(out->mask));
+    if (out->handler != 0U && out->handler != 1U &&
+        (out->flags & 0x80000000U) != 0U) {
+        __atomic_store_n(&s_sigact[signum].handler, 0U, __ATOMIC_RELEASE);
+    }
+    (void)pthread_mutex_unlock(&s_sigact_mtx);
+    return 0;
+}
+
+void i686_gsig_fork_child(void);
+void i686_gsig_fork_child(void)
+{
+    (void)pthread_mutex_destroy(&s_sigact_mtx);
+    (void)pthread_mutex_init(&s_sigact_mtx, NULL);
 }
 
 int i686_gsig_is_ignored(int signum);
 int i686_gsig_is_ignored(int signum)
 {
-    return (signum >= 1 && signum <= 64 && s_sigact[signum].handler == 1U);
+    uint32_t h;
+    if (signum < 1 || signum > 64) {
+        return 0;
+    }
+    h = __atomic_load_n(&s_sigact[signum].handler, __ATOMIC_ACQUIRE);
+    return (h == 1U);
 }
 
 uint32_t i686_gsig_handler_raw(int signum);
@@ -49,22 +102,25 @@ uint32_t i686_gsig_handler_raw(int signum)
     if (signum < 1 || signum > 64) {
         return 0U;
     }
-    return s_sigact[signum].handler;
+    return __atomic_load_n(&s_sigact[signum].handler, __ATOMIC_ACQUIRE);
 }
 
 void i686_gsig_exec_reset(void);
 void i686_gsig_exec_reset(void)
 {
     int s;
+    (void)pthread_mutex_lock(&s_sigact_mtx);
     for (s = 1; s <= 64; s++) {
-        if (s_sigact[s].handler == 1U) {
+        uint32_t h = __atomic_load_n(&s_sigact[s].handler, __ATOMIC_RELAXED);
+        if (h == 1U) {
             continue;
         }
-        s_sigact[s].handler = 0U;
+        __atomic_store_n(&s_sigact[s].handler, 0U, __ATOMIC_RELAXED);
         s_sigact[s].flags = 0U;
         s_sigact[s].restorer = 0U;
         s_sigact[s].mask = 0ULL;
     }
+    (void)pthread_mutex_unlock(&s_sigact_mtx);
 }
 
 /* prctl PR_{GET,SET}_NAME: TASK_COMM_LEN = 16 NUL-padded bytes. */
@@ -87,20 +143,29 @@ static long sys_rt_sigaction(i686_ctx_t *ctx, uint32_t sig, uint32_t act_va,
     }
     if (oldact_va != 0U) {
         uint8_t old[20];
-        wr_le32(old + 0U, s_sigact[sig].handler);
+        uint32_t h;
+        (void)pthread_mutex_lock(&s_sigact_mtx);
+        h = __atomic_load_n(&s_sigact[sig].handler, __ATOMIC_ACQUIRE);
+        wr_le32(old + 0U, h);
         wr_le32(old + 4U, s_sigact[sig].flags);
         wr_le32(old + 8U, s_sigact[sig].restorer);
         memcpy(old + 12U, &s_sigact[sig].mask, 8U);
+        (void)pthread_mutex_unlock(&s_sigact_mtx);
         if (guest_ptr_bad(oldact_va) ||
             i686_copy_to_guest(ctx, oldact_va, old, sizeof old) != 0) {
             return -EFAULT;
         }
     }
     if (have_staged) {
-        s_sigact[sig].handler  = rd_le32(staged + 0U);
+        /* The handler word is read lock-free elsewhere, so every write
+         * uses an atomic store (I686-R4-6). */
+        uint32_t h = rd_le32(staged + 0U);
+        (void)pthread_mutex_lock(&s_sigact_mtx);
+        __atomic_store_n(&s_sigact[sig].handler, h, __ATOMIC_RELEASE);
         s_sigact[sig].flags    = rd_le32(staged + 4U);
         s_sigact[sig].restorer = rd_le32(staged + 8U);
         memcpy(&s_sigact[sig].mask, staged + 12U, 8U);
+        (void)pthread_mutex_unlock(&s_sigact_mtx);
     }
     return 0;
 }
@@ -166,6 +231,15 @@ static long sys_sigaltstack(i686_ctx_t *ctx, uint32_t ss_va, uint32_t old_ss_va)
 {
     uint8_t staged[SS_];
     int have_staged = 0;
+    /* Snapshot the old stack first: the cross-sibling rule is old-before-
+     * overwrite, so overlapping ss/old_ss guest pointers cannot corrupt
+     * the reported state. Nothing below mutates ctx until commit. */
+    uint32_t old_sp = ctx->altstack_sp;
+    uint32_t old_size = ctx->altstack_size;
+    uint32_t old_flags = ctx->altstack_flags;
+    if (ctx->altstack_onstack != 0U) {
+        old_flags |= 0x1U;
+    }
     if (ss_va != 0U) {
         if (guest_ptr_bad(ss_va) ||
             i686_copy_from_guest(ctx, staged, ss_va, sizeof staged) != 0) {
@@ -175,13 +249,9 @@ static long sys_sigaltstack(i686_ctx_t *ctx, uint32_t ss_va, uint32_t old_ss_va)
     }
     if (old_ss_va != 0U) {
         uint8_t old[SS_];
-        uint32_t oflags = ctx->altstack_flags;
-        if (ctx->altstack_onstack != 0U) {
-            oflags |= 0x1U;
-        }
-        wr_le32(old + 0U, ctx->altstack_sp);
-        wr_le32(old + 4U, oflags);
-        wr_le32(old + 8U, ctx->altstack_size);
+        wr_le32(old + 0U, old_sp);
+        wr_le32(old + 4U, old_flags);
+        wr_le32(old + 8U, old_size);
         if (guest_ptr_bad(old_ss_va) ||
             i686_copy_to_guest(ctx, old_ss_va, old, sizeof old) != 0) {
             return -EFAULT;
