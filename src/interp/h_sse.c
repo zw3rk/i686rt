@@ -80,6 +80,24 @@ static uint32_t sse_round_f64_to_f32(i686_ctx_t *ctx, double d)
     }
 
     f = (float)d;
+    /* I686-R5-1: (float)d rounds to nearest-even, which may already lie
+     * on the desired side of the exact value d. Step only when the
+     * nearest result is on the wrong side of d. */
+    if ((double)f != d && rc != 0U) {
+        if (rc == 1U) {
+            if ((double)f > d) {
+                f = nextafterf(f, -INFINITY);
+            }
+        } else if (rc == 2U) {
+            if ((double)f < d) {
+                f = nextafterf(f, INFINITY);
+            }
+        } else {
+            if (fabs((double)f) > fabs(d)) {
+                f = nextafterf(f, 0.0f);
+            }
+        }
+    }
     fb = f32_bits(f);
     mag = fb & 0x7FFFFFFFu;
 
@@ -89,32 +107,6 @@ static uint32_t sse_round_f64_to_f32(i686_ctx_t *ctx, double d)
             return (d < 0.0) ? F32_NEG_INF : F32_POS_INF;
         }
         return (d < 0.0) ? (F32_MAX_BITS | 0x80000000u) : F32_MAX_BITS;
-    }
-
-    if ((double)f != d && rc != 0U && mag >= 0x00800000u) {
-        int bump;
-        unsigned neg = (fb >> 31) & 1U;
-
-        if (rc == 1U) {
-            bump = neg ? 1 : -1;
-        } else if (rc == 2U) {
-            bump = neg ? -1 : 1;
-        } else {
-            bump = -1;
-        }
-        if (bump > 0) {
-            mag += 1U;
-            if (mag >= 0x7F800000u) {
-                ctx->mxcsr |= MXCSR_OE | MXCSR_PE;
-                return neg ? F32_NEG_INF : F32_POS_INF;
-            }
-        } else {
-            mag -= 1U;
-        }
-        fb = (neg << 31) | mag;
-        if ((double)f32_from(fb) == d) {
-            fb = f32_bits(f);
-        }
     }
 
     if (mag < 0x00800000u) {
@@ -271,6 +263,42 @@ static uint64_t sse_f64_op(i686_ctx_t *ctx, uint64_t a, uint64_t b, fop_kind k)
         flg = fetestexcept(FE_INEXACT | FE_OVERFLOW | FE_UNDERFLOW);
         if (host_rm != saved_rm) {
             (void)fesetround(saved_rm);
+        }
+        /* I686-R5-1: verify directed rounding against a higher-precision
+         * long double exact value and step only when the host result is
+         * on the wrong side (host rounding modes may be unavailable or
+         * coarse on some platforms). */
+        if (rc != 0U && !isnan(r) && !isinf(r)) {
+            long double exact = 0.0L;
+            long double rr = (long double)r;
+            double stepped = r;
+            switch (k) {
+            case FOP_ADD: exact = (long double)da + (long double)db; break;
+            case FOP_SUB: exact = (long double)da - (long double)db; break;
+            case FOP_MUL: exact = (long double)da * (long double)db; break;
+            case FOP_DIV:
+                if (db != 0.0) {
+                    exact = (long double)da / (long double)db;
+                }
+                break;
+            default: break;
+            }
+            if (rr != exact) {
+                if (rc == 1U && rr > exact) {
+                    stepped = nextafter(r, -INFINITY);
+                } else if (rc == 2U && rr < exact) {
+                    stepped = nextafter(r, INFINITY);
+                } else if (rc == 3U && fabsl(rr) > fabsl(exact)) {
+                    stepped = nextafter(r, 0.0);
+                }
+            }
+            if (stepped != r) {
+                r = stepped;
+                flg |= FE_INEXACT;
+                if (isinf(r)) {
+                    flg |= FE_OVERFLOW;
+                }
+            }
         }
     }
     if ((flg & FE_INEXACT) != 0) {

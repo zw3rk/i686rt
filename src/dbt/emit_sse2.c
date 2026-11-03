@@ -381,14 +381,15 @@ static int sse_emit_mxcsr(i686_emit_ctx_t *e, const x86_insn_t *insn,
     if (insn->modrm_mod == 3U) {
         return -1; /* reg form is x86 #UD */
     }
+    /* I686-R5-2: LDMXCSR with reserved bits set must #GP without
+     * modifying MXCSR; bail to the interpreter oracle which enforces it. */
+    if (store == 0U) {
+        return -1;
+    }
     sse_guest_addr(e, insn);
-    if (store != 0U) { /* STMXCSR: m32 <- ctx->mxcsr */
+    { /* STMXCSR: m32 <- ctx->mxcsr */
         a64_emit_ldr_imm_w(b, SSE_W8, A64_XCTX, 0x198U);
         a64_emit_str_imm_w(b, SSE_W8, SSE_ADDR, 0U);
-    } else { /* LDMXCSR: m32 -> ctx->mxcsr (reserved bits masked) */
-        a64_emit_ldr_imm_w(b, SSE_W8, SSE_ADDR, 0U);
-        sse_and_ffff(b, SSE_W8, SSE_W8);
-        a64_emit_str_imm_w(b, SSE_W8, A64_XCTX, 0x198U);
     }
     return 0;
 }

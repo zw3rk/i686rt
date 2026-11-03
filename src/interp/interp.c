@@ -302,6 +302,39 @@ int  i686_syscall_is_exit(long nr);
 
 #define I686_REGISTRY_MAX 512U
 
+/* I686-R5-3: LOCK is only legal on memory-destination ADD/ADC/AND/BTC/
+ * BTR/BTS/CMPXCHG/CMPXCHG8B/DEC/INC/NEG/NOT/OR/SBB/SUB/XOR/XADD/XCHG.
+ * LOCK on shifts/rotates is #UD even when the masked count is 0. */
+static int interp_lock_illegal_shift(uint16_t op)
+{
+    switch (op) {
+    case I686_OP_ROL_Eb1: case I686_OP_ROL_Ev1:
+    case I686_OP_ROL_EbCL: case I686_OP_ROL_EvCL:
+    case I686_OP_ROL_EbIb: case I686_OP_ROL_EvIb:
+    case I686_OP_ROR_Eb1: case I686_OP_ROR_Ev1:
+    case I686_OP_ROR_EbCL: case I686_OP_ROR_EvCL:
+    case I686_OP_ROR_EbIb: case I686_OP_ROR_EvIb:
+    case I686_OP_RCL_Eb1: case I686_OP_RCL_Ev1:
+    case I686_OP_RCL_EbCL: case I686_OP_RCL_EvCL:
+    case I686_OP_RCL_EbIb: case I686_OP_RCL_EvIb:
+    case I686_OP_RCR_Eb1: case I686_OP_RCR_Ev1:
+    case I686_OP_RCR_EbCL: case I686_OP_RCR_EvCL:
+    case I686_OP_RCR_EbIb: case I686_OP_RCR_EvIb:
+    case I686_OP_SHL_Eb1: case I686_OP_SHL_Ev1:
+    case I686_OP_SHL_EbCL: case I686_OP_SHL_EvCL:
+    case I686_OP_SHL_EbIb: case I686_OP_SHL_EvIb:
+    case I686_OP_SHR_Eb1: case I686_OP_SHR_Ev1:
+    case I686_OP_SHR_EbCL: case I686_OP_SHR_EvCL:
+    case I686_OP_SHR_EbIb: case I686_OP_SHR_EvIb:
+    case I686_OP_SAR_Eb1: case I686_OP_SAR_Ev1:
+    case I686_OP_SAR_EbCL: case I686_OP_SAR_EvCL:
+    case I686_OP_SAR_EbIb: case I686_OP_SAR_EvIb:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static i686_interp_fn s_registry[I686_REGISTRY_MAX];
 
 void i686_interp_register(uint16_t op, i686_interp_fn fn)
@@ -394,6 +427,12 @@ int i686_interp_step(i686_ctx_t *ctx)
                                                                     ctx->eip + b));
         }
         (void)fprintf(stderr, "\n");
+        return I686_EXIT_UNDEF;
+    }
+    if (insn.pfx_lock != 0U && interp_lock_illegal_shift(insn.op)) {
+        i686_vm32_exec_leave();
+        ctx->exit_reason = I686_EXIT_UNDEF;
+        ctx->exit_arg = insn.op;
         return I686_EXIT_UNDEF;
     }
     fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
@@ -554,6 +593,19 @@ run_loop:
                                                                         ctx->eip + b));
             }
             (void)fprintf(stderr, "\n");
+            return I686_EXIT_UNDEF;
+        }
+        if (insn.pfx_lock != 0U && interp_lock_illegal_shift(insn.op)) {
+            i686_vm32_exec_leave();
+            ctx->exit_reason = I686_EXIT_UNDEF;
+            ctx->exit_arg = insn.op;
+            {
+                extern int i686_deliver_sync(i686_ctx_t *, int reason);
+                if (i686_deliver_sync(ctx, (int)I686_EXIT_UNDEF) == 0) {
+                    continue;
+                }
+            }
+            diag("opcode refused", ctx, insn.op);
             return I686_EXIT_UNDEF;
         }
         fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;

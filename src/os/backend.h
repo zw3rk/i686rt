@@ -271,4 +271,11 @@ int rt_host_install_signal_handlers(rt_host_sync_fault_fn on_sync_fault,
                                     rt_host_async_sig_fn on_async_sig,
                                     rt_host_preempt_fn on_preempt);
 
+/* I686-R5-10: shared Darwin poll/wake-pipe readiness wait (defined in
+ * backend_darwin_io.c, used by backend_darwin_net.c). */
+#if defined(__APPLE__)
+int i686_darwin_wait_fd(int fd, int for_write, rt_worker_sync_t *ws,
+                        uint32_t expected_seq, int timeout_ms);
+#endif
+
 #endif /* I686RT_OS_BACKEND_H */

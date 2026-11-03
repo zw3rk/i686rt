@@ -647,10 +647,12 @@ static int h_ldmxcsr(i686_ctx_t *ctx, const x86_insn_t *insn)
         return I686_EXIT_UNDEF;
     }
     sse_ld(ctx, insn, &v, 4);
-    sse_set_mxcsr(ctx, v);
-    if ((v & ~MXCSR_DEFINED) != 0U) {
-        ctx->mxcsr |= MXCSR_IE;
+    /* I686-R5-2: reserved MXCSR bits set -> #GP (guest SIGSEGV) without
+     * modifying MXCSR or advancing EIP. */
+    if ((v & ~0xFFFFu) != 0U) {
+        return I686_EXIT_FAULT;
     }
+    sse_set_mxcsr(ctx, v);
     return sse_done(ctx, insn);
 }
 

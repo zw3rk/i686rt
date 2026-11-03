@@ -264,10 +264,10 @@ static int vm_munmap_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len)
     if (rt32_vm_can_unmap_locked(start, end) != 0) {
         return -ENOMEM;
     }
+    /* I686-R5-8: preflight file-tracking split capacity before the host
+     * reservation, and only commit untrack after the reservation succeeds
+     * so a failed reservation never leaves a live mapping untracked. */
     if (i686_vm_file_can_replace(start, (size_t)aligned_len, 0) != 0) {
-        return -ENOMEM;
-    }
-    if (i686_vm_file_untrack_map(start, (size_t)aligned_len) != 0) {
         return -ENOMEM;
     }
     {
@@ -275,6 +275,9 @@ static int vm_munmap_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len)
         if (rc != 0) {
             return rc;
         }
+    }
+    if (i686_vm_file_untrack_map(start, (size_t)aligned_len) != 0) {
+        return -ENOMEM;
     }
 
     if (rt32_vm_unmap_regions_locked(start, end) != 0) {

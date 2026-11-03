@@ -633,6 +633,8 @@ prefixes_done:;
         }
     }
 
+    /* I686-R5-3: LOCK legality (shifts/rotates #UD) is enforced in the
+     * interpreter/DBT dispatch, not here; decode preserves pfx_lock. */
     out->len = (uint8_t)(pc - eip);
     if (out->len < 1U || out->len > 15U) {
         return -1;

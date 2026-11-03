@@ -77,6 +77,7 @@
  * (darwin: sys/wait.h -> sys/signal.h) rewrite with a macro; the frozen
  * struct must parse before any of that lands. */
 #include "marshal.h"
+#include "os/backend.h"
 #include "os/sys_sock_internal.h"
 #include "structs_i386.h"
 
@@ -98,31 +99,17 @@ static const uint8_t s_sc_nargs[I686_SC_MAX + 1U] = {
     6U, 6U, 2U, 5U, 5U, 3U, 3U, 4U, 5U, 4U,
 };
 
-/* darwin is never a runtime host (aarch64 Linux only); the shim exists so
- * the macOS-native unit driver links.  Flags are folded by callers that
- * can (flags 0 -> accept(2)); flags != 0 on darwin is untested. */
-#ifdef __APPLE__
-static int hs_accept4(int fd, struct sockaddr *sa, socklen_t *sl, int flags)
-{
-    (void)fd;
-    (void)sa;
-    (void)sl;
-    (void)flags;
-    errno = I686_ENOSYS;
-    return -1;
-}
-#else
-static int hs_accept4(int fd, struct sockaddr *sa, socklen_t *sl, int flags)
-{
-    return accept4(fd, sa, sl, flags);
-}
-#endif
+/* I686-R5-11: guest socket syscalls route through the rt_host_* backend
+ * wrappers (backend.h section 6), which cover both static-PIE aarch64-Linux
+ * and macOS arm64 (Darwin) hosts. Flags are folded by callers that can
+ * (flags 0 -> accept(2) path inside the backend). */
 
 /* ---- subcall cores (shared by socketcall and direct numbers) ---------- */
 
 static int64_t sock_socket(uint32_t domain, uint32_t type, uint32_t protocol)
 {
-    return sret(socket((int)domain, (int)type, (int)protocol));
+    /* I686-R5-11: via backend wrapper (covers Linux + Darwin). */
+    return rt_host_socket((int)domain, (int)type, (int)protocol);
 }
 
 /* sockaddrs are byte-identical between i386 and the host; the kernel reads
@@ -141,7 +128,7 @@ static int64_t sock_bind(i686_ctx_t *ctx, uint32_t fd, uint32_t addr_va,
         }
         sa = (const struct sockaddr *)i686_guest_ptr(ctx, addr_va);
     }
-    return sret(bind((int)fd, sa, (socklen_t)len));
+    return rt_host_bind((int)fd, sa, len);
 }
 
 static int64_t sock_connect(i686_ctx_t *ctx, uint32_t fd, uint32_t addr_va,
@@ -156,12 +143,12 @@ static int64_t sock_connect(i686_ctx_t *ctx, uint32_t fd, uint32_t addr_va,
         }
         sa = (const struct sockaddr *)i686_guest_ptr(ctx, addr_va);
     }
-    return sret(connect((int)fd, sa, (socklen_t)len));
+    return rt_host_connect((int)fd, sa, len, NULL, 0U);
 }
 
 static int64_t sock_listen(uint32_t fd, uint32_t backlog)
 {
-    return sret(listen((int)fd, (int)backlog));
+    return rt_host_listen((int)fd, (int)backlog);
 }
 
 /* accept/accept4: the out sockaddr (bounded by the guest-supplied socklen,
@@ -188,9 +175,9 @@ static int64_t sock_accept4(i686_ctx_t *ctx, uint32_t fd, uint32_t addr_va,
         sl  = (socklen_t *)i686_guest_ptr(ctx, lenp_va);
     }
     if (flags == 0U) {
-        return sret(accept((int)fd, sa, sl));
+        return rt_host_accept4((int)fd, sa, (uint32_t *)sl, 0, NULL, 0U);
     }
-    return sret(hs_accept4((int)fd, sa, sl, (int)flags));
+    return rt_host_accept4((int)fd, sa, (uint32_t *)sl, (int)flags, NULL, 0U);
 }
 
 /* getsockname/getpeername share the staging: in-window sockaddr (bounded
@@ -213,8 +200,10 @@ static int64_t sock_getname(i686_ctx_t *ctx, uint32_t fd, uint32_t addr_va,
         }
         sl = (socklen_t *)i686_guest_ptr(ctx, lenp_va);
     }
-    return sret(peer ? getpeername((int)fd, sa, sl)
-                     : getsockname((int)fd, sa, sl));
+    if (peer) {
+        return rt_host_getpeername((int)fd, sa, (uint32_t *)sl);
+    }
+    return rt_host_getsockname((int)fd, sa, (uint32_t *)sl);
 }
 
 static int64_t sock_getsockname(i686_ctx_t *ctx, uint32_t fd, uint32_t addr_va,
@@ -236,8 +225,8 @@ static int64_t sock_socketpair(i686_ctx_t *ctx, uint32_t domain,
     if (sv_va < 0x1000U || sv_va > UINT32_MAX - 7U) {
         return -EFAULT;
     }
-    return sret(socketpair((int)domain, (int)type, (int)protocol,
-                           (int *)(void *)i686_guest_ptr(ctx, sv_va)));
+    return rt_host_socketpair((int)domain, (int)type, (int)protocol,
+                              (int *)(void *)i686_guest_ptr(ctx, sv_va));
 }
 
 /* sendto covers SYS_SEND (addr == 0) and the direct nr 369. */
@@ -258,9 +247,9 @@ static int64_t sock_sendto(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
         }
         sa = (const struct sockaddr *)i686_guest_ptr(ctx, addr_va);
     }
-    return sret(sendto((int)fd,
-                       (len != 0U) ? i686_guest_ptr(ctx, buf_va) : NULL,
-                       (size_t)len, (int)flags, sa, (socklen_t)addrlen));
+    return rt_host_sendto((int)fd,
+                            (len != 0U) ? i686_guest_ptr(ctx, buf_va) : NULL,
+                            (size_t)len, (int)flags, sa, addrlen, NULL, 0U);
 }
 
 /* recvfrom covers SYS_RECV (from == 0) and the direct nr 371. */
@@ -287,14 +276,15 @@ static int64_t sock_recvfrom(i686_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
         sa = (struct sockaddr *)i686_guest_ptr(ctx, from_va);
         sl = (socklen_t *)i686_guest_ptr(ctx, fromlenp_va);
     }
-    return sret(recvfrom((int)fd,
-                         (len != 0U) ? i686_guest_ptr(ctx, buf_va) : NULL,
-                         (size_t)len, (int)flags, sa, sl));
+    return rt_host_recvfrom((int)fd,
+                              (len != 0U) ? i686_guest_ptr(ctx, buf_va) : NULL,
+                              (size_t)len, (int)flags, sa, (uint32_t *)sl,
+                              NULL, 0U);
 }
 
 static int64_t sock_shutdown(uint32_t fd, uint32_t how)
 {
-    return sret(shutdown((int)fd, (int)how));
+    return rt_host_shutdown((int)fd, (int)how);
 }
 
 /* setsockopt: only SO_RCVTIMEO_OLD/SO_SNDTIMEO_OLD under SOL_SOCKET carry
@@ -327,15 +317,16 @@ static int64_t sock_setsockopt(i686_ctx_t *ctx, uint32_t fd, uint32_t level,
         tv.tv_usec = (suseconds_t)g.tv_usec;
         int host_opt = (optname == I686_SO_RCVTIMEO_OLD) ? SO_RCVTIMEO
                                                          : SO_SNDTIMEO;
-        return sret(setsockopt((int)fd, SOL_SOCKET, host_opt, &tv,
-                               (socklen_t)sizeof(tv)));
+        return rt_host_setsockopt((int)fd, SOL_SOCKET, host_opt, &tv,
+                                  (uint32_t)sizeof(tv));
     }
     if (val_va != 0U && !va_ok(val_va, optlen)) {
         return -EFAULT;
     }
-    return sret(setsockopt((int)fd, (int)level, (int)optname,
-                           (val_va != 0U) ? i686_guest_ptr(ctx, val_va) : NULL,
-                           (socklen_t)optlen));
+    return rt_host_setsockopt((int)fd, (int)level, (int)optname,
+                              (val_va != 0U) ? i686_guest_ptr(ctx, val_va)
+                                             : NULL,
+                              optlen);
 }
 
 static int64_t sock_getsockopt(i686_ctx_t *ctx, uint32_t fd, uint32_t level,
@@ -356,11 +347,15 @@ static int64_t sock_getsockopt(i686_ctx_t *ctx, uint32_t fd, uint32_t level,
             return -EINVAL;
         }
         struct timeval tv;
-        socklen_t      hlen = (socklen_t)sizeof(tv);
+        uint32_t       hlen = (uint32_t)sizeof(tv);
         int host_opt = (optname == I686_SO_RCVTIMEO_OLD) ? SO_RCVTIMEO
                                                          : SO_SNDTIMEO;
-        if (getsockopt((int)fd, SOL_SOCKET, host_opt, &tv, &hlen) < 0) {
-            return -(int64_t)errno;
+        {
+            int64_t grc =
+                rt_host_getsockopt((int)fd, SOL_SOCKET, host_opt, &tv, &hlen);
+            if (grc < 0) {
+                return grc;
+            }
         }
         i686_timeval_t g;
         g.tv_sec  = (int32_t)tv.tv_sec;
@@ -380,11 +375,12 @@ static int64_t sock_getsockopt(i686_ctx_t *ctx, uint32_t fd, uint32_t level,
         (lenp_va < 0x1000U || lenp_va > UINT32_MAX - 3U)) {
         return -EFAULT;
     }
-    return sret(getsockopt((int)fd, (int)level, (int)optname,
-                           (val_va != 0U) ? i686_guest_ptr(ctx, val_va) : NULL,
-                           (lenp_va != 0U)
-                               ? (socklen_t *)i686_guest_ptr(ctx, lenp_va)
-                               : NULL));
+    return rt_host_getsockopt((int)fd, (int)level, (int)optname,
+                              (val_va != 0U) ? i686_guest_ptr(ctx, val_va)
+                                             : NULL,
+                              (lenp_va != 0U)
+                                  ? (uint32_t *)i686_guest_ptr(ctx, lenp_va)
+                                  : NULL);
 }
 
 /* ---- registry adapters ------------------------------------------------ */

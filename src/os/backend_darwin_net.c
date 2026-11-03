@@ -81,39 +81,8 @@ static bool lease_valid(const rt_worker_sync_t *ws, uint32_t expected_seq)
     return ws == NULL || atomic_load(&ws->sig_seq) == expected_seq;
 }
 
-/* FD readiness wait shared with backend_darwin_io.c (one static copy per
- * TU; the io copy serves section 5, this one section 6). */
-static int darwin_wait_fd(int fd, int for_write, rt_worker_sync_t *ws,
-                          uint32_t expected_seq, int timeout_ms)
-{
-    struct pollfd pf[2];
-    int n = 0;
-    int rc;
-    if (!lease_valid(ws, expected_seq)) {
-        return 0;
-    }
-    pf[0].fd = fd;
-    pf[0].events = (short)(for_write ? POLLOUT : POLLIN);
-    pf[0].revents = 0;
-    n = 1;
-    if (ws != NULL && ws->wake_pipe_rd >= 0) {
-        pf[1].fd = ws->wake_pipe_rd;
-        pf[1].events = POLLIN;
-        pf[1].revents = 0;
-        n = 2;
-    }
-    rc = poll(pf, (nfds_t)n, timeout_ms);
-    if (rc < 0) {
-        return -errno;
-    }
-    if (rc == 0 || !lease_valid(ws, expected_seq)) {
-        return 0;
-    }
-    if (n == 2 && (pf[1].revents & POLLIN) != 0) {
-        return 0;
-    }
-    return ((pf[0].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)) != 0) ? 1 : 0;
-}
+/* I686-R5-10: readiness wait shared from backend_darwin_io.c
+ * (i686_darwin_wait_fd, declared in backend.h). */
 
 int64_t rt_host_socket(int linux_domain, int linux_type, int protocol)
 {
@@ -147,7 +116,7 @@ int64_t rt_host_bind(int fd, const void *linux_addr, uint32_t addrlen)
 int64_t rt_host_connect(int fd, const void *linux_addr, uint32_t addrlen,
                         rt_worker_sync_t *ws, uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
     int rc;
     if (w < 0) {
         return (int64_t)w;
@@ -168,7 +137,7 @@ int64_t rt_host_accept4(int fd, void *linux_addr_out, uint32_t *addrlen_inout,
                         int linux_flags, rt_worker_sync_t *ws,
                         uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
     int cfd;
     socklen_t len = (addrlen_inout != NULL) ? (socklen_t)*addrlen_inout : 0u;
     (void)linux_flags;
@@ -192,7 +161,7 @@ int64_t rt_host_sendto(int fd, const void *buf, size_t len, int linux_flags,
                        const void *linux_dest_addr, uint32_t addrlen,
                        rt_worker_sync_t *ws, uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
     ssize_t n;
     if (w < 0) {
         return (int64_t)w;
@@ -208,7 +177,7 @@ int64_t rt_host_recvfrom(int fd, void *buf, size_t len, int linux_flags,
                          void *linux_src_addr_out, uint32_t *addrlen_inout,
                          rt_worker_sync_t *ws, uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
     ssize_t n;
     socklen_t len2 = (addrlen_inout != NULL) ? (socklen_t)*addrlen_inout : 0u;
     if (w < 0) {

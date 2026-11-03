@@ -360,20 +360,32 @@ void t_mem_mxcsr(void)
     CHECK(xl64(0, 0) == 0x0102030405060708ull &&
           xl64(0, 1) == 0xDEADBEEFDEADBEEFull);
 
-    /* LDMXCSR: reserved bits masked + IE; STMXCSR reads back. */
+    /* LDMXCSR: reserved bit set -> #GP fault, MXCSR and EIP preserved. */
     reset();
-    w32va(DATA_VA, 0x0001FFFFu); /* bit 16 is reserved */
+    ctx.mxcsr = 0x00001F80u;
+    {
+        uint32_t eip0 = ctx.eip;
+        w32va(DATA_VA, 0x0001FFFFu); /* bit 16 is reserved */
+        in = mkmem(I686_OP_LDMXCSR, 0);
+        in.opnd[0] = I686_OPND_RM32;
+        CHECK(run(&in) != 0);
+        CHECK(sse_get_mxcsr(&ctx) == 0x00001F80u);
+        CHECK(ctx.eip == eip0);
+    }
+    /* LDMXCSR valid value loads; STMXCSR reads back. */
+    reset();
+    w32va(DATA_VA, 0x00001F80u);
     in = mkmem(I686_OP_LDMXCSR, 0);
     in.opnd[0] = I686_OPND_RM32;
     CHECK(run(&in) == 0);
-    CHECK(sse_get_mxcsr(&ctx) == 0x0000FFFFu);
-    CHECK((ctx.mxcsr & T_IE) != 0);
+    CHECK(sse_get_mxcsr(&ctx) == 0x00001F80u);
+    CHECK((ctx.mxcsr & T_IE) == 0);
     in = mkmem(I686_OP_STMXCSR, 0);
     in.opnd[0] = I686_OPND_RM32;
     w32va(DATA_VA + 8, 0);
     in.ea_disp = DATA_VA + 8;
     CHECK(run(&in) == 0);
-    CHECK(r32va(DATA_VA + 8) == 0x0000FFFFu);
+    CHECK(r32va(DATA_VA + 8) == 0x00001F80u);
 }
 
 

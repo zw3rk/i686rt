@@ -42,10 +42,11 @@ static bool lease_valid(const rt_worker_sync_t *ws, uint32_t expected_seq)
     return ws == NULL || atomic_load(&ws->sig_seq) == expected_seq;
 }
 
-/* Wait until fd is ready (or the wake pipe fires, or timeout_ms elapses).
+/* I686-R5-10: shared Darwin readiness wait (declared in backend.h).
+ * Wait until fd is ready (or the wake pipe fires, or timeout_ms elapses).
  * Returns 1 when fd is ready, 0 on timeout/signal, -errno on error. */
-static int darwin_wait_fd(int fd, int for_write, rt_worker_sync_t *ws,
-                          uint32_t expected_seq, int timeout_ms)
+int i686_darwin_wait_fd(int fd, int for_write, rt_worker_sync_t *ws,
+                        uint32_t expected_seq, int timeout_ms)
 {
     struct pollfd pf[2];
     int n = 0;
@@ -126,7 +127,7 @@ int64_t rt_host_close(int fd)
 int64_t rt_host_read(int fd, void *buf, size_t count,
                      rt_worker_sync_t *ws, uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
     ssize_t n;
     if (w < 0) {
         return (int64_t)w;
@@ -141,7 +142,7 @@ int64_t rt_host_read(int fd, void *buf, size_t count,
 int64_t rt_host_write(int fd, const void *buf, size_t count,
                       rt_worker_sync_t *ws, uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
     ssize_t n;
     if (w < 0) {
         return (int64_t)w;
@@ -168,7 +169,7 @@ int64_t rt_host_pwrite64(int fd, const void *buf, size_t count, int64_t offset)
 int64_t rt_host_readv(int fd, const struct iovec *iov, int iovcnt,
                       rt_worker_sync_t *ws, uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
     ssize_t n;
     if (w < 0) {
         return (int64_t)w;
@@ -183,7 +184,7 @@ int64_t rt_host_readv(int fd, const struct iovec *iov, int iovcnt,
 int64_t rt_host_writev(int fd, const struct iovec *iov, int iovcnt,
                        rt_worker_sync_t *ws, uint32_t expected_seq)
 {
-    int w = darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
+    int w = i686_darwin_wait_fd(fd, 1, ws, expected_seq, 30000);
     ssize_t n;
     if (w < 0) {
         return (int64_t)w;
