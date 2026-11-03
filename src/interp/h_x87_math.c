@@ -7,6 +7,10 @@
 
 #include "interp/h_x87_internal.h"
 
+#ifndef M_LOG2E
+#define M_LOG2E 1.44269504088896340736
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Unary / transcendental ops (both modes)                             */
 /* ------------------------------------------------------------------ */
@@ -575,7 +579,7 @@ void i686_x87_op_fyl2x(i686_ctx_t *ctx, int p1)
                 return;
             }
             {
-                double l = log2(a + 1.0);
+                double l = log1p(a) * M_LOG2E;
                 if (l == 0.0 && isinf(b)) {
                     x87_set_exc(ctx, SW_IE);
                     x87_set_f64(ctx, 1, (double)NAN);

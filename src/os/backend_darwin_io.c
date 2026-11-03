@@ -290,6 +290,9 @@ int64_t rt_host_copy_file_range(int fd_in, int64_t *off_in, int fd_out,
         }
         n = pread(fd_in, chunk, want, (off_t)(in + done));
         if (n < 0) {
+            if (done > 0) {
+                break;
+            }
             return (int64_t)-errno;
         }
         if (n == 0) {
@@ -304,12 +307,16 @@ int64_t rt_host_copy_file_range(int fd_in, int64_t *off_in, int fd_out,
                 w = write(fd_out, chunk + wdone, (size_t)n - wdone);
             }
             if (w < 0) {
+                if (done > 0) {
+                    goto copy_done;
+                }
                 return (int64_t)-errno;
             }
             wdone += (size_t)w;
         }
         done += (int64_t)n;
     }
+copy_done:
     if (off_in != NULL) {
         *off_in = in + done;
     } else if (done != 0) {

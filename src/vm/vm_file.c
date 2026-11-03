@@ -318,7 +318,8 @@ static void vm_file_shrink_invalidate(i686_ctx_t *ctx, uint32_t gva)
 
 /* Shrink worker: caller holds the VM lock (I686-R4-3). Native mappings
  * keep host EOF behaviour (never touched); staged mappings zero the tail
- * and ANON + invalidate wholly-beyond pages via a checked prot window. */
+ * and EOF-trap + invalidate wholly-beyond pages (PROT_NONE / COW-clean
+ * so access faults; regrow restores them for reread from the file). */
 static void vm_file_shrink_locked(i686_ctx_t *ctx, uint32_t map_start,
                                   size_t map_len, uint64_t map_file_offset,
                                   uint64_t shrink_size, uint8_t staged)
@@ -340,13 +341,19 @@ static void vm_file_shrink_locked(i686_ctx_t *ctx, uint32_t map_start,
     }
     cut = i686_vm_file_shrink_cut(map_start, map_len, map_file_offset,
                                   shrink_size);
+    base = (ctx != NULL) ? ctx->guest_base : s_arena_base;
+    for (uint64_t a = (uint64_t)map_start; a < (uint64_t)cut; a += 0x1000ULL) {
+        if (s_state[page_index((uint32_t)a)] == 1u) {
+            s_state[page_index((uint32_t)a)] = 1u;
+            (void)mprotect((void *)(uintptr_t)(base + a), 0x1000u, i686_host_prot(ctx, i686_vm_file_prot((uint32_t)a & ~0xFFFu)));
+        }
+    }
     if ((uint64_t)cut >= map_end) {
-        return; /* shrink at/past the map EOF: nothing beyond EOF here */
+        return; /* shrink at/past the map EOF: prefix restored above */
     }
     tail_gva = (shrink_size <= map_file_offset)
                    ? (uint64_t)map_start
                    : (uint64_t)map_start + (shrink_size - map_file_offset);
-    base = (ctx != NULL) ? ctx->guest_base : s_arena_base;
     a2 = (ctx != NULL && ctx->vm_regime == I686_VM_REGIME_A2 &&
           ctx->vm_host_page > 4096u) ? 1 : 0;
     if (a2 != 0) {
@@ -372,7 +379,7 @@ static void vm_file_shrink_locked(i686_ctx_t *ctx, uint32_t map_start,
         for (a = (uint64_t)cut; a < map_end; a += 0x1000ULL) {
             uint32_t gva = (uint32_t)a;
             memset((void *)(uintptr_t)(base + a), 0, 0x1000u);
-            s_state[page_index(gva)] = (uint8_t)I686_PAGE_ANON;
+            s_state[page_index(gva)] = 1u; /* COW-clean EOF-trapped */
             vm_file_shrink_invalidate(ctx, gva);
         }
         /* Clamp the widen end into u32 range (0xFFFFFFFF -> window end). */
@@ -398,13 +405,12 @@ static void vm_file_shrink_locked(i686_ctx_t *ctx, uint32_t map_start,
         uint32_t gva = (uint32_t)a;
         uint32_t pg = gva & ~0xFFFu;
         void *page = (void *)(uintptr_t)(base + (uint64_t)pg);
-        int restore = i686_host_prot(ctx, i686_vm_file_prot(pg));
         if (mprotect(page, 0x1000u, PROT_READ | PROT_WRITE) != 0) {
             continue;
         }
         memset(page, 0, 0x1000u);
-        s_state[page_index(gva)] = (uint8_t)I686_PAGE_ANON;
-        (void)mprotect(page, 0x1000u, restore);
+        s_state[page_index(gva)] = 1u; /* COW-clean EOF-trapped */
+        (void)mprotect(page, 0x1000u, PROT_NONE);
         vm_file_shrink_invalidate(ctx, gva);
     }
 }
