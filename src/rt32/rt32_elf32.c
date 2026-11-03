@@ -115,7 +115,7 @@ static int protect_and_record_seg(i686_ctx_t *ctx, uint32_t start, uint32_t end,
 {
     rt32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
     if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > I686_PAGE_SIZE) {
-        if (i686_vm32_union_prot(ctx, start, end) != 0) {
+        if (i686_vm32_widen_prot(ctx, start, end) != 0) {
             fprintf(stderr, "i686rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
                     label, start, end, strerror(errno));
             return -1;
@@ -228,9 +228,8 @@ static int load_elf32_image(i686_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
     }
 
-    uint32_t highest_mapped_end  = 0U;
-    uint32_t highest_mapped_prot = 0U;
-    uint32_t prev_seg_end        = 0U;
+    uint32_t highest_mapped_end = 0U;
+    uint32_t prev_seg_end       = 0U;
     uint32_t fallback_phdr_vaddr = 0U;
     bool     entry_in_load       = false;
     bool     phdr_in_load        = false;
@@ -296,8 +295,11 @@ static int load_elf32_image(i686_ctx_t *ctx, int fd, uint32_t default_pie_base,
                               ((ph->p_flags & PF_W) ? (uint32_t)PROT_WRITE : 0U) |
                               ((ph->p_flags & PF_X) ? (uint32_t)PROT_EXEC : 0U);
 
-        uint32_t shared_end  = (map_end < map_start) ? map_end : map_start;
-        uint32_t merged_prot = highest_mapped_prot | guest_prot;
+        uint32_t shared_end = (map_end < map_start) ? map_end : map_start;
+        /* Later mapping wins (I686-R9-5): Linux MAP_FIXED load order gives
+         * the shared boundary page the current segment's protection, not
+         * the OR of both (which would turn an R-X/RW- boundary into RWX). */
+        uint32_t merged_prot = guest_prot;
         if (ctx->vm_host_page > I686_PAGE_SIZE) {
             uint32_t h    = ctx->vm_host_page;
             uint32_t h_lo = page_start & ~(h - 1U);
@@ -360,14 +362,12 @@ static int load_elf32_image(i686_ctx_t *ctx, int fd, uint32_t default_pie_base,
             if (protect_and_record_seg(ctx, page_start, shared_end, merged_prot, label) != 0) {
                 return -1;
             }
-            highest_mapped_prot = merged_prot;
         }
         if (map_end > map_start) {
             if (protect_and_record_seg(ctx, map_start, map_end, guest_prot, label) != 0) {
                 return -1;
             }
-            highest_mapped_end  = map_end;
-            highest_mapped_prot = guest_prot;
+            highest_mapped_end = map_end;
         }
 
         if (ph->p_flags & PF_X) {

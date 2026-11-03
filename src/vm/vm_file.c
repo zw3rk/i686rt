@@ -342,10 +342,20 @@ static void vm_file_shrink_locked(i686_ctx_t *ctx, uint32_t map_start,
     cut = i686_vm_file_shrink_cut(map_start, map_len, map_file_offset,
                                   shrink_size);
     base = (ctx != NULL) ? ctx->guest_base : s_arena_base;
-    for (uint64_t a = (uint64_t)map_start; a < (uint64_t)cut; a += 0x1000ULL) {
-        if (s_state[page_index((uint32_t)a)] == 1u) {
-            s_state[page_index((uint32_t)a)] = 1u;
-            (void)mprotect((void *)(uintptr_t)(base + a), 0x1000u, i686_host_prot(ctx, i686_vm_file_prot((uint32_t)a & ~0xFFFu)));
+    a2 = (ctx != NULL && ctx->vm_regime == I686_VM_REGIME_A2 &&
+          ctx->vm_host_page > 4096u) ? 1 : 0;
+    if (a2 != 0) {
+        /* Host-aligned prefix restore (I686-R9-8): per-4K mprotect is not
+         * host-aligned on 16K A2 hosts (EINVAL); widen aligns internally. */
+        if (cut > map_start) {
+            (void)i686_vm32_widen_prot(ctx, map_start, cut);
+        }
+    } else {
+        for (uint64_t a = (uint64_t)map_start; a < (uint64_t)cut; a += 0x1000ULL) {
+            if (s_state[page_index((uint32_t)a)] == 1u) {
+                s_state[page_index((uint32_t)a)] = 1u;
+                (void)mprotect((void *)(uintptr_t)(base + a), 0x1000u, i686_host_prot(ctx, i686_vm_file_prot((uint32_t)a & ~0xFFFu)));
+            }
         }
     }
     if ((uint64_t)cut >= map_end) {
@@ -354,8 +364,6 @@ static void vm_file_shrink_locked(i686_ctx_t *ctx, uint32_t map_start,
     tail_gva = (shrink_size <= map_file_offset)
                    ? (uint64_t)map_start
                    : (uint64_t)map_start + (shrink_size - map_file_offset);
-    a2 = (ctx != NULL && ctx->vm_regime == I686_VM_REGIME_A2 &&
-          ctx->vm_host_page > 4096u) ? 1 : 0;
     if (a2 != 0) {
         /* One host-aligned RW cover over [tail_gva, map_end), widened back
          * on success and failure (VM lock outer, subpage lock inner). */

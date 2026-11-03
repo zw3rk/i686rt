@@ -833,6 +833,9 @@ static void fork_child(void)
     i686_dbt_fork_child();
 #endif
     i686_aot_fork_child();
+    /* fork_prepare holds the registry lock in the surviving thread; unlock
+     * before destroy/init (I686-R9-9). The lock is retaken below. */
+    (void)pthread_mutex_unlock(&s_registry_lock);
     (void)pthread_mutex_destroy(&s_registry_lock);
     (void)pthread_mutex_init(&s_registry_lock, NULL);
     surviving = i686_current_ctx();

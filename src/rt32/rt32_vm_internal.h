@@ -62,7 +62,7 @@ void rt32_vm_fork_child(void);
 void rt32_vm_sync_from_ctx(i686_ctx_t *ctx);
 void rt32_vm_sync_to_ctx(i686_ctx_t *ctx);
 int rt32_vm_reserve_prot_none(i686_ctx_t *ctx, uint32_t start, uint32_t len);
-void rt32_vm_union_protect_a2(i686_ctx_t *ctx, uint32_t start, uint32_t end);
+void rt32_vm_widen_protect_a2(i686_ctx_t *ctx, uint32_t start, uint32_t end);
 bool rt32_vm_a2_staged_needed(const i686_ctx_t *ctx, uint32_t va, uint64_t len,
                               uint32_t flags, uint64_t file_off);
 int rt32_vm_mmap2_staged_a2_locked(i686_ctx_t *ctx, uint32_t target_va,

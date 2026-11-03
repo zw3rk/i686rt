@@ -237,13 +237,17 @@ void rt32_vm_file_sync_prot_locked(uint32_t start, uint32_t end)
     vm_bump_epoch();
 }
 
-void rt32_vm_union_protect_a2(i686_ctx_t *ctx, uint32_t start, uint32_t end)
+/* Steady-state A2 cover (I686-R9-4): the host page carries the
+ * intersection (AND) of its 4 KiB sub-page protections. Union (OR) is
+ * reserved for the transient locked emulate window; leaving it in place
+ * would expose a PROT_NONE hole beside a mapped sibling sub-page. */
+void rt32_vm_widen_protect_a2(i686_ctx_t *ctx, uint32_t start, uint32_t end)
 {
     if (ctx == NULL || end <= start ||
         ctx->vm_regime != I686_VM_REGIME_A2) {
         return;
     }
-    (void)i686_vm32_union_prot(ctx, start, end);
+    (void)i686_vm32_widen_prot(ctx, start, end);
 }
 static int vm_insert_region_raw(uint32_t start, uint32_t end,
                                 uint32_t prot, uint32_t flags, const char *name)
@@ -838,7 +842,7 @@ uint32_t rt32_vm_brk(i686_ctx_t *ctx, uint32_t new_brk)
             rt32_vm_lock_release();
             return curr;
         }
-        rt32_vm_union_protect_a2(ctx, old_page, new_page);
+        rt32_vm_widen_protect_a2(ctx, old_page, new_page);
         if (staged) {
             i686_vm32_subpage_unlock();
         }

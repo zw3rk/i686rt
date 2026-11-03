@@ -190,18 +190,18 @@ static long sys_uname(i686_ctx_t *ctx, uint32_t buf_va)
         "Linux", "i686rt", "6.1.0", "#1 SMP i686rt", "i686", "(none)",
     };
 
-    if (buf_va > UINT32_MAX - (I686_UTS_TOTAL - 1U)) {
-        return -EFAULT; /* struct would wrap the 32-bit guest space */
-    }
-    uint8_t *buf = (uint8_t *)i686_guest_ptr(ctx, buf_va);
+    /* Checked guest write (I686-R9-2): build locally, then copy so
+     * unmapped/PROT_NONE/read-only destinations return -EFAULT instead
+     * of host-faulting. Wrap is rejected by i686_copy_to_guest. */
+    uint8_t ubuf[I686_UTS_TOTAL];
     for (size_t i = 0U; i < I686_UTS_FIELDS; i++) {
-        uint8_t *field = buf + i * I686_UTS_FIELD;
+        uint8_t *field = ubuf + i * I686_UTS_FIELD;
         memset(field, 0, I686_UTS_FIELD);
         for (size_t j = 0U; uts_fields[i][j] != '\0' && j < I686_UTS_FIELD - 1U; j++) {
             field[j] = (uint8_t)uts_fields[i][j];
         }
     }
-    return 0;
+    return i686_copy_to_guest(ctx, buf_va, ubuf, sizeof(ubuf));
 }
 
 /*

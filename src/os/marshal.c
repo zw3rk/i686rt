@@ -146,6 +146,9 @@ static void s_copy_to_run(void)
 {
     memcpy(i686_guest_ptr(s_copy_args.ctx, s_copy_args.va),
            s_copy_args.src, s_copy_args.len);
+    /* Guest store (I686-R9-6): a write to a MAP_PRIVATE file page flips
+     * PAGE_COW_CLEAN to DIRTY so a later pwrite refresh cannot clobber it. */
+    (void)i686_vm_file_promote_cow(s_copy_args.va, s_copy_args.len);
 }
 
 static void s_copy_from_run(void)
@@ -204,6 +207,11 @@ static void s_fetch_run(void)
     for (i = 0U; i < buflen; i++) {
         uint32_t cur_va = va + (uint32_t)i;
         const char *p;
+        if (cur_va < va) {
+            /* 32-bit wrap (I686-R9-1): va=0xFFFFFFF0 must not wrap to VA 0. */
+            s_fetch_rc = -I686_EFAULT;
+            return;
+        }
         if (ctx != NULL && ctx->vm_regime == I686_VM_REGIME_A2 &&
             (i == 0U || (cur_va & 0xFFFu) == 0u) &&
             !i686_subpage_range_ok(ctx, cur_va & ~0xFFFu, 0x1000u, 0x01u)) {

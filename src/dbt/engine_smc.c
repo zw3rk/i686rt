@@ -322,6 +322,9 @@ int i686_dbt_smc_write_fault(uint64_t host_addr)
     hbase = page & ~(h - 1U);
     smc_unprotect_host(g_dbt_run_ctx, hbase, h);
     smc_drop_host(g_dbt_run_ctx, hbase, h);
+    /* SMC write commit (I686-R9-6): the re-executed store diverts this
+     * MAP_PRIVATE file page, so mark it DIRTY before returning. */
+    (void)i686_vm_file_promote_cow(page, SMC_PAGE);
     if (g_dbt_run_ctx != NULL &&
         g_dbt_run_ctx->vm_regime == I686_VM_REGIME_A2 && h > SMC_PAGE) {
         uint32_t off;

@@ -151,7 +151,7 @@ static uint32_t vm_mmap2_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len,
             return (uint32_t)(-ENOMEM);
         }
     }
-    rt32_vm_union_protect_a2(ctx, target_va, target_end);
+    rt32_vm_widen_protect_a2(ctx, target_va, target_end);
     if (staged) {
         i686_vm32_subpage_unlock();
     }
@@ -217,14 +217,16 @@ static int vm_mprotect_locked(i686_ctx_t *ctx, uint32_t addr, uint32_t len,
         return 0;
     }
 
-    if (mprotect(i686_guest_ptr(ctx, addr), (size_t)aligned_len,
-                 i686_host_prot(ctx, prot)) != 0) {
-        return -errno;
-    }
-
+    /* VMA first (I686-R9-7): on region-slot exhaustion the host page is
+     * never touched, so the VMA table and host permissions cannot diverge. */
     if (rt32_vm_mprotect_regions_locked(addr, (uint32_t)end64,
                                         prot & 0x7U) != 0) {
         return -ENOMEM;
+    }
+
+    if (mprotect(i686_guest_ptr(ctx, addr), (size_t)aligned_len,
+                 i686_host_prot(ctx, prot)) != 0) {
+        return -errno;
     }
     return 0;
 }

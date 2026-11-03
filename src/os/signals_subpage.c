@@ -750,11 +750,14 @@ static int emulate_rep_string(i686_ctx_t *ctx, const x86_insn_t *insn,
         } else {
             i686_fault_disarm();
         }
-#ifndef I686RT_NO_DBT
         if (acc->str_has_edi && (acc->str_edi_need & 0x02u) != 0u) {
+            /* Emulated store commit (I686-R9-6): divert the MAP_PRIVATE
+             * file page before a later pwrite can refresh it. */
+            (void)i686_vm_file_promote_cow(dst_va, acc->str_unit);
+#ifndef I686RT_NO_DBT
             i686_dbt_invalidate_range(ctx, dst_va, dst_va + acc->str_unit);
-        }
 #endif
+        }
         if (acc->str_has_edi) {
             (void)i686_vm32_widen_prot(ctx, d_p0, d_p1);
         }
@@ -868,16 +871,19 @@ int i686_spurious_emulate(i686_ctx_t *ctx, uint32_t ga)
             i686_fault_disarm();
         }
     }
-#ifndef I686RT_NO_DBT
     if (ir == I686_INTERP_CONTINUE) {
         for (i = 0u; i < acc.count; i++) {
             if ((acc.spans[i].need & 0x02u) != 0u) {
+                /* Emulated store commit (I686-R9-6). */
+                (void)i686_vm_file_promote_cow(acc.spans[i].va,
+                                               acc.spans[i].len);
+#ifndef I686RT_NO_DBT
                 i686_dbt_invalidate_range(ctx, acc.spans[i].va,
                                           acc.spans[i].va + acc.spans[i].len);
+#endif
             }
         }
     }
-#endif
     widen_acc_covers(ctx, &acc, hps);
     i686_vm32_subpage_unlock();
     return (ir == I686_INTERP_CONTINUE) ? 0 : -1;

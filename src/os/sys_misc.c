@@ -11,6 +11,7 @@
  */
 
 #include "sys_misc_internal.h"
+#include "rt32/rt32_vm_internal.h"
 
 /* Guest MAP_* -> host MAP_*: identical bits; x86-only hints stripped.
  * File-local for now (shared export deferred per the lane card). */
@@ -582,9 +583,42 @@ static int64_t r_old_mmap(i686_ctx_t *ctx)
 
 static int64_t r_madvise(i686_ctx_t *ctx)
 {
-    return fixup((int64_t)madvise(i686_guest_ptr(ctx, ctx->gpr[I686_REG_EBX]),
-                                  (size_t)ctx->gpr[I686_REG_ECX],
-                                  (int)ctx->gpr[I686_REG_EDX]));
+    /* Validated madvise (I686-R9-3): reject wrap/escape past the 4 GiB
+     * window, require page alignment and a fully mapped range, and drop
+     * stale translations when discarding executable pages. */
+    uint32_t addr = ctx->gpr[I686_REG_EBX];
+    uint32_t len = ctx->gpr[I686_REG_ECX];
+    int32_t behavior = (int32_t)ctx->gpr[I686_REG_EDX];
+    uint64_t end64;
+    bool mapped;
+    int64_t r;
+
+    if (len == 0U || (addr & (uint32_t)(I686_PAGE_SIZE - 1U)) != 0U) {
+        return -EINVAL;
+    }
+    end64 = (uint64_t)addr + (uint64_t)len;
+    if (end64 > 0x100000000ULL) {
+        return -EINVAL;
+    }
+    rt32_vm_lock_acquire();
+    rt32_vm_sync_from_ctx(ctx);
+    mapped = rt32_vm_check_mapped_range_locked(addr, (uint32_t)end64,
+                                              NULL, NULL, NULL, 0U);
+    rt32_vm_sync_to_ctx(ctx);
+    rt32_vm_lock_release();
+    if (!mapped) {
+        return -ENOMEM;
+    }
+    r = fixup((int64_t)madvise(i686_guest_ptr(ctx, addr), (size_t)len,
+                               (int)behavior));
+    if (r == 0 && (behavior == MADV_DONTNEED
+#ifdef MADV_REMOVE
+                   || behavior == MADV_REMOVE
+#endif
+                   )) {
+        rt32_vm_invalidate_jit(ctx, addr, (uint32_t)end64);
+    }
+    return r;
 }
 
 /* ------------------------------------------------------------------ */

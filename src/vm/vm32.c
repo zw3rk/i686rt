@@ -70,6 +70,11 @@ static struct vm32_futex_slot s_futex_slots[I686_VM32_FUTEX_SLOTS];
 static void vm32_atfork_child(void)
 {
     unsigned i;
+    /* fork_prepare locked both mutexes in the forking (surviving) thread;
+     * release them before reinitializing: destroying a locked mutex is
+     * undefined behaviour (I686-R9-9). Unlock order is inner-first. */
+    (void)pthread_mutex_unlock(&s_subpage_mtx);
+    (void)pthread_mutex_unlock(&s_futex_mtx);
     (void)pthread_mutex_destroy(&s_subpage_mtx);
     (void)pthread_mutex_destroy(&s_futex_mtx);
     (void)pthread_mutex_init(&s_subpage_mtx, NULL);
