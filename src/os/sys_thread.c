@@ -21,6 +21,7 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
 
 #include "os/syscalls_i386.h"
 #include "os/marshal.h"
@@ -31,6 +32,56 @@ void    i686_thread_registry_main(i686_ctx_t *ctx);
 i686_ctx_t *i686_thread_registry_find(uint32_t tid);
 uint32_t i686_thread_registry_tgid(void);
 uint32_t i686_thread_registry_self_tid(const i686_ctx_t *ctx);
+
+/* I686-R10-2: execve ends every sibling thread, but host threads cannot
+ * be terminated safely, so r_execve rejects while siblings (or in-flight
+ * clones) are registered.  With only the caller present the registry is
+ * pruned to the caller for the incoming image.  Registry storage lives
+ * in src/os/clone.c; the struct tag is shared for compatible access. */
+struct i686_thread_entry {
+    uint32_t tid;
+    int host_tid;
+    i686_ctx_t *ctx;
+};
+extern struct i686_thread_entry s_registry[];
+extern size_t s_registry_n;
+extern size_t s_registry_reserved;
+extern pthread_mutex_t s_registry_lock;
+extern i686_ctx_t *s_main_ctx;
+
+int i686_thread_exec_begin(i686_ctx_t *ctx);
+int i686_thread_exec_begin(i686_ctx_t *ctx)
+{
+    size_t i;
+    uint32_t tid = 0U;
+    if (ctx == NULL) {
+        return -EINVAL;
+    }
+    (void)pthread_mutex_lock(&s_registry_lock);
+    if (s_registry_reserved != 0U) {
+        (void)pthread_mutex_unlock(&s_registry_lock);
+        return -ENOSYS;
+    }
+    for (i = 0U; i < s_registry_n; i++) {
+        if (s_registry[i].ctx == ctx) {
+            tid = s_registry[i].tid;
+        } else {
+            (void)pthread_mutex_unlock(&s_registry_lock);
+            return -ENOSYS;
+        }
+    }
+    if (tid == 0U) {
+        tid = (ctx->host_tid > 0) ? (uint32_t)ctx->host_tid : 1000U;
+    }
+    s_registry_n = 0U;
+    s_main_ctx = ctx;
+    s_registry[0].tid = tid;
+    s_registry[0].host_tid = ctx->host_tid;
+    s_registry[0].ctx = ctx;
+    s_registry_n = 1U;
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    return 0;
+}
 
 /* i386 struct robust_list_head (include/uapi/linux/futex.h): a
  * robust_list (one pointer), a long futex_offset, and one pending

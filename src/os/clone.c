@@ -87,15 +87,15 @@ static void make_key(void)
  */
 #define I686_THREAD_REGISTRY_MAX 64U
 
-static struct {
+struct i686_thread_entry {
     uint32_t    tid;
     int         host_tid; /* 0 until thread_entry records it */
     i686_ctx_t *ctx;
 } s_registry[I686_THREAD_REGISTRY_MAX];
-static size_t       s_registry_n;
-static size_t       s_registry_reserved;
-static pthread_mutex_t s_registry_lock = PTHREAD_MUTEX_INITIALIZER;
-static i686_ctx_t  *s_main_ctx;
+size_t       s_registry_n;
+size_t       s_registry_reserved;
+pthread_mutex_t s_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+i686_ctx_t  *s_main_ctx;
 
 static uint32_t thread_registry_main_pid_locked(void)
 {
@@ -852,6 +852,7 @@ static void fork_child(void)
         s_main_ctx = surviving;
         surviving->host_tid = (int)getpid();
         surviving->is_thread_clone = false;
+        __atomic_store_n(&surviving->pending_signals, 0ULL, __ATOMIC_SEQ_CST);
         if (s_registry_n < I686_THREAD_REGISTRY_MAX) {
             s_registry[s_registry_n].tid = (uint32_t)surviving->host_tid;
             s_registry[s_registry_n].host_tid = surviving->host_tid;

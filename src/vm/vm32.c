@@ -113,6 +113,22 @@ void i686_vm32_fork_child(void)
     vm32_atfork_child();
 }
 
+/* I686-R10-2: the execve success path drops orphaned FUTEX_WAIT slots so
+ * the new image starts with an empty table. */
+void i686_vm32_futex_reset(void);
+void i686_vm32_futex_reset(void)
+{
+    unsigned i;
+    (void)pthread_mutex_lock(&s_futex_mtx);
+    for (i = 0u; i < I686_VM32_FUTEX_SLOTS; i++) {
+        s_futex_slots[i].in_use = 0;
+        s_futex_slots[i].gva = 0u;
+        atomic_store_explicit(&s_futex_slots[i].woken, 0u,
+                              memory_order_relaxed);
+    }
+    (void)pthread_mutex_unlock(&s_futex_mtx);
+}
+
 static void vm32_register_reader(void)
 {
     for (;;) {
@@ -356,6 +372,11 @@ long i686_vm32_futex(i686_ctx_t *ctx, uint32_t uaddr, uint32_t op,
         long rc;
         uint32_t was_woken;
         if (bitset == 0u) {
+            return -EINVAL;
+        }
+        if (timeout != NULL &&
+            (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
+             timeout->tv_nsec >= 1000000000L)) {
             return -EINVAL;
         }
         (void)pthread_mutex_lock(&s_futex_mtx);

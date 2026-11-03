@@ -648,6 +648,7 @@ oom:
 static int64_t r_execve(i686_ctx_t *ctx)
 {
     char path[4096];
+    char *path_copy;
     char **argv;
     char **envp;
     size_t argc = 0U;
@@ -656,6 +657,16 @@ static int64_t r_execve(i686_ctx_t *ctx)
     uint32_t sp = 0U;
     int fd;
     unsigned depth;
+
+    /* I686-R10-2: reject while sibling threads are registered; with only
+     * the caller present the registry is pruned to the caller. */
+    {
+        extern int i686_thread_exec_begin(i686_ctx_t *);
+        int erc = i686_thread_exec_begin(ctx);
+        if (erc != 0) {
+            return (int64_t)erc;
+        }
+    }
 
     if (i686_fetch_cstr(ctx, ctx->gpr[I686_REG_EBX], path, sizeof(path)) != 0) {
         return -EFAULT;
@@ -722,9 +733,18 @@ static int64_t r_execve(i686_ctx_t *ctx)
         free_strv(envp);
         return -ELOOP;
     }
+    /* I686-R10-1: heap-duplicate the exec path — path[] is stack-local
+     * and post-exec readers outlive this frame. */
+    path_copy = strdup(path);
+    if (path_copy == NULL) {
+        free_strv(argv);
+        free_strv(envp);
+        return -ENOMEM;
+    }
     guest_regions_teardown(ctx);
     if (rt32_elf_load(ctx, fd, path, &info) != 0) {
         (void)close(fd);
+        free(path_copy);
         free_strv(argv);
         free_strv(envp);
         return -ENOEXEC;
@@ -734,8 +754,13 @@ static int64_t r_execve(i686_ctx_t *ctx)
      * consumed — now close every CLOEXEC fd before the new program
      * starts (no host exec happens here, so nothing else does it). */
     exec_close_cloexec_fds();
+    /* I686-R10-2: the new image starts with an empty futex table. */
+    {
+        extern void i686_vm32_futex_reset(void);
+        i686_vm32_futex_reset();
+    }
 
-    ctx->exec_path = path; /* fresh auxv AT_EXECFN source */
+    ctx->exec_path = path_copy; /* heap copy: path[] dies here (R10-1) */
     if (rt32_stack_setup(ctx, &info, (int)argc, argv, envp, &sp) != 0) {
         free_strv(argv);
         free_strv(envp);
