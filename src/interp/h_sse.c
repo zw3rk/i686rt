@@ -414,7 +414,7 @@ static int h_movups(i686_ctx_t *ctx, const x86_insn_t *insn)
             sse_st(ctx, insn, buf, size);
         }
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_movaps(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -436,7 +436,7 @@ static int h_movaps(i686_ctx_t *ctx, const x86_insn_t *insn)
             sse_st(ctx, insn, buf, 16);
         }
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_movlps(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -460,7 +460,7 @@ static int h_movlps(i686_ctx_t *ctx, const x86_insn_t *insn)
         sse_get_xmm(ctx, insn->modrm_reg, src);
         sse_st(ctx, insn, src, 8);
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_movhps(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -486,7 +486,7 @@ static int h_movhps(i686_ctx_t *ctx, const x86_insn_t *insn)
         sse_get_xmm(ctx, insn->modrm_reg, src);
         sse_st(ctx, insn, src + 8, 8);
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_movq_xmm(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -535,7 +535,7 @@ static int h_movq_xmm(i686_ctx_t *ctx, const x86_insn_t *insn)
             sse_st(ctx, insn, &v, 4);
         }
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 /* ------------------------------------------------------------------ */
@@ -545,6 +545,7 @@ static int h_movq_xmm(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_arith(i686_ctx_t *ctx, const x86_insn_t *insn, fop_kind k)
 {
     uint8_t dst[16];
+    uint32_t mx_entry = sse_entry(ctx); /* N6: before any flag-setting */
 
     sse_get_xmm(ctx, insn->modrm_reg, dst);
     if (insn->pfx_rep == 1U) {
@@ -580,8 +581,12 @@ static int h_arith(i686_ctx_t *ctx, const x86_insn_t *insn, fop_kind k)
             set_lane32(dst, i, sse_f32_op(ctx, lane32(dst, i), lane32(src, i), k));
         }
     }
+    /* N6: fault on newly raised unmasked bits before the dest commit. */
+    if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     sse_set_xmm(ctx, insn->modrm_reg, dst);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_addps(i686_ctx_t *ctx, const x86_insn_t *insn) { return h_arith(ctx, insn, FOP_ADD); }
@@ -615,7 +620,7 @@ static int h_logic(i686_ctx_t *ctx, const x86_insn_t *insn, log_kind k)
     src128(ctx, insn, src);
     log_apply(dst, src, 16, k);
     sse_set_xmm(ctx, insn->modrm_reg, dst);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_andps(i686_ctx_t *ctx, const x86_insn_t *insn)  { return h_logic(ctx, insn, LOG_AND); }
@@ -644,7 +649,7 @@ static int h_plogic(i686_ctx_t *ctx, const x86_insn_t *insn, log_kind k)
         }
         mm_wr(ctx, insn->modrm_reg, d);
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_pand(i686_ctx_t *ctx, const x86_insn_t *insn)  { return h_plogic(ctx, insn, LOG_AND); }
@@ -660,6 +665,7 @@ static int h_cvtpi2ps(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t dst[16];
     uint32_t w0, w1;
+    uint32_t mx_entry = sse_entry(ctx); /* N6: before any flag-setting */
 
     sse_get_xmm(ctx, insn->modrm_reg, dst);
     if (insn->pfx_rep != 0U) {
@@ -692,12 +698,17 @@ static int h_cvtpi2ps(i686_ctx_t *ctx, const x86_insn_t *insn)
             set_lane32(dst, 1, sse_round_f64_to_f32(ctx, (double)(int32_t)w1));
         }
     }
+    /* N6: fault on newly raised unmasked bits before the dest commit. */
+    if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     sse_set_xmm(ctx, insn->modrm_reg, dst);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_cvttps2pi(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
+    uint32_t mx_entry = sse_entry(ctx); /* N6: before any flag-setting */
     if (insn->pfx_rep != 0U) {
         uint32_t r;
         if (insn->pfx_rep == 1U) {
@@ -721,8 +732,12 @@ static int h_cvttps2pi(i686_ctx_t *ctx, const x86_insn_t *insn)
             }
             r = sse_cvtt_f2i(ctx, f64_from(sse_f64_src(ctx, s)));
         }
+        /* N6: fault on newly raised unmasked bits before the dest commit. */
+        if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         ctx->gpr[insn->modrm_reg & 7U] = r;
-        return sse_done(ctx, insn);
+        return sse_done_nocheck(ctx, insn);
     }
     {
         uint64_t out = 0U;
@@ -746,14 +761,19 @@ static int h_cvttps2pi(i686_ctx_t *ctx, const x86_insn_t *insn)
             out = (uint64_t)sse_cvtt_f2i(ctx, (double)f32_from(sse_f32_src(ctx, s0))) |
                   ((uint64_t)sse_cvtt_f2i(ctx, (double)f32_from(sse_f32_src(ctx, s1))) << 32);
         }
+        /* N6: fault on newly raised unmasked bits before the dest commit. */
+        if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         mm_wr(ctx, insn->modrm_reg, out);
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_cvtps2pd(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t dst[16];
+    uint32_t mx_entry = sse_entry(ctx); /* N6: before any flag-setting */
 
     sse_get_xmm(ctx, insn->modrm_reg, dst);
     if (insn->pfx_rep == 1U) {
@@ -802,14 +822,19 @@ static int h_cvtps2pd(i686_ctx_t *ctx, const x86_insn_t *insn)
         set_lane64(dst, 0, f64_bits((double)f32_from(sse_f32_src(ctx, s0))));
         set_lane64(dst, 1, f64_bits((double)f32_from(sse_f32_src(ctx, s1))));
     }
+    /* N6: fault on newly raised unmasked bits before the dest commit. */
+    if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     sse_set_xmm(ctx, insn->modrm_reg, dst);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_cvtdq2ps(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t dst[16], src[16];
     unsigned i;
+    uint32_t mx_entry = sse_entry(ctx); /* N6: before any flag-setting */
 
     sse_get_xmm(ctx, insn->modrm_reg, dst);
     if (insn->modrm_mod == 3U) {
@@ -834,8 +859,12 @@ static int h_cvtdq2ps(i686_ctx_t *ctx, const x86_insn_t *insn)
                        sse_round_f64_to_f32(ctx, (double)(int32_t)lane32(src, i)));
         }
     }
+    /* N6: fault on newly raised unmasked bits before the dest commit. */
+    if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     sse_set_xmm(ctx, insn->modrm_reg, dst);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 void i686_interp_sse_init(void)

@@ -222,27 +222,30 @@ void i686_x87_op_fptan(i686_ctx_t *ctx)
             return;
         }
         set_c2(ctx, 0); /* R7-38: success clears a stale C2 */
-        x87_set_ext80(ctx, 0, t);
-        /* R7-31: overflow validated before TOP moves. */
+        /* N8/R7-31: overflow validated before ST(0) is modified,
+         * so an unmasked stack fault leaves ST(0) untouched. */
         if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
             return;
         }
+        x87_set_ext80(ctx, 1, t);
         x87_set_ext80(ctx, 0, one);
         return;
     }
     {
         double a = x87_get_f64(ctx, 0);
+        double t;
 
         if (fabs(a) >= 9223372036854775808.0) {
             set_c2(ctx, 1);
             return;
         }
         set_c2(ctx, 0); /* R7-38: success clears a stale C2 */
-        x87_set_f64(ctx, 0, tan(a));
-        /* R7-31: overflow validated before TOP moves. */
+        t = tan(a);
+        /* N8/R7-31: overflow validated before ST(0) is modified. */
         if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
             return;
         }
+        x87_set_f64(ctx, 1, t);
         x87_set_f64(ctx, 0, 1.0);
     }
 }

@@ -103,7 +103,7 @@ enum {
     I686_OP7_LSS      = 466, /* 0F B2 Gv,mp                             */
     I686_OP7_LFS      = 467, /* 0F B4 Gv,mp                             */
     I686_OP7_LGS      = 468, /* 0F B5 Gv,mp                             */
-    I686_OP7_PRIV     = 469, /* E4-E7/EC-EF, 0F 20-23 (16-bit code)     */
+    I686_OP7_PRIV     = 469, /* 6C-6F/E4-E7/EC-EF, 0F 20-23/30/32 (#GP) */
     I686_OP7_UNPCKLPS = 470, /* 0F 14 Vps,Wps / 66 Vpd,Wpd              */
     I686_OP7_UNPCKHPS = 471, /* 0F 15 Vps,Wps / 66 Vpd,Wpd              */
     I686_OP7_PACKUSWB = 472, /* 0F 67 Pq,Qd / 66 Vdq,Wdq                */

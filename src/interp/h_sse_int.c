@@ -68,6 +68,7 @@ static int h_cmpps(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t dst[16];
     unsigned pred = insn->imm & 7U;
+    uint32_t mx_entry = sse_entry(ctx); /* N6: before any flag-setting */
 
     sse_get_xmm(ctx, insn->modrm_reg, dst);
     if (insn->pfx_rep == 1U) {
@@ -111,8 +112,12 @@ static int h_cmpps(i686_ctx_t *ctx, const x86_insn_t *insn)
                                   ? 0xFFFFFFFFu : 0U);
         }
     }
+    /* N6: fault on newly raised unmasked bits before the dest commit. */
+    if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     sse_set_xmm(ctx, insn->modrm_reg, dst);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static void comis_flags(i686_ctx_t *ctx, unsigned kind)
@@ -133,6 +138,7 @@ static void comis_flags(i686_ctx_t *ctx, unsigned kind)
 static int h_comis(i686_ctx_t *ctx, const x86_insn_t *insn, int signaling)
 {
     int wide = (insn->pfx_66 != 0U);
+    uint32_t mx_entry = sse_entry(ctx); /* N6: before any flag-setting */
 
     if (wide) {
         uint8_t src[16];
@@ -151,12 +157,16 @@ static int h_comis(i686_ctx_t *ctx, const x86_insn_t *insn, int signaling)
             if (signaling || f64_snan(a) || f64_snan(b)) {
                 ctx->mxcsr |= MXCSR_IE;
             }
+            /* N6: fault on newly raised bits before flags commit. */
+            if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+                return I686_EXIT_FAULT;
+            }
             comis_flags(ctx, 3U);
         } else {
             double da = f64_from(a), db = f64_from(b);
             comis_flags(ctx, da < db ? 2U : (da == db ? 1U : 0U));
         }
-        return sse_done(ctx, insn);
+        return sse_done_nocheck(ctx, insn);
     }
     {
         uint8_t src[16];
@@ -175,12 +185,16 @@ static int h_comis(i686_ctx_t *ctx, const x86_insn_t *insn, int signaling)
             if (signaling || f32_snan(a) || f32_snan(b)) {
                 ctx->mxcsr |= MXCSR_IE;
             }
+            /* N6: fault on newly raised bits before flags commit. */
+            if (sse_xm_check(ctx, mx_entry) != I686_INTERP_CONTINUE) {
+                return I686_EXIT_FAULT;
+            }
             comis_flags(ctx, 3U);
         } else {
             double da = (double)f32_from(a), db = (double)f32_from(b);
             comis_flags(ctx, da < db ? 2U : (da == db ? 1U : 0U));
         }
-        return sse_done(ctx, insn);
+        return sse_done_nocheck(ctx, insn);
     }
 }
 
@@ -205,7 +219,7 @@ static int h_movmskps(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
     }
     ctx->gpr[insn->modrm_reg & 7U] = r;
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 /* PADDD / PSUBD (also MMX plain forms). */
@@ -225,7 +239,7 @@ static int h_paddd(i686_ctx_t *ctx, const x86_insn_t *insn)
         memcpy(d + 4U * i, &r, 4);
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_psubd(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -244,7 +258,7 @@ static int h_psubd(i686_ctx_t *ctx, const x86_insn_t *insn)
         memcpy(d + 4U * i, &r, 4);
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 /* PADDQ / PSUBQ: 64-bit lanes. */
@@ -264,7 +278,7 @@ static int h_pq(i686_ctx_t *ctx, const x86_insn_t *insn, int sub)
         memcpy(d + 8U * i, &r, 8);
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_paddq(i686_ctx_t *ctx, const x86_insn_t *insn) { return h_pq(ctx, insn, 0); }
@@ -287,7 +301,7 @@ static int h_pmullw(i686_ctx_t *ctx, const x86_insn_t *insn)
         d[2U * i + 1U] = (uint8_t)(r >> 8);
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 /* PMULUDQ: even 32-bit lanes -> 64-bit unsigned products. */
@@ -308,7 +322,7 @@ static int h_pmuludq(i686_ctx_t *ctx, const x86_insn_t *insn)
         memcpy(d + 8U * i, &r, 8);
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 /* PUNPCKL/H BW/WD/DQ (+LQDQ/HQDQ, 66 only) */
@@ -330,7 +344,7 @@ static int h_punpck(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned esize,
         memcpy(out + esize * (2U * j + 1U), s + base + esize * j, esize);
     }
     int_vec_dst(ctx, insn, out, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_punpcklbw(i686_ctx_t *ctx, const x86_insn_t *insn)  { return h_punpck(ctx, insn, 1, 0); }
@@ -383,7 +397,7 @@ static int h_pshufw(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
     }
     int_vec_dst(ctx, insn, out, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -411,11 +425,14 @@ static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
                 sse_st(ctx, insn, &v, 8);
             }
         }
-        return sse_done(ctx, insn);
+        return sse_done_nocheck(ctx, insn);
     }
-    /* R7-43: MOVDQA faults #GP(0) on misaligned memory operands
-     * before any side effect (the MMX MOVQ path above has none). */
-    sse_align16(ctx, insn);
+    /* R7-43/N2: only MOVDQA (66, no REP prefix) faults #GP(0) on
+     * misaligned memory operands, before any side effect (the MMX
+     * MOVQ path above has none).  MOVDQU (F3) permits misalignment. */
+    if (insn->pfx_66 != 0U && insn->pfx_rep == 0U) {
+        sse_align16(ctx, insn);
+    }
     if (load) {
         src128(ctx, insn, buf);
         sse_set_xmm(ctx, insn->modrm_reg, buf);
@@ -427,7 +444,7 @@ static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
             sse_st(ctx, insn, buf, 16);
         }
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_movq2dq(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -462,7 +479,7 @@ static int h_movq2dq(i686_ctx_t *ctx, const x86_insn_t *insn)
     } else {
         return I686_EXIT_UNDEF;
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_movntdq(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -478,7 +495,7 @@ static int h_movntdq(i686_ctx_t *ctx, const x86_insn_t *insn)
         uint64_t v = mm_rd(ctx, insn->modrm_reg);
         sse_st(ctx, insn, &v, 8);
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -543,7 +560,7 @@ static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         mm_wr(ctx, insn->modrm_rm, v);
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 typedef enum { PCMP_GT8 = 0, PCMP_EQ8, PCMP_EQ32 } pcmp_kind;
@@ -569,7 +586,7 @@ static int h_pcmp(i686_ctx_t *ctx, const x86_insn_t *insn, pcmp_kind k)
         memset(d + i, t ? 0xFF : 0x00, esz);
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_pcmp_gt8(i686_ctx_t *ctx, const x86_insn_t *insn)  { return h_pcmp(ctx, insn, PCMP_GT8); }
@@ -598,7 +615,7 @@ static int h_pmovmskb(i686_ctx_t *ctx, const x86_insn_t *insn)
         r |= (uint32_t)(src[i] >> 7) << i;
     }
     ctx->gpr[insn->modrm_reg & 7U] = r;
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_pminmaxub(i686_ctx_t *ctx, const x86_insn_t *insn, int is_max)
@@ -613,7 +630,7 @@ static int h_pminmaxub(i686_ctx_t *ctx, const x86_insn_t *insn, int is_max)
         d[i] = (is_max ? (d[i] > s[i]) : (d[i] < s[i])) ? d[i] : s[i];
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_pminub(i686_ctx_t *ctx, const x86_insn_t *insn) { return h_pminmaxub(ctx, insn, 0); }
@@ -631,7 +648,7 @@ static int h_psubb(i686_ctx_t *ctx, const x86_insn_t *insn)
         d[i] = (uint8_t)(d[i] - s[i]);
     }
     int_vec_dst(ctx, insn, d, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_prefetch(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -639,7 +656,7 @@ static int h_prefetch(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->pfx_66 != 0U || insn->pfx_rep != 0U) {
         return I686_EXIT_UNDEF;
     }
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_sfence(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -648,7 +665,7 @@ static int h_sfence(i686_ctx_t *ctx, const x86_insn_t *insn)
         return I686_EXIT_UNDEF;
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_ldmxcsr(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -706,7 +723,7 @@ static int h_unpckps(i686_ctx_t *ctx, const x86_insn_t *insn, int hi)
         memcpy(out + 12, s + off + 4, 4);
     }
     sse_set_xmm(ctx, insn->modrm_reg, out);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_unpcklps(i686_ctx_t *ctx, const x86_insn_t *insn) { return h_unpckps(ctx, insn, 0); }
@@ -732,7 +749,7 @@ static int h_packuswb(i686_ctx_t *ctx, const x86_insn_t *insn)
         out[half + i] = (w1 < 0) ? 0U : ((w1 > 255) ? 255U : (uint8_t)w1);
     }
     int_vec_dst(ctx, insn, out, xmm);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_shufps(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -755,7 +772,7 @@ static int h_shufps(i686_ctx_t *ctx, const x86_insn_t *insn)
         memcpy(out + 12, s + 4U * ((imm >> 6) & 3U), 4);
     }
     sse_set_xmm(ctx, insn->modrm_reg, out);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 void i686_interp_sse_int_init(void)

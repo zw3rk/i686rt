@@ -218,9 +218,11 @@ cannot_handle:
 /* ------------------------------------------------------------------ */
 
 /* 16-bit ModRM EA: returns 0 with (seg, off) filled, -1 for mod == 3
- * (register form: caller decodes the reg fields), or a positive
- * VM86_* fault code (callers must propagate it, not treat it as the
- * register form).  seg_default: SS for the bp-based forms ([bp+si],
+ * (register form: caller decodes the reg fields), MODRM_EA_FAULT for a
+ * 0x67 address-size override on a memory operand (callers map it to
+ * v86_fault_sigill, never to success), or a positive VM86_* fault
+ * code (callers must propagate it, not treat it as the register
+ * form).  seg_default: SS for the bp-based forms ([bp+si],
  * [bp+di], [bp+disp]), DS otherwise ([disp16] included).  A 0x67
  * address-size prefix makes any memory operand fault like an unknown
  * opcode (register forms stay legal). */
@@ -243,9 +245,12 @@ static long modrm_ea(i686_ctx_t *ctx, i686_v86state_t *vs, uint16_t ov_seg,
         return -1;
     }
     if (addr32 != 0) {
-        /* R7-53: 32-bit addressing is not implemented for the
-         * executed subset: fault before consuming displacement. */
-        return v86_fault_sigill(ctx);
+        /* N10/R7-53: 32-bit addressing is not implemented for the
+         * executed subset: fail before consuming displacement with
+         * a status distinct from memory-success 0 (which aliases
+         * I686_VM86_SIGNAL); the caller records SIGILL and
+         * returns I686_VM86_SIGNAL. */
+        return MODRM_EA_FAULT;
     }
     if (mod == 0U && rm == 6U) {
         /* [disp16]: direct 16-bit displacement, NO base register. */
@@ -428,8 +433,11 @@ static long v86_step(i686_ctx_t *ctx, i686_v86state_t *vs, i686_vm86_enter_t *ks
         uint16_t seg, off;
         long ea_rc =
             modrm_ea(ctx, vs, ov_seg, has_ov, (int)addr32, modrm, &seg, &off);
+        if (ea_rc == MODRM_EA_FAULT) {
+            return v86_fault_sigill(ctx); /* N10: 0x67 -> SIGILL + SIGNAL */
+        }
         if (ea_rc > 0) {
-            return ea_rc; /* R7-53: 0x67-addressed memory fault */
+            return ea_rc;
         }
         if (ea_rc != 0) {
             /* register form: 0x88 rm<-reg, 0x8a reg<-rm */
@@ -454,8 +462,11 @@ static long v86_step(i686_ctx_t *ctx, i686_v86state_t *vs, i686_vm86_enter_t *ks
         uint16_t seg, off;
         long ea_rc =
             modrm_ea(ctx, vs, ov_seg, has_ov, (int)addr32, modrm, &seg, &off);
+        if (ea_rc == MODRM_EA_FAULT) {
+            return v86_fault_sigill(ctx); /* N10: 0x67 -> SIGILL + SIGNAL */
+        }
         if (ea_rc > 0) {
-            return ea_rc; /* R7-53: 0x67-addressed memory fault */
+            return ea_rc;
         }
         if (ea_rc != 0) {
             /* register form: 0x89 rm<-reg, 0x8b reg<-rm */
@@ -490,8 +501,11 @@ static long v86_step(i686_ctx_t *ctx, i686_v86state_t *vs, i686_vm86_enter_t *ks
         uint16_t seg, off;
         long ea_rc =
             modrm_ea(ctx, vs, ov_seg, has_ov, (int)addr32, modrm, &seg, &off);
+        if (ea_rc == MODRM_EA_FAULT) {
+            return v86_fault_sigill(ctx); /* N10: 0x67 -> SIGILL + SIGNAL */
+        }
         if (ea_rc > 0) {
-            return ea_rc; /* R7-53: 0x67-addressed memory fault */
+            return ea_rc;
         }
         if (op == 0xc6U) {
             uint8_t imm = fetch8(ctx, vs);

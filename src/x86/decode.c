@@ -495,6 +495,12 @@ static int far_op_decode(i686_ctx_t *ctx, uint8_t b1, uint8_t b2,
     case 0x0F21u:
     case 0x0F22u:
     case 0x0F23u:
+    case 0x0F30u: /* WRMSR */
+    case 0x0F32u: /* RDMSR */
+    case 0x6Cu: /* INS/OUTS (no operands beyond the string regs) */
+    case 0x6Du:
+    case 0x6Eu:
+    case 0x6Fu:
     case 0xE4u: /* IN/OUT imm8 and DX forms */
     case 0xE5u:
     case 0xE6u:
@@ -503,15 +509,15 @@ static int far_op_decode(i686_ctx_t *ctx, uint8_t b1, uint8_t b2,
     case 0xEDu:
     case 0xEEu:
     case 0xEFu:
-        if (eff_default16(ctx) == 0u) {
-            return -1; /* flat code keeps its v1 UNDEF behaviour */
-        }
+        /* R7-23: CPL=3 (IOPL=0), so these fault #GP(0) in flat
+         * 32-bit code too (not #UD); 16-bit/LDT code keeps its
+         * E09 gap-6 behaviour through the same handler. */
         out->op = I686_OP7_PRIV;
         if (key >= 0x0F20u && key <= 0x0F23u) {
             if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
                 return -1;
             }
-        } else if (key <= 0xE7u) {
+        } else if (key >= 0xE4u && key <= 0xE7u) {
             if (!code_ok(*pc, eip, 1u)) {
                 return -1;
             }

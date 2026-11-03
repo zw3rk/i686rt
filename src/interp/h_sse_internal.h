@@ -123,21 +123,34 @@ static inline int sse_done_nocheck(i686_ctx_t *ctx,
     return I686_INTERP_CONTINUE;
 }
 
-static inline int sse_done(i686_ctx_t *ctx, const x86_insn_t *insn)
+/* N6: per-instruction MXCSR entry snapshot (status bits 0..5).
+ * Every raising handler snapshots this FIRST, before any fetch or
+ * compute that may set status bits (sse_f32_src/sse_f64_src set DE,
+ * arithmetic/convert helpers set IE/ZE/OE/UE/PE). */
+static inline uint32_t sse_entry(const i686_ctx_t *ctx)
 {
-    /* R7-30: an unmasked SIMD exception faults (#XM, EIP stays at
-     * the insn) instead of completing silently.  MXCSR masks ride
-     * bits 7..12, status bits 0..5.  Pending-style: any computing
-     * handler that left unmasked status faults here, so a guest
-     * must clear/mask to make progress. */
-    if ((ctx->mxcsr & ~(ctx->mxcsr >> 7) & 0x3fU) != 0U) {
+    return ctx->mxcsr & 0x3fU;
+}
+
+/* N6: #XM check for bits newly raised by the current instruction.
+ * Only status bits set since mx_entry that are unmasked (mask bits
+ * 7..12) fault (#XM, EIP stays at the insn); pre-existing sticky
+ * bits (e.g. unmasked by an earlier LDMXCSR) never fault on their
+ * own, so a fault-free MOVAPS after such a restore completes.
+ * Call BEFORE committing the destination register/memory, so a
+ * faulting instruction leaves its destination untouched. */
+static inline int sse_xm_check(i686_ctx_t *ctx, uint32_t mx_entry)
+{
+    uint32_t raised = (ctx->mxcsr & 0x3fU) & ~mx_entry;
+
+    if ((raised & ~(ctx->mxcsr >> 7) & 0x3fU) != 0U) {
         extern void i686_fault_sig_record(int sig);
 
         ctx->exit_arg = 19U; /* #XM trapno */
         i686_fault_sig_record(8); /* SIGFPE */
         return I686_EXIT_FAULT;
     }
-    return sse_done_nocheck(ctx, insn);
+    return I686_INTERP_CONTINUE;
 }
 
 /* R7-4: default segment from the decoded base register (matches

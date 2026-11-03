@@ -43,7 +43,7 @@ static int h_fld_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
         return done(ctx, insn);
     }
     /* R7-31: overflow faults with TOP unchanged. */
-    if (push_f32(ctx, ld_f32(ctx, x86_ea_compute(ctx, insn))) !=
+    if (push_f32(ctx, ld_f32(ctx, x87_ea_checked(ctx, insn, 4u, 0u))) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT;
     }
@@ -91,7 +91,7 @@ static int h_fst_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_f32(ctx, x86_ea_compute(ctx, insn)) !=
+    if (st_f32(ctx, x87_ea_checked(ctx, insn, 4u, 1u)) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -109,7 +109,7 @@ static int h_fstp_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_f32(ctx, x86_ea_compute(ctx, insn)) !=
+    if (st_f32(ctx, x87_ea_checked(ctx, insn, 4u, 1u)) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -144,7 +144,8 @@ static int h_fldenv(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return done(ctx, insn);
     }
-    i686_x87_op_fldenv(ctx, x86_ea_compute(ctx, insn),
+    i686_x87_op_fldenv(ctx, x87_ea_checked(ctx, insn,
+                       (insn->pfx_opsize != 0U) ? 14u : 28u, 0u),
                        insn->pfx_opsize != 0U);
     return done(ctx, insn);
 }
@@ -163,7 +164,7 @@ static int h_fldcw(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return done(ctx, insn);
     }
-    ctx->fctrl = (uint16_t)mem_rd(ctx, x86_ea_compute(ctx, insn), 2);
+    ctx->fctrl = (uint16_t)mem_rd(ctx, x87_ea_checked(ctx, insn, 2u, 0u), 2);
     return done(ctx, insn);
 }
 
@@ -211,7 +212,8 @@ static int h_fnstenv(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return done(ctx, insn);
     }
-    i686_x87_op_fnstenv(ctx, x86_ea_compute(ctx, insn),
+    i686_x87_op_fnstenv(ctx, x87_ea_checked(ctx, insn,
+                        (insn->pfx_opsize != 0U) ? 14u : 28u, 1u),
                         insn->pfx_opsize != 0U);
     return done(ctx, insn);
 }
@@ -258,7 +260,7 @@ static int h_fnstcw(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return done(ctx, insn);
     }
-    mem_wr(ctx, x86_ea_compute(ctx, insn), 2, ctx->fctrl);
+    mem_wr(ctx, x87_ea_checked(ctx, insn, 2u, 1u), 2, ctx->fctrl);
     return done(ctx, insn);
 }
 
@@ -272,7 +274,7 @@ static int h_fld_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
         return done(ctx, insn);
     }
     /* R7-31: overflow faults with TOP unchanged. */
-    if (push_f64(ctx, ld_f64(ctx, x86_ea_compute(ctx, insn))) !=
+    if (push_f64(ctx, ld_f64(ctx, x87_ea_checked(ctx, insn, 8u, 0u))) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT;
     }
@@ -303,7 +305,7 @@ static int h_fst_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_f64(ctx, x86_ea_compute(ctx, insn)) !=
+    if (st_f64(ctx, x87_ea_checked(ctx, insn, 8u, 1u)) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -335,7 +337,7 @@ static int h_fstp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_f64(ctx, x86_ea_compute(ctx, insn)) !=
+    if (st_f64(ctx, x87_ea_checked(ctx, insn, 8u, 1u)) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -349,7 +351,7 @@ static int h_fucom(i686_ctx_t *ctx, const x86_insn_t *insn)
     int un;
 
     if (insn->modrm_mod != 3U) {
-        i686_x87_op_frstor(ctx, x86_ea_compute(ctx, insn),
+        i686_x87_op_frstor(ctx, x87_ea_checked(ctx, insn, 108u, 0u),
                            insn->pfx_opsize != 0U);
         return done(ctx, insn);
     }
@@ -412,7 +414,7 @@ static int h_fnsave(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    i686_x87_op_fnsave(ctx, x86_ea_compute(ctx, insn),
+    i686_x87_op_fnsave(ctx, x87_ea_checked(ctx, insn, 108u, 1u),
                        insn->pfx_opsize != 0U);
     return done(ctx, insn);
 }
@@ -423,7 +425,7 @@ static int h_fnstsw_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    mem_wr(ctx, x86_ea_compute(ctx, insn), 2, ctx->fstat);
+    mem_wr(ctx, x87_ea_checked(ctx, insn, 2u, 1u), 2, ctx->fstat);
     return done(ctx, insn);
 }
 
@@ -441,7 +443,7 @@ static int h_fxsave(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    va = x86_ea_compute(ctx, insn);
+    va = x87_ea_checked(ctx, insn, 512u, 1u);
     /* R7-43: FXSAVE faults #GP(0) on misaligned operands before
      * any state side effect. */
     i686_seg_check_align(ctx, va, 16u);
@@ -455,7 +457,7 @@ static int h_fxrstor(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    va = x86_ea_compute(ctx, insn);
+    va = x87_ea_checked(ctx, insn, 512u, 0u);
     /* R7-43: FXRSTOR faults #GP(0) on misaligned operands before
      * any state side effect. */
     i686_seg_check_align(ctx, va, 16u);
@@ -472,6 +474,31 @@ static int h_fxrstor(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     i686_x87_op_fxrstor(ctx, va);
     return done(ctx, insn);
+}
+
+/* N3: no-wait control/save forms (FNINIT/FNSTSW/FNSTCW/FNSTENV/
+ * FNSAVE/FXSAVE/FXRSTOR) never observe a pending unmasked x87
+ * exception (SDM: those stores/saves execute despite ES).  Without
+ * this a SIGFPE handler running FNCLEX re-faults forever.
+ * D9 /6 and /7 share their op id with waiting register forms
+ * (F2XM1..FINCSTP, FPREM..FCOS), so only the memory form is no-wait;
+ * FRSTOR keeps the waiting check. */
+int i686_x87_is_nowait(const x86_insn_t *insn)
+{
+    switch (insn->op) {
+    case I686_OP_FNINIT:      /* FNCLEX + FNINIT (DB E2/E3) */
+    case I686_OP_FNSTSW_AX:   /* DF E0 */
+    case I686_OP_FNSTSW_m16:  /* DD /7 mem */
+    case I686_OP_FNSAVE:      /* DD /6 mem */
+    case I686_OP_FXSAVE:      /* 0F AE /0 mem */
+    case I686_OP_FXRSTOR:     /* 0F AE /1 mem */
+        return 1;
+    case I686_OP_FNSTENV:     /* D9 /6 mem only; reg = F2XM1..FINCSTP */
+    case I686_OP_FNSTCW:      /* D9 /7 mem only; reg = FPREM..FCOS */
+        return insn->modrm_mod != 3U;
+    default:
+        return 0;
+    }
 }
 
 /* ------------------------------------------------------------------ */

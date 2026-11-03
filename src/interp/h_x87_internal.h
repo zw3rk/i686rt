@@ -142,6 +142,10 @@ static inline int x87_es_fault(i686_ctx_t *ctx)
  * fp_reg so every FP/WAIT opcode carries the mark. */
 void i686_interp_mark_fp(uint16_t op);
 
+/* N3: no-wait control/save forms (defined in h_x87.c) that execute
+ * despite a pending unmasked x87 exception. */
+int i686_x87_is_nowait(const x86_insn_t *insn);
+
 static inline void fp_reg(uint16_t op, i686_interp_fn fn)
 {
     i686_interp_register(op, fn);
@@ -209,6 +213,25 @@ static inline double ld_f64(i686_ctx_t *ctx, uint32_t va)
 
     memcpy(&d, &b, 8);
     return d;
+}
+
+/* R7-9: x87 memory operands honor segment limits like every other
+ * access.  Computes the linear address and runs the LDT limit/type
+ * and null-selector checks for the access width and direction (the
+ * segment is the insn's override-aware segment, as in x86_rm_read).
+ * Callers pass the full image width (FLDENV 14/28, FNSAVE 108,
+ * FXSAVE 512). */
+static inline uint32_t x87_ea_checked(i686_ctx_t *ctx, const x86_insn_t *insn,
+                                      unsigned bytes, unsigned write)
+{
+    extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg,
+                                    uint32_t linear, unsigned bytes,
+                                    unsigned write);
+    extern uint8_t x86_ea_seg(const x86_insn_t *insn);
+    uint32_t va = x86_ea_compute(ctx, insn);
+
+    i686_seg_check_data(ctx, x86_ea_seg(insn), va, bytes, write);
+    return va;
 }
 
 /* ------------------------------------------------------------------ */
@@ -396,11 +419,12 @@ static inline double d_div(i686_ctx_t *ctx, double a, double b)
     double s = a / b;
     double err;
 
-    if (b == 0.0 && !isnan(a)) {
-        /* R7-44: 0/0 and Inf/0 are invalid (indefinite QNaN),
-         * not zero-divide; only a finite nonzero dividend
-         * divides by zero to signed infinity. */
-        if (a == 0.0 || isinf(a)) {
+    /* N4: only a finite nonzero dividend over zero is zero-divide
+     * (signed infinity + ZE).  0/0 is invalid (indefinite QNaN + IE);
+     * Inf/Inf falls through to the quiet-NaN path below (IE via
+     * d_exc); ±Inf/0 is exact signed infinity with NO flags. */
+    if (b == 0.0 && !isnan(a) && !isinf(a)) {
+        if (a == 0.0) {
             x87_set_exc(ctx, SW_IE);
             return (double)NAN;
         }

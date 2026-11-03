@@ -533,13 +533,19 @@ static int h_enter(i686_ctx_t *ctx, const x86_insn_t *insn)
     frame = esp;
     for (uint32_t i = 1U; i < level; i++) {
         uint32_t disp;
-        if (w == 16U) {
+        uint32_t fea;
+        /* R7-12: the display walk uses the STACK size for the frame
+         * register (BP with 16-bit wrap on a 16-bit stack, full EBP
+         * otherwise) and the OPERAND size for the step.  SDM ENTER:
+         * op32/stack16 does BP -= 4, op16/stack32 does EBP -= 2. */
+        if (ctx->ss_b == 0u) {
             ebp = (ebp & 0xFFFF0000u) | ((ebp - bytes) & 0xFFFFu);
         } else {
             ebp -= bytes;
         }
-        i686_seg_check_data(ctx, I686_SEG_SS, ss + ebp, bytes, 0u);
-        disp = mem_read(ctx, ss + ebp, bytes);
+        fea = (ctx->ss_b == 0u) ? (ebp & 0xFFFFu) : ebp;
+        i686_seg_check_data(ctx, I686_SEG_SS, ss + fea, bytes, 0u);
+        disp = mem_read(ctx, ss + fea, bytes);
         esp = (esp - bytes) & mask;
         i686_seg_check_data(ctx, I686_SEG_SS, ss + esp, bytes, 1u);
         mem_write(ctx, ss + esp, bytes, disp);

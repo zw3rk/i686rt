@@ -7,7 +7,8 @@
 
 #include "interp/h_x87_internal.h"
 
-static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop);
+static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop,
+                    int ucom);
 
 /* ------------------------------------------------------------------ */
 /* D8 / DC / DE arithmetic + compare                                   */
@@ -50,7 +51,7 @@ static int arith_d8dc(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind,
                 b = x87_get_f64(ctx, 0);
             }
         } else {
-            uint32_t va = x86_ea_compute(ctx, insn);
+            uint32_t va = x87_ea_checked(ctx, insn, mbytes, 0u);
             a = x87_get_f64(ctx, 0);
             b = (mbytes == 4) ? (double)ld_f32(ctx, va) : ld_f64(ctx, va);
         }
@@ -75,7 +76,7 @@ static int arith_d8dc(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind,
                 x87_get_ext80(ctx, 0, sb);
             }
         } else {
-            uint32_t va = x86_ea_compute(ctx, insn);
+            uint32_t va = x87_ea_checked(ctx, insn, mbytes, 0u);
             x87_get_ext80(ctx, 0, sa);
             if (mbytes == 4) {
                 x87_80_from_f32(sb, ld_f32(ctx, va));
@@ -149,7 +150,7 @@ static int do_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mbytes,
         if (insn->modrm_mod == 3U) {
             b = x87_get_f64(ctx, insn->modrm_rm);
         } else {
-            uint32_t va = x86_ea_compute(ctx, insn);
+            uint32_t va = x87_ea_checked(ctx, insn, mbytes, 0u);
             b = (mbytes == 4) ? (double)ld_f32(ctx, va) : ld_f64(ctx, va);
         }
         un = cc_of_cmp(a, b, ctx);
@@ -168,7 +169,7 @@ static int do_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mbytes,
         if (insn->modrm_mod == 3U) {
             x87_get_ext80(ctx, insn->modrm_rm, sb);
         } else {
-            uint32_t va = x86_ea_compute(ctx, insn);
+            uint32_t va = x87_ea_checked(ctx, insn, mbytes, 0u);
             if (mbytes == 4) {
                 x87_80_from_f32(sb, ld_f32(ctx, va));
             } else {
@@ -417,7 +418,7 @@ static int h_fild_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    v = (uint32_t)mem_rd(ctx, x86_ea_compute(ctx, insn), 4);
+    v = (uint32_t)mem_rd(ctx, x87_ea_checked(ctx, insn, 4u, 0u), 4);
     push_int(ctx, (int64_t)(int32_t)v);
     /* R7-31: overflow with unmasked IE faults (EIP stays). */
     if (x87_es_fault(ctx) != I686_INTERP_CONTINUE) {
@@ -435,7 +436,7 @@ static int h_fist_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_int(ctx, x86_ea_compute(ctx, insn), 4) !=
+    if (st_int(ctx, x87_ea_checked(ctx, insn, 4u, 1u), 4) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -461,7 +462,7 @@ static int h_fisttp_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_int_trunc(ctx, x86_ea_compute(ctx, insn), 4) !=
+    if (st_int_trunc(ctx, x87_ea_checked(ctx, insn, 4u, 1u), 4) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -478,7 +479,7 @@ static int h_fisttp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_int_trunc(ctx, x86_ea_compute(ctx, insn), 8) !=
+    if (st_int_trunc(ctx, x87_ea_checked(ctx, insn, 8u, 1u), 8) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -495,7 +496,7 @@ static int h_fisttp_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_int_trunc(ctx, x86_ea_compute(ctx, insn), 2) !=
+    if (st_int_trunc(ctx, x87_ea_checked(ctx, insn, 2u, 1u), 2) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -528,10 +529,10 @@ static int h_fninit(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_fld_m80(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     if (insn->modrm_mod == 3U) {
-        return do_fcomi(ctx, insn, 0);
+        return do_fcomi(ctx, insn, 0, 1); /* DB E8+i: FUCOMI (unordered) */
     }
     {
-        uint32_t va = x86_ea_compute(ctx, insn);
+        uint32_t va = x87_ea_checked(ctx, insn, 10u, 0u);
         uint8_t b[10];
 
         for (unsigned i = 0; i < 10; i++) {
@@ -551,7 +552,7 @@ static int h_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod != 3U) {
         return undef_form(ctx, insn);
     }
-    return do_fcomi(ctx, insn, 0);
+    return do_fcomi(ctx, insn, 0, 0); /* DB F0+i: FCOMI (ordered) */
 }
 
 static int h_fstp_m80(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -563,7 +564,7 @@ static int h_fstp_m80(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    st_m80(ctx, x86_ea_compute(ctx, insn));
+    st_m80(ctx, x87_ea_checked(ctx, insn, 10u, 1u));
     x87_pop(ctx);
     return done(ctx, insn);
 }
@@ -575,7 +576,7 @@ static int h_fild_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    v = (uint32_t)mem_rd(ctx, x86_ea_compute(ctx, insn), 2);
+    v = (uint32_t)mem_rd(ctx, x87_ea_checked(ctx, insn, 2u, 0u), 2);
     push_int(ctx, (int64_t)(int16_t)v);
     /* R7-31: overflow with unmasked IE faults (EIP stays). */
     if (x87_es_fault(ctx) != I686_INTERP_CONTINUE) {
@@ -593,7 +594,7 @@ static int h_fist_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_int(ctx, x86_ea_compute(ctx, insn), 2) !=
+    if (st_int(ctx, x87_ea_checked(ctx, insn, 2u, 1u), 2) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -622,10 +623,10 @@ static int h_fnstsw_ax(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_fild_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     if (insn->modrm_mod == 3U) {
-        return do_fcomi(ctx, insn, 1);
+        return do_fcomi(ctx, insn, 1, 1); /* DF E8+i: FUCOMIP (unordered) */
     }
     {
-        uint64_t v = mem_rd(ctx, x86_ea_compute(ctx, insn), 8);
+        uint64_t v = mem_rd(ctx, x87_ea_checked(ctx, insn, 8u, 0u), 8);
         int64_t s;
 
         memcpy(&s, &v, 8);
@@ -643,7 +644,7 @@ static int h_fcomip(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod != 3U) {
         return undef_form(ctx, insn);
     }
-    return do_fcomi(ctx, insn, 1);
+    return do_fcomi(ctx, insn, 1, 0); /* DF F0+i: FCOMIP (ordered) */
 }
 
 static int h_fistp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -655,7 +656,7 @@ static int h_fistp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (x87_src(ctx, 0)) {
         return I686_EXIT_FAULT;
     }
-    if (st_int(ctx, x86_ea_compute(ctx, insn), 8) !=
+    if (st_int(ctx, x87_ea_checked(ctx, insn, 8u, 1u), 8) !=
         I686_INTERP_CONTINUE) {
         return I686_EXIT_FAULT; /* R7-30: store inhibited */
     }
@@ -663,7 +664,8 @@ static int h_fistp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
     return done(ctx, insn);
 }
 
-static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
+static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop,
+                    int ucom)
 {
     unsigned un;
     unsigned lt;
@@ -681,10 +683,11 @@ static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
         un = (isnan(a) || isnan(b)) ? 1U : 0U;
         lt = !un && a < b ? 1U : 0U;
         eq = !un && a == b ? 1U : 0U;
-        /* R7-36: FUCOMI signals only on signaling NaNs (a quiet
-         * unordered result sets flags without IE).  R7-30: an
-         * unmasked raise inhibits the pop below. */
-        if (exc_ie_cmp(ctx, a, b, (int)un, true) !=
+        /* N5: ordered FCOMI/FCOMIP (ucom == 0) signal IE on any NaN
+         * (quiet included); unordered FUCOMI/FUCOMIP (ucom != 0)
+         * signal only on SNaNs (a quiet unordered result sets flags
+         * without IE).  R7-30: an unmasked raise inhibits the pop. */
+        if (exc_ie_cmp(ctx, a, b, (int)un, ucom != 0) !=
             I686_INTERP_CONTINUE) {
             return I686_EXIT_FAULT;
         }
@@ -694,15 +697,19 @@ static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
         unsigned c0 = 0;
         unsigned c2 = 0;
         unsigned c3 = 0;
+        int nan_ie;
 
         x87_get_ext80(ctx, 0, sa);
         x87_get_ext80(ctx, insn->modrm_rm, sb);
-        x87_80_fcom(sa, sb, true, &c3, &c2, &c0);
+        x87_80_fcom(sa, sb, ucom != 0, &c3, &c2, &c0);
         un = (c0 && c2 && c3) ? 1U : 0U;
         lt = !un && c0 ? 1U : 0U;
         eq = !un && c3 ? 1U : 0U;
-        /* R7-36/R7-30: as above, via the saved operand images. */
-        if (un && (x87_80_is_snan(sa) || x87_80_is_snan(sb)) &&
+        /* N5/R7-30: ordered signals on any NaN, unordered only on
+         * SNaN, via the saved operand images. */
+        nan_ie = (ucom != 0) ? (x87_80_is_snan(sa) || x87_80_is_snan(sb))
+                              : (x87_80_is_nan(sa) || x87_80_is_nan(sb));
+        if (un && nan_ie &&
             x87_exc_raise(ctx, SW_IE) != I686_INTERP_CONTINUE) {
             return I686_EXIT_FAULT;
         }

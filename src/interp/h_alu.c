@@ -714,6 +714,12 @@ static void cmpxchg_probe_write(i686_ctx_t *ctx, const x86_insn_t *insn,
 {
     uint32_t ea = x86_ea_compute(ctx, insn);
 
+    /* R7-17: the mismatch path skips the host store when the page is
+     * already writable, but the architectural write cycle still needs
+     * its segment write check (LDT limit/type, null selector): run
+     * it unconditionally, then store back only when the host page
+     * cannot take it. */
+    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, width / 8U, 1u);
     if (!i686_span_mapped_writable(ctx, ea, width / 8U)) {
         x86_rm_write(ctx, insn, width, rmv);
     }

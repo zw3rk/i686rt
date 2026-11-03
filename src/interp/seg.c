@@ -324,9 +324,16 @@ bool i686_seg_dbt_eligible(const i686_ctx_t *ctx)
         if ((sel & 0x4u) != 0u) {
             return false; /* LDT-limited: interpreter enforces limits */
         }
-        /* R7-8: null uses fault and invalid selectors fail their next
-         * use in the interpreter; emitted code checks neither. */
+        /* N1: a null FS/GS is the normal Linux i386 state (FS == 0
+         * until set_thread_area installs TLS); its uses fault in the
+         * interpreter and emitted FS/GS uses carry the same checks,
+         * so null FS/GS stay DBT-eligible.  Any other null selector
+         * (R7-8) or invalid selector fails the next use in the
+         * interpreter, which emitted code does not check. */
         if (is_null_sel(sel)) {
+            if (regs[i] == I686_SEG_FS || regs[i] == I686_SEG_GS) {
+                continue;
+            }
             return false;
         }
         if (i686_seg_lookup(ctx, sel, &d) != SEG_F_OK) {
@@ -384,7 +391,26 @@ void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
         return;
     }
     if ((sel & 0x4u) == 0u) {
-        return; /* GDT/flat: v1-compatible, never limit-checked (D8) */
+        uint32_t idx = (uint32_t)sel >> 3;
+        /* R7-9: the flat GDT aliases (idx 4/5 and any other nonzero
+         * non-TLS index) stay unchecked for v1 compatibility (D8),
+         * but a TLS slot (GDT 6/7/8) with an installed set_thread_area
+         * descriptor enforces that descriptor's type and limits. */
+        if (idx < (uint32_t)I686_GDT_TLS_FIRST ||
+            idx >= (uint32_t)(I686_GDT_TLS_FIRST + I686_GDT_TLS_SLOTS)) {
+            return;
+        }
+        {
+            uint32_t slot = idx - (uint32_t)I686_GDT_TLS_FIRST;
+            const i686_desc_t *ts =
+                (const i686_desc_t *)(const void *)ctx->tls_desc[slot];
+
+            if ((ts->flags & I686_DESC_PRESENT) == 0u) {
+                return; /* bare-base fallback: flat, nothing to enforce */
+            }
+            d = *ts;
+            goto checked;
+        }
     }
     {
         int f = i686_seg_lookup(ctx, sel, &d);
@@ -397,6 +423,7 @@ void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
             return;
         }
     }
+checked:
     /* R7-9: writes need a writable data segment; code segments (even
      * readable ones loaded into data regs) never accept writes. */
     if (write != 0u) {

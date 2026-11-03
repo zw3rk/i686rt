@@ -180,9 +180,10 @@ static int h_seg_pop_sreg(i686_ctx_t *ctx, const x86_insn_t *insn, uint8_t seg)
     uint32_t linear = ctx->seg_base[I686_SEG_SS] + sp;
     uint16_t sel;
     uint32_t next = sp + bytes;
+    uint32_t old_b = ctx->ss_b; /* N9: increment runs at the old width */
     int f;
 
-    if (ctx->ss_b == 0u) {
+    if (old_b == 0u) {
         next &= 0xFFFFu;
     }
     i686_seg_check_data(ctx, I686_SEG_SS, linear, bytes, 0u);
@@ -191,7 +192,18 @@ static int h_seg_pop_sreg(i686_ctx_t *ctx, const x86_insn_t *insn, uint8_t seg)
     if (f != SEG_F_OK) {
         return seg_fault(ctx, f, sel);
     }
-    stack_set_sp(ctx, next);
+    if (seg == I686_SEG_SS) {
+        /* N9: POP SS installs a new SS.B, but the ESP commit for
+         * this pop still uses the OLD stack address size. */
+        if (old_b != 0u) {
+            ctx->gpr[I686_REG_ESP] = next;
+        } else {
+            ctx->gpr[I686_REG_ESP] =
+                (ctx->gpr[I686_REG_ESP] & 0xFFFF0000u) | (next & 0xFFFFu);
+        }
+    } else {
+        stack_set_sp(ctx, next);
+    }
     ctx->eip += (uint32_t)insn->len;
     return I686_INTERP_CONTINUE;
 }
@@ -476,8 +488,9 @@ static int h_seg_hlt(i686_ctx_t *ctx, const x86_insn_t *insn)
     return seg_fault(ctx, SEG_F_GP, 0);
 }
 
-/* Synthetic privileged set (IN/OUT imm8/DX, MOV CR/DR): only synthesized
- * by decode.c in 16-bit (cs_d == 0) code; resumable #GP(0), E09 gap 6. */
+/* Synthetic privileged set (IN/OUT/INS/OUTS, MOV CR/DR, RDMSR/WRMSR):
+ * R7-23: decode.c synthesizes it in any mode (CPL=3, IOPL=0), so flat
+ * 32-bit code faults resumable #GP(0) instead of #UD; E09 gap 6. */
 static int h_seg_priv(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     (void)insn;

@@ -349,13 +349,20 @@ static int i686_interp_is_fp(uint16_t op)
              ((unsigned)op % 64U)) & 1U) != 0U;
 }
 
-/* R7-30: a pending unmasked x87 exception (ES) raises #MF before the
- * next FP/WAIT instruction executes; EIP stays at it (fault). */
-static int fp_pending_trap(i686_ctx_t *ctx, uint16_t op)
+/* R7-30/N3: a pending unmasked x87 exception (ES) raises #MF before
+ * the next FP/WAIT instruction executes; EIP stays at it (fault).
+ * N3: the no-wait control/save forms (FNCLEX, FNINIT, FNSTSW,
+ * FNSTCW, FNSTENV, FNSAVE, FXSAVE, FXRSTOR) execute despite ES so a
+ * SIGFPE handler can clear with FNCLEX without re-faulting. */
+static int fp_pending_trap(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     extern void i686_fault_sig_record(int sig);
+    extern int i686_x87_is_nowait(const x86_insn_t *insn);
 
-    if (!i686_interp_is_fp(op) || (ctx->fstat & 0x80U) == 0U) {
+    if (!i686_interp_is_fp(insn->op) || (ctx->fstat & 0x80U) == 0U) {
+        return I686_INTERP_CONTINUE;
+    }
+    if (i686_x87_is_nowait(insn)) {
         return I686_INTERP_CONTINUE;
     }
     ctx->exit_reason = I686_EXIT_FAULT;
@@ -457,7 +464,7 @@ int i686_interp_step(i686_ctx_t *ctx)
     }
     /* R7-30: pending unmasked x87 exception (the engine delivers
      * the FAULT it returns). */
-    if (fp_pending_trap(ctx, insn.op) != I686_INTERP_CONTINUE) {
+    if (fp_pending_trap(ctx, &insn) != I686_INTERP_CONTINUE) {
         i686_vm32_exec_leave();
         return I686_EXIT_FAULT;
     }
@@ -663,7 +670,7 @@ run_loop:
         /* R7-30: pending unmasked x87 exception raises #MF
          * before the next FP/WAIT instruction (delivered like
          * any synchronous fault below). */
-        if (fp_pending_trap(ctx, insn.op) != I686_INTERP_CONTINUE) {
+        if (fp_pending_trap(ctx, &insn) != I686_INTERP_CONTINUE) {
             int fpr;
 
             i686_vm32_exec_leave();

@@ -562,10 +562,13 @@ static inline void sse_eor_w11_1(a64_buf_t *b)
 
 /* ---- RC7b T1 raw SIMD words (verified against the cross assembler) -- */
 
-/* EXT Vd.16B, Vn.16B, Vm.16B, #imm4: result[j] = concat(Vn:Vm)[j+imm4]
- * (whole-register byte shifts against a zero temp). R7-50: the base
- * word carries a zero immediate field (0x6E000000, verified against
- * the native assembler); the old 0x6E001800 base forced imm4|3. */
+/* EXT Vd.16B, Vn.16B, Vm.16B, #imm4: Vd[j] = (j+imm4 < 16)
+ * ? Vn[j+imm4] : Vm[j+imm4-16] (Vn supplies the low bytes, Vm the
+ * high bytes; whole-register byte shifts against a zero temp).
+ * N7: PSRLDQ (right) is EXT(src, zero, imm), PSLLDQ (left) is
+ * EXT(zero, src, 16-imm).  R7-50: the base word carries a zero
+ * immediate field (0x6E000000, verified against the native
+ * assembler); the old 0x6E001800 base forced imm4|3. */
 static inline void sse_ext_16b(a64_buf_t *b, unsigned vd, unsigned vn,
                                unsigned vm, unsigned imm4)
 {

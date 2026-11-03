@@ -303,12 +303,12 @@ void i686_x87_op_fsincos(i686_ctx_t *ctx)
         if (x87_exc_raise(ctx, exc) != I686_INTERP_CONTINUE) {
             return;
         }
-        x87_set_ext80(ctx, 0, s);
-        /* R7-31: overflow validated before TOP moves (the
-         * dispatch returns #MF on ES). */
+        /* N8/R7-31: overflow validated before ST(0) is modified,
+         * so an unmasked stack fault leaves ST(0) untouched. */
         if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
             return;
         }
+        x87_set_ext80(ctx, 1, s);
         x87_set_ext80(ctx, 0, c); /* after: ST(0)=cos, ST(1)=sin */
         return;
     }
@@ -324,11 +324,11 @@ void i686_x87_op_fsincos(i686_ctx_t *ctx)
         s = sin(a);
         c = cos(a);
         set_c2(ctx, 0); /* R7-38: success clears a stale C2 */
-        x87_set_f64(ctx, 0, s);
-        /* R7-31: overflow validated before TOP moves. */
+        /* N8/R7-31: overflow validated before ST(0) is modified. */
         if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
             return;
         }
+        x87_set_f64(ctx, 1, s);
         x87_set_f64(ctx, 0, c);
     }
 }
@@ -559,8 +559,10 @@ void i686_x87_op_fxtract(i686_ctx_t *ctx)
 void i686_x87_op_fscale(i686_ctx_t *ctx)
 {
     /* R7-31: stack sources validated before any read (the
-     * fixed-form dispatch returns #MF on an unmasked fault). */
-    if (x87_src(ctx, 0)) {
+     * fixed-form dispatch returns #MF on an unmasked fault).
+     * N8: ST(1) holds the scale factor and must be validated
+     * before it is read (empty sets IE+SF / stages indefinite). */
+    if (x87_src(ctx, 0) || x87_src(ctx, 1)) {
         return;
     }
 

@@ -12,6 +12,13 @@
 /* Internal: keep interpreting (packed VM86_* codes are >= 0). */
 #define V86_CONT (-1L)
 
+/* N10: modrm_ea's 0x67-address-size failure.  It must differ from both
+ * the memory-success value 0 (which aliases I686_VM86_SIGNAL) and the
+ * register-form value -1: callers map it to v86_fault_sigill()
+ * (pending SIGILL + I686_VM86_SIGNAL), never treating it as success
+ * with uninitialized seg/off. */
+#define MODRM_EA_FAULT (-2L)
+
 /* Runaway safety bound (kernel has none; E10 proto used 10^6).  A real
  * DOS/BIOS workload can run long, so the cap is generous; hitting it is
  * a documented emulator-bound exit, not guest semantics. */

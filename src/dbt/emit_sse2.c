@@ -491,16 +491,21 @@ static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
     if (insn->pfx_opsize == 0U || insn->pfx_rep != 0U) {
         return -1;
     }
+    /* N7: ARM EXT Vd.16B,Vn.16B,Vm.16B,#i extracts
+     * Vd[j] = (j+i < 16) ? Vn[j+i] : Vm[j+i-16] (Vn supplies the
+     * low bytes, Vm the high bytes).  PSRLDQ (right shift) is
+     * EXT(src, zero, imm): out[j] = in[j+imm] with zero fill;
+     * PSLLDQ (left shift) is EXT(zero, src, 16-imm):
+     * out[j] = in[j-imm] with zero fill.  The operands were
+     * swapped (each direction emitted the other). */
     if (dig == 3U) { /* PSRLDQ: out[j] = in[j+imm] */
         if (imm == 0U) {
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_mov_v_v(b, 0U, 1U);
         } else if (imm < 16U) {
-            /* R7-50: EXT(zero:src)[j+imm]; the old 16-imm count
-             * shifted the wrong way. */
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_movi_v_zero(b, 2U);
-            sse_ext_16b(b, 0U, 2U, 1U, imm);
+            sse_ext_16b(b, 0U, 1U, 2U, imm);
         } else {
             sse_movi_v_zero(b, 0U);
         }
@@ -509,11 +514,9 @@ static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_mov_v_v(b, 0U, 1U);
         } else if (imm < 16U) {
-            /* R7-50: EXT(src:zero)[j+16-imm]; the old imm count
-             * shifted the wrong way. */
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_movi_v_zero(b, 2U);
-            sse_ext_16b(b, 0U, 1U, 2U, 16U - imm);
+            sse_ext_16b(b, 0U, 2U, 1U, 16U - imm);
         } else {
             sse_movi_v_zero(b, 0U);
         }
