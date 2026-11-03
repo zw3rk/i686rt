@@ -532,7 +532,7 @@ int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr,
     if (ws != NULL) {
         atomic_store(&ws->ulock_wait_addr, 0u);
     }
-    if (rc == 0) {
+    if (rc >= 0) {
         if (ws != NULL && atomic_load(&ws->sig_seq) != expected_seq) {
             return -EINTR;
         }
@@ -555,11 +555,11 @@ int64_t rt_host_futex_wake_bitset(_Atomic uint32_t *pinned_host_uaddr,
     (void)key;
     (void)bitset;
     if (count <= 0) {
-        count = INT_MAX;
+        return 0;
     }
     rc = __ulock_wake(I686_UL_COMPARE_AND_WAIT | I686_ULF_WAKE_ALL,
-                      (void *)pinned_host_uaddr, (uint64_t)(uint32_t)count);
-    if (rc != 0 && errno != ENOENT) {
+                      (void *)pinned_host_uaddr, 0u);
+    if (rc < 0 && errno != ENOENT) {
         return (int64_t)-errno;
     }
     return 0;
