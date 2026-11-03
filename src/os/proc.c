@@ -281,7 +281,23 @@ static int canon_proc_leaf(const char *leaf, char *out, size_t cap)
             p = q;
             continue;
         }
-        if ((!first && o + 1U >= cap) || o + len >= cap) {
+        if (len == 2U && p[0] == '.' && p[1] == '.') {
+            if (o == 0U) {
+                return -1;
+            }
+            while (o > 0U && out[o - 1U] != '/') {
+                o--;
+            }
+            if (o > 0U && out[o - 1U] == '/') {
+                o--;
+            }
+            if (o == 0U) {
+                first = 1;
+            }
+            p = q;
+            continue;
+        }
+        if (o + (first ? 0U : 1U) + len >= cap) {
             return -1;
         }
         if (!first) {
