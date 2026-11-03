@@ -330,6 +330,9 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             } else {
                 a64_emit_guest_ldr_w(b, L3C_W10, L3C_EA);
             }
+            if (e->tso) {
+                a64_emit(b, 0xD50339BFU); /* dmb ishld */
+            }
         }
         l3c_exit_dest_w10(e, I686_EXIT_BRANCH, 0U);
         return 0;
@@ -386,6 +389,9 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             a64_emit_guest_strh_w(b, L3C_W11, I686_REG_ESP);
         } else {
             a64_emit_guest_str_w(b, L3C_W11, I686_REG_ESP);
+        }
+        if (e->tso) {
+            a64_emit(b, 0xD5033BBFU); /* dmb ish */
         }
         /* RC-U3 stack site: ESP commits before the store can fault. */
         memset(&site, 0, sizeof(site));
@@ -444,6 +450,9 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             } else {
                 a64_emit_guest_ldr_w(b, L3C_W10, L3C_EA);
             }
+            if (e->tso) {
+                a64_emit(b, 0xD50339BFU); /* dmb ishld */
+            }
             /* Load site: the fault leaves ESP intact (still pre-call),
              * so no rollback (sp_rollback_delta = 0, flags = 0); width
              * stays 0 so the replay walk accounts no ESP effect before
@@ -480,6 +489,9 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             a64_emit_guest_strh_w(b, L3C_W11, I686_REG_ESP);
         } else {
             a64_emit_guest_str_w(b, L3C_W11, I686_REG_ESP);
+        }
+        if (e->tso) {
+            a64_emit(b, 0xD5033BBFU); /* dmb ish */
         }
         /* RC-U3 stack site: ESP commits before the store can fault.
          * The resume target is dynamic (w10 into the exit dest). */
@@ -526,6 +538,9 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             a64_emit_guest_ldrh_w(b, L3C_W10, I686_REG_ESP);
         } else {
             a64_emit_guest_ldr_w(b, L3C_W10, I686_REG_ESP);
+        }
+        if (e->tso) {
+            a64_emit(b, 0xD50339BFU); /* dmb ishld */
         }
         a64_emit_add_imm_w(b, false, I686_REG_ESP, I686_REG_ESP, bytes, 0U);
         if (insn->op == I686_OP_RET_Iw) {
