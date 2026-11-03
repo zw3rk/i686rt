@@ -93,6 +93,7 @@ static struct {
     i686_ctx_t *ctx;
 } s_registry[I686_THREAD_REGISTRY_MAX];
 static size_t       s_registry_n;
+static size_t       s_registry_reserved;
 static pthread_mutex_t s_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static i686_ctx_t  *s_main_ctx;
 
@@ -134,17 +135,48 @@ int i686_thread_is_main(i686_ctx_t *ctx)
     return is_main;
 }
 
-/* Space check for r_clone: reserve the verdict before the child
- * starts so a full table fails the clone instead of running a thread
- * the registry cannot track. */
-static int thread_registry_has_space(void);
-static int thread_registry_has_space(void)
+/* Slot reservation for r_clone: claim the slot under the lock
+ * before pthread_create so concurrent clones cannot race past a
+ * shared space check. The reservation converts into a live entry
+ * once the child publishes its tid; a failed create releases it. */
+static int thread_registry_reserve(void);
+static int thread_registry_reserve(void)
 {
-    int space;
+    int ok = 0;
     (void)pthread_mutex_lock(&s_registry_lock);
-    space = (s_registry_n < I686_THREAD_REGISTRY_MAX);
+    if (s_registry_n + s_registry_reserved <
+        I686_THREAD_REGISTRY_MAX) {
+        s_registry_reserved++;
+        ok = 1;
+    }
     (void)pthread_mutex_unlock(&s_registry_lock);
-    return space;
+    return ok;
+}
+
+static void thread_registry_unreserve(void);
+static void thread_registry_unreserve(void)
+{
+    (void)pthread_mutex_lock(&s_registry_lock);
+    if (s_registry_reserved > 0U) {
+        s_registry_reserved--;
+    }
+    (void)pthread_mutex_unlock(&s_registry_lock);
+}
+
+static void thread_registry_commit(i686_ctx_t *ctx, uint32_t tid);
+static void thread_registry_commit(i686_ctx_t *ctx, uint32_t tid)
+{
+    (void)pthread_mutex_lock(&s_registry_lock);
+    if (s_registry_reserved > 0U) {
+        s_registry_reserved--;
+    }
+    if (s_registry_n < I686_THREAD_REGISTRY_MAX) {
+        s_registry[s_registry_n].tid = tid;
+        s_registry[s_registry_n].host_tid = (int)tid;
+        s_registry[s_registry_n].ctx = ctx;
+        s_registry_n++;
+    }
+    (void)pthread_mutex_unlock(&s_registry_lock);
 }
 
 void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid);
@@ -718,7 +750,7 @@ static int64_t r_clone(i686_ctx_t *ctx)
     /* child->clear_child_tid was reset right after the memcpy above:
      * present only when CLONE_CHILD_CLEARTID was passed. */
 
-    if (!thread_registry_has_space()) {
+    if (!thread_registry_reserve()) {
         (void)pthread_mutex_destroy(&ca->mtx);
         (void)pthread_cond_destroy(&ca->cond);
         free(child); free(ca);
@@ -735,6 +767,7 @@ static int64_t r_clone(i686_ctx_t *ctx)
         int crc;
         crc = pthread_create(&th, NULL, thread_entry, ca);
         if (crc != 0) {
+            thread_registry_unreserve();
             (void)pthread_mutex_destroy(&ca->mtx);
             (void)pthread_cond_destroy(&ca->cond);
             free(child); free(ca);
@@ -746,7 +779,7 @@ static int64_t r_clone(i686_ctx_t *ctx)
         (void)pthread_cond_wait(&ca->cond, &ca->mtx);
     }
     r_val = ca->host_tid;
-    i686_thread_registry_add(child, r_val);
+    thread_registry_commit(child, r_val);
     if (ca->parent_tid_va != 0U) {
         (void)i686_copy_to_guest(ctx, ca->parent_tid_va, &r_val, 4U);
     }
@@ -811,6 +844,7 @@ static void fork_child(void)
     }
     (void)pthread_mutex_lock(&s_registry_lock);
     s_registry_n = 0;
+    s_registry_reserved = 0;
     if (surviving != NULL) {
         s_main_ctx = surviving;
         surviving->host_tid = (int)getpid();

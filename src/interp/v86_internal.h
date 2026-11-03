@@ -282,7 +282,9 @@ static inline int is_revectored(unsigned n, const uint32_t map[8])
  * pending (SIGILL for unknown/undecodable opcodes, D2). */
 static inline long v86_fault_sigill(i686_ctx_t *ctx)
 {
-    ctx->pending_signals |= (uint64_t)1U << (4U - 1U); /* SIGILL */
+    (void)__atomic_fetch_or(&ctx->pending_signals,
+                            (uint64_t)1U << (4U - 1U), /* SIGILL */
+                            __ATOMIC_SEQ_CST);
     return I686_VM86_SIGNAL;
 }
 
@@ -290,7 +292,9 @@ static inline long v86_fault_sigill(i686_ctx_t *ctx)
  * signal to the process (freeze: pending + VM86_SIGNAL). */
 static inline long v86_fault_sig(i686_ctx_t *ctx, int sig)
 {
-    ctx->pending_signals |= (uint64_t)1U << (uint32_t)(sig - 1);
+    (void)__atomic_fetch_or(&ctx->pending_signals,
+                            (uint64_t)1U << (uint32_t)(sig - 1),
+                            __ATOMIC_SEQ_CST);
     return I686_VM86_SIGNAL;
 }
 

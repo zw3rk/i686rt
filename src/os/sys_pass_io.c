@@ -100,12 +100,9 @@ static long sys_dup3(uint32_t oldfd, uint32_t newfd, uint32_t flags)
 #ifdef __APPLE__
     {
         int fd;
-        /* Linux dup3 rejects oldfd == newfd with -EINVAL, but only
-         * after confirming oldfd is open (-EBADF otherwise). */
+        /* Linux ksys_dup3 rejects oldfd == newfd with -EINVAL
+         * unconditionally, before any validity check. */
         if (oldfd == newfd) {
-            if (fcntl((int)oldfd, F_GETFD) < 0) {
-                return -errno;
-            }
             return -EINVAL;
         }
         fd = dup2((int)oldfd, (int)newfd);

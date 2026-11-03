@@ -187,7 +187,9 @@ static long sys_rt_sigprocmask(i686_ctx_t *ctx, uint32_t how, uint32_t set_va,
     }
     if (oldset_va != 0U) {
         uint8_t old[8];
-        memcpy(old, &ctx->sig_mask, 8U);
+        uint64_t cur =
+            __atomic_load_n(&ctx->sig_mask, __ATOMIC_SEQ_CST);
+        memcpy(old, &cur, 8U);
         if (guest_ptr_bad(oldset_va) ||
             i686_copy_to_guest(ctx, oldset_va, old, sizeof old) != 0) {
             return -EFAULT;
@@ -198,13 +200,15 @@ static long sys_rt_sigprocmask(i686_ctx_t *ctx, uint32_t how, uint32_t set_va,
         memcpy(&m, staged, 8U);
         switch (how) {
         case 0U: /* SIG_BLOCK */
-            ctx->sig_mask |= m;
+            (void)__atomic_fetch_or(&ctx->sig_mask, m,
+                                    __ATOMIC_SEQ_CST);
             break;
         case 1U: /* SIG_UNBLOCK */
-            ctx->sig_mask &= ~m;
+            (void)__atomic_fetch_and(&ctx->sig_mask, ~m,
+                                     __ATOMIC_SEQ_CST);
             break;
         case 2U: /* SIG_SETMASK */
-            ctx->sig_mask = m;
+            __atomic_store_n(&ctx->sig_mask, m, __ATOMIC_SEQ_CST);
             break;
         default:
             return -EINVAL;
@@ -502,5 +506,8 @@ void i686_syscalls_pass_init(void)
 uint64_t i686_sigmask_get(void)
 {
     i686_ctx_t *ctx = i686_current_ctx();
-    return (ctx != NULL) ? ctx->sig_mask : 0ULL;
+    if (ctx == NULL) {
+        return 0ULL;
+    }
+    return __atomic_load_n(&ctx->sig_mask, __ATOMIC_SEQ_CST);
 }
