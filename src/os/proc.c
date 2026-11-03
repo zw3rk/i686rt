@@ -247,48 +247,97 @@ static const char *skip_proc_prefix(const char *path)
     return p;
 }
 
+/* I686-R12-5: canonicalize the leaf after "/proc/" before matching:
+ * collapse duplicate '/' runs, drop "/./" segments, strip trailing '/'.
+ * Non-canonical spellings such as "/proc/self//maps" or
+ * "/proc/./self/maps" must hit the synthetic handler instead of leaking
+ * the host file.  Returns 0 with the NUL-terminated form in out, or -1
+ * when the leaf does not fit (then it cannot be a virtual path). */
+static int canon_proc_leaf(const char *leaf, char *out, size_t cap)
+{
+    size_t o = 0U;
+    int first = 1;
+    const char *p = leaf;
+
+    if (cap == 0U) {
+        return -1;
+    }
+    while (*p != '\0') {
+        const char *q;
+        size_t len;
+
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        q = p;
+        while (*q != '\0' && *q != '/') {
+            q++;
+        }
+        len = (size_t)(q - p);
+        if (len == 1U && p[0] == '.') {
+            p = q;
+            continue;
+        }
+        if ((!first && o + 1U >= cap) || o + len >= cap) {
+            return -1;
+        }
+        if (!first) {
+            out[o++] = '/';
+        }
+        memcpy(out + o, p, len);
+        o += len;
+        first = 0;
+        p = q;
+    }
+    out[o] = '\0';
+    return 0;
+}
+
 int i686_proc_open_at(i686_ctx_t *ctx, const char *guest_path)
 {
     const char *leaf = skip_proc_prefix(guest_path);
+    char canon[64];
     if (leaf == NULL) {
         return I686_PROC_NOT_MATCHED;
     }
-    if (strcmp(leaf, "cpuinfo") == 0) {
+    if (canon_proc_leaf(leaf, canon, sizeof(canon)) != 0) {
+        return I686_PROC_NOT_MATCHED;
+    }
+    if (strcmp(canon, "cpuinfo") == 0) {
         const char *s = i686_proc_cpuinfo_str();
         return create_anon_file("proc_cpuinfo", s, strlen(s));
     }
-    if (strcmp(leaf, "version") == 0) {
+    if (strcmp(canon, "version") == 0) {
         const char *s = i686_proc_version_str();
         return create_anon_file("proc_version", s, strlen(s));
     }
-    if (strncmp(leaf, "self/", 5) == 0) {
-        const char *sub = leaf + 5;
-        while (*sub == '/') {
-            sub++;
+    if (strcmp(canon, "self/maps") == 0) {
+        char buf[16384];
+        size_t n = i686_proc_render_maps(ctx, buf, sizeof(buf));
+        return create_anon_file("proc_maps", buf, n);
+    }
+    if (strcmp(canon, "self/cmdline") == 0) {
+        char buf[4096];
+        size_t n = i686_proc_render_cmdline(ctx, buf, sizeof(buf));
+        return create_anon_file("proc_cmdline", buf, n);
+    }
+    if (strcmp(canon, "self/auxv") == 0) {
+        return create_anon_file("proc_auxv", ctx->auxv_data,
+                                ctx->auxv_bytes);
+    }
+    if (strcmp(canon, "self/exe") == 0) {
+        const char *ep = (ctx->exec_path != NULL && ctx->exec_path[0] != '\0')
+                             ? ctx->exec_path
+                             : ((ctx->guest_argv != NULL)
+                                    ? ctx->guest_argv[0]
+                                    : NULL);
+        if (ep == NULL || ep[0] == '\0') {
+            return -ENOENT;
         }
-        if (strcmp(sub, "maps") == 0) {
-            char buf[16384];
-            size_t n = i686_proc_render_maps(ctx, buf, sizeof(buf));
-            return create_anon_file("proc_maps", buf, n);
-        }
-        if (strcmp(sub, "cmdline") == 0) {
-            char buf[4096];
-            size_t n = i686_proc_render_cmdline(ctx, buf, sizeof(buf));
-            return create_anon_file("proc_cmdline", buf, n);
-        }
-        if (strcmp(sub, "auxv") == 0) {
-            return create_anon_file("proc_auxv", ctx->auxv_data,
-                                    ctx->auxv_bytes);
-        }
-        if (strcmp(sub, "exe") == 0) {
-            const char *ep = (ctx->exec_path != NULL && ctx->exec_path[0] != '\0')
-                                 ? ctx->exec_path
-                                 : ((ctx->guest_argv != NULL)
-                                        ? ctx->guest_argv[0]
-                                        : NULL);
-            if (ep == NULL || ep[0] == '\0') {
-                return -ENOENT;
-            }
+        {
             int fd = open(ep, O_RDONLY | O_CLOEXEC);
             return (fd >= 0) ? fd : -errno;
         }

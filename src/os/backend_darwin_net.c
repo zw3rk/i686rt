@@ -105,6 +105,18 @@ int64_t rt_host_socketpair(int linux_domain, int linux_type, int protocol,
     if (socketpair(linux_domain, linux_type & 0xff, protocol, sv) != 0) {
         return (int64_t)-errno;
     }
+    /* I686-R12-4: mirror the SOCK_CLOEXEC/SOCK_NONBLOCK handling of
+     * rt_host_socket on both ends of the pair. */
+    if ((linux_type & 02000000) != 0) { /* SOCK_CLOEXEC */
+        (void)fcntl(sv[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(sv[1], F_SETFD, FD_CLOEXEC);
+    }
+    if ((linux_type & 04000) != 0) { /* SOCK_NONBLOCK */
+        int f0 = fcntl(sv[0], F_GETFL);
+        int f1 = fcntl(sv[1], F_GETFL);
+        (void)fcntl(sv[0], F_SETFL, ((f0 < 0) ? 0 : f0) | O_NONBLOCK);
+        (void)fcntl(sv[1], F_SETFL, ((f1 < 0) ? 0 : f1) | O_NONBLOCK);
+    }
     return 0;
 }
 
@@ -140,7 +152,6 @@ int64_t rt_host_accept4(int fd, void *linux_addr_out, uint32_t *addrlen_inout,
     int w = i686_darwin_wait_fd(fd, 0, ws, expected_seq, 30000);
     int cfd;
     socklen_t len = (addrlen_inout != NULL) ? (socklen_t)*addrlen_inout : 0u;
-    (void)linux_flags;
     if (w < 0) {
         return (int64_t)w;
     }
@@ -150,6 +161,15 @@ int64_t rt_host_accept4(int fd, void *linux_addr_out, uint32_t *addrlen_inout,
     cfd = accept(fd, linux_addr_out, (addrlen_inout != NULL) ? &len : NULL);
     if (cfd < 0) {
         return (int64_t)-errno;
+    }
+    /* I686-R12-4: mirror the SOCK_CLOEXEC/SOCK_NONBLOCK handling of
+     * rt_host_socket on the accepted fd. */
+    if ((linux_flags & 02000000) != 0) { /* SOCK_CLOEXEC */
+        (void)fcntl(cfd, F_SETFD, FD_CLOEXEC);
+    }
+    if ((linux_flags & 04000) != 0) { /* SOCK_NONBLOCK */
+        int fl = fcntl(cfd, F_GETFL);
+        (void)fcntl(cfd, F_SETFL, ((fl < 0) ? 0 : fl) | O_NONBLOCK);
     }
     if (addrlen_inout != NULL) {
         *addrlen_inout = (uint32_t)len;

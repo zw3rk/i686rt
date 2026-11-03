@@ -548,6 +548,18 @@ int i686_exec_open(const i686_ctx_t *ctx, const char *path)
 {
     char buf[4096];
 
+    /* I686-R12-3: /proc/self/exe and own-pid /proc/<pid>/exe -> exec_path. */
+    if (ctx != NULL && ctx->exec_path != NULL && ctx->exec_path[0] != '\0') {
+        if (strcmp(path, "/proc/self/exe") == 0) {
+            path = ctx->exec_path;
+        } else if (strncmp(path, "/proc/", 6) == 0) {
+            char *end = NULL;
+            long pid = strtol(path + 6, &end, 10);
+            if (end != path + 6 && !strcmp(end, "/exe") && pid == (long)getpid()) {
+                path = ctx->exec_path;
+            }
+        }
+    }
     if (path[0] == '/' && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
         size_t n = strlen(ctx->sysroot);
         size_t pl = strlen(path);
