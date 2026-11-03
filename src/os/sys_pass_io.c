@@ -99,12 +99,25 @@ static long sys_dup3(uint32_t oldfd, uint32_t newfd, uint32_t flags)
     }
 #ifdef __APPLE__
     {
-        int fd = dup2((int)oldfd, (int)newfd);
+        int fd;
+        /* Linux dup3 rejects oldfd == newfd with -EINVAL, but only
+         * after confirming oldfd is open (-EBADF otherwise). */
+        if (oldfd == newfd) {
+            if (fcntl((int)oldfd, F_GETFD) < 0) {
+                return -errno;
+            }
+            return -EINVAL;
+        }
+        fd = dup2((int)oldfd, (int)newfd);
         if (fd < 0) {
             return -errno;
         }
         if ((flags & 0x80000u) != 0U) {
-            (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+            if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+                int e = errno;
+                (void)close(fd);
+                return -e;
+            }
         }
         return fd;
     }

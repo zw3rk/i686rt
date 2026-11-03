@@ -329,17 +329,18 @@ static int h_cpuid(i686_ctx_t *ctx, const x86_insn_t *insn)
     return interp_done(ctx, insn);
 }
 
-/* XLAT: AL <- [DS:EBX + AL], DS overridable.  67 uses the 16-bit BX
- * offset (masked here); the +AL part stays 8-bit either way. */
+/* XLAT: AL <- [DS:EBX + AL], DS overridable.  Under 67 the BX + AL
+ * sum wraps at 64 KiB; the +AL part stays 8-bit either way. */
 static int h_xlat(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    uint32_t base = ctx->gpr[I686_REG_EBX];
+    uint32_t al = x86_reg_read(ctx, I686_REG_EAX, 8U);
+    uint32_t off = ctx->gpr[I686_REG_EBX] + al; /* wraps in 32 bits */
 
     if (insn->pfx_addrsize != 0U) {
-        base &= 0xffffU;
+        off &= 0xffffU;
     }
     x86_reg_write(ctx, I686_REG_EAX, 8U,
-                  mem_read(ctx, base + x86_reg_read(ctx, I686_REG_EAX, 8U) +
+                  mem_read(ctx, off +
                                    ctx->seg_base[seg_used(insn, I686_SEG_DS)], 1U));
     return interp_done(ctx, insn);
 }

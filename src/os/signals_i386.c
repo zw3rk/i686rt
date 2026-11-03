@@ -239,11 +239,12 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
          * live task state for the handler's duration and sigreturn
          * restores the frame's copy — that is how a handler's own
          * uc_sigmask edit (musl's SIGCANCEL re-raise) survives). */
-        uint64_t pre = ctx->sig_mask;
+        uint64_t pre =
+            __atomic_load_n(&ctx->sig_mask, __ATOMIC_SEQ_CST);
         uint64_t blocked = pre | (1ULL << (uint32_t)(sig - 1));
 
         blocked |= ((uint64_t)ga->mask[1] << 32) | (uint64_t)ga->mask[0];
-        ctx->sig_mask = blocked;
+        __atomic_store_n(&ctx->sig_mask, blocked, __ATOMIC_SEQ_CST);
         if (sa_siginfo) {
             /* uc_sigmask: ucontext@frame+0x90, +0x14 mcontext(88) -> +0x6c */
             uint8_t m[8];
@@ -400,12 +401,15 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
      * SIGCANCEL re-raise relies on the edit surviving). */
     if (rt) {
         uint8_t m[8];
+        uint64_t restored = 0ULL;
         if (i686_copy_from_guest(ctx, m, frame + 0x90U + 0x6cU, sizeof(m)) != 0) {
             return -1;
         }
-        memcpy(&ctx->sig_mask, m, sizeof(ctx->sig_mask));
+        memcpy(&restored, m, sizeof(restored));
+        __atomic_store_n(&ctx->sig_mask, restored, __ATOMIC_SEQ_CST);
     } else {
-        ctx->sig_mask = (uint64_t)sc.oldmask;
+        __atomic_store_n(&ctx->sig_mask, (uint64_t)sc.oldmask,
+                         __ATOMIC_SEQ_CST);
     }
     ctx->gpr[I686_REG_EDI] = sc.edi; ctx->gpr[I686_REG_ESI] = sc.esi;
     ctx->gpr[I686_REG_EBP] = sc.ebp; ctx->gpr[I686_REG_ESP] = sc.esp;
@@ -496,9 +500,11 @@ static void host_sigalrm_handler(int sig, siginfo_t *info, void *ucontext)
         (void)raise(SIGALRM);
         return;
     }
-    if ((target->sig_mask & ((uint64_t)1U << 13)) != 0ULL) {
+    if ((__atomic_load_n(&target->sig_mask, __ATOMIC_SEQ_CST) &
+         ((uint64_t)1U << 13)) != 0ULL) {
         /* Blocked: queue (kernel keeps it pending until unmasked). */
-        target->pending_signals |= (uint64_t)1U << 13; /* SIGALRM = 14 */
+        __atomic_fetch_or(&target->pending_signals, (uint64_t)1U << 13,
+                          __ATOMIC_SEQ_CST); /* SIGALRM = 14 */
         return;
     }
     disp = i686_gsig_handler_raw(14);
@@ -511,7 +517,8 @@ static void host_sigalrm_handler(int sig, siginfo_t *info, void *ucontext)
         (void)raise(SIGALRM);
         return;
     }
-    target->pending_signals |= (uint64_t)1U << 13; /* SIGALRM = 14 */
+    __atomic_fetch_or(&target->pending_signals, (uint64_t)1U << 13,
+                      __ATOMIC_SEQ_CST); /* SIGALRM = 14 */
 }
 
 /* Host alarm(2) wrapper that tracks the armed state for the bridge.
@@ -636,18 +643,21 @@ int i686_deliver_sync(i686_ctx_t *ctx, int reason)
  *  - Installed handler: builds a guest signal frame and redirects EIP. */
 int i686_deliver_pending(i686_ctx_t *ctx)
 {
-    uint64_t pend = ctx->pending_signals;
+    uint64_t pend =
+        __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST);
     while (pend != 0ULL) {
         uint64_t bit = pend & (~pend + 1ULL); /* lowest set bit */
         struct i686_gsigaction ga;
         int sig = 1;
         uint64_t scan;
+        uint64_t mask;
 
         pend ^= bit;
         for (scan = bit; scan > 1ULL; scan >>= 1) {
             sig++;
         }
-        if ((ctx->sig_mask & bit) != 0ULL && sig != 9 && sig != 19) {
+        mask = __atomic_load_n(&ctx->sig_mask, __ATOMIC_SEQ_CST);
+        if ((mask & bit) != 0ULL && sig != 9 && sig != 19) {
             continue; /* blocked: stays pending until unmasked */
         }
         /* One consumed snapshot per signal (I686-R4-6): the IGN/DFL
@@ -655,15 +665,19 @@ int i686_deliver_pending(i686_ctx_t *ctx)
          * this copy. The snapshot's handler is the installed EIP even
          * after the reset flips the table back to SIG_DFL. */
         if (i686_gsig_consume_oneshot(sig, &ga) != 0) {
-            ctx->pending_signals &= ~bit;
+            __atomic_fetch_and(&ctx->pending_signals, ~bit,
+                               __ATOMIC_SEQ_CST);
             continue;
         }
         if (ga.handler == 1U && sig != 9 && sig != 19) {
-            ctx->pending_signals &= ~bit; /* SIG_IGN: drop */
+            /* SIG_IGN: drop */
+            __atomic_fetch_and(&ctx->pending_signals, ~bit,
+                               __ATOMIC_SEQ_CST);
             continue;
         }
         if (ga.handler == 0U || sig == 9 || sig == 19) {
-            ctx->pending_signals &= ~bit;
+            __atomic_fetch_and(&ctx->pending_signals, ~bit,
+                               __ATOMIC_SEQ_CST);
             if (sig == 17 || sig == 18 || sig == 23 || sig == 28) {
                 continue; /* Ign / Cont */
             }
@@ -677,7 +691,8 @@ int i686_deliver_pending(i686_ctx_t *ctx)
             }
             _exit(128 + sig);
         }
-        ctx->pending_signals &= ~bit;
+        __atomic_fetch_and(&ctx->pending_signals, ~bit,
+                           __ATOMIC_SEQ_CST);
         ctx->exit_arg = 0; /* no trapno for async */
         return sigframe_build_snapshot(ctx, sig, &ga,
                                        (ga.flags & 0x4U) ? 1 : 0, 0U, 0U);

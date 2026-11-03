@@ -81,12 +81,14 @@ static uint32_t mem_load(const i686_ctx_t *ctx, uint32_t va, unsigned width)
     return v;
 }
 
+/* Near CALL/RET run against SS like PUSH/POP (h_mov.c): the stack
+ * pointer is an offset from the SS base, wrapping in 32 bits. */
 static void stack_push(i686_ctx_t *ctx, uint32_t val, unsigned width)
 {
     unsigned bytes = width / 8U;
     uint32_t sp = ctx->gpr[I686_REG_ESP] - bytes; /* wraps in 32 bits */
 
-    mem_store(ctx, sp, val, width);
+    mem_store(ctx, ctx->seg_base[I686_SEG_SS] + sp, val, width);
     ctx->gpr[I686_REG_ESP] = sp;
 }
 
@@ -94,7 +96,7 @@ static uint32_t stack_pop(i686_ctx_t *ctx, unsigned width)
 {
     unsigned bytes = width / 8U;
     uint32_t sp = ctx->gpr[I686_REG_ESP];
-    uint32_t v = mem_load(ctx, sp, width);
+    uint32_t v = mem_load(ctx, ctx->seg_base[I686_SEG_SS] + sp, width);
 
     ctx->gpr[I686_REG_ESP] = sp + bytes;
     return v;
@@ -189,13 +191,14 @@ enum loop_kind { LOOP_PLAIN = 0, LOOP_Z, LOOP_NZ };
 
 static int do_loop(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind)
 {
-    unsigned width = opnd_width(insn);
+    /* The count register follows the ADDRESS size (67): CX under a 16-bit
+     * address size (upper ECX preserved), ECX otherwise. */
+    unsigned addr_w = (insn->pfx_addrsize != 0U) ? 16U : 32U;
     uint32_t count;
     bool taken;
     uint32_t next = next_eip_of(ctx, insn);
 
-    /* The count register decrements at operand size: ECX, or CX under 66. */
-    if (width == 16U) {
+    if (addr_w == 16U) {
         ctx->gpr[I686_REG_ECX] =
             (ctx->gpr[I686_REG_ECX] & 0xFFFF0000U) |
             ((ctx->gpr[I686_REG_ECX] - 1U) & 0xFFFFU);
@@ -234,8 +237,9 @@ static int h_loopnz(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_jcxz(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    unsigned width = opnd_width(insn);
-    uint32_t count = (width == 16U) ? (ctx->gpr[I686_REG_ECX] & 0xFFFFU)
+    /* JCXZ/JECXZ test CX vs ECX by address size (67), not operand size. */
+    unsigned addr_w = (insn->pfx_addrsize != 0U) ? 16U : 32U;
+    uint32_t count = (addr_w == 16U) ? (ctx->gpr[I686_REG_ECX] & 0xFFFFU)
                                     : ctx->gpr[I686_REG_ECX];
     uint32_t next = next_eip_of(ctx, insn);
 

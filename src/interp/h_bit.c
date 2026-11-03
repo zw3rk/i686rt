@@ -42,21 +42,22 @@ static uint32_t width_mask(unsigned width)
 enum bt_mode { BT_TEST = 0, BT_SET, BT_RESET, BT_COMPLEMENT };
 
 /*
- * x86 bit addressing (per the frozen contract): the index is taken modulo
- * the operand width.  For a register destination it picks the bit directly;
- * for a memory destination the high bits select a byte offset from the
- * r/m effective address, bitnr>>3, and index&7 the bit inside that byte
- * (for a 32-bit operand this equals the SDM's DIV 32 / MOD 32 formula).
+ * x86 bit addressing: a register destination picks the bit modulo the
+ * operand width.  A memory destination with an immediate index (0F BA)
+ * does the same at EA + (index mod width)/8.  A memory destination with
+ * a register index (0F A3/AB/B3/BB) takes the SIGNED bit offset: the
+ * effective address moves by floor(bit_ofs / width) units of the operand
+ * width (an arithmetic shift) and the bit is bit_ofs mod width.
  */
 static int bt_common(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mode,
-                     uint32_t raw_index)
+                     uint32_t raw_index, unsigned from_reg)
 {
     unsigned width = opnd_width(insn);
-    unsigned index = (unsigned)(raw_index & (width - 1U));
     uint32_t bit;
 
     if (insn->modrm_mod == 3U) {
         /* Register destination: one width-sized read-modify-write. */
+        unsigned index = (unsigned)(raw_index & (width - 1U));
         uint32_t val = x86_reg_read(ctx, insn->modrm_rm, width);
 
         bit = (val >> index) & 1U;
@@ -75,9 +76,33 @@ static int bt_common(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mode,
     } else {
         /* Memory destination: byte-granular RMW at EA + byte offset. */
         uint32_t ea = x86_ea_compute(ctx, insn);
-        uint32_t byte_off = (uint32_t)(index >> 3); /* 0..width/8-1 */
-        uint8_t *p = (uint8_t *)i686_guest_ptr(ctx, ea + byte_off);
-        unsigned bitpos = index & 7U;
+        unsigned index;
+        uint32_t byte_off;
+        uint8_t *p;
+        unsigned bitpos;
+
+        if (from_reg != 0U) {
+            /* Register index: sign-extend, offset the address by whole
+             * width-sized units (arithmetic shift = floor divide),
+             * keep the residual bit. */
+            int32_t bit_ofs = (width == 16U)
+                                  ? (int32_t)(int16_t)(uint16_t)raw_index
+                                  : (int32_t)raw_index;
+
+            if (width == 16U) {
+                ea += (uint32_t)((bit_ofs >> 4) * 2);
+                index = (unsigned)(bit_ofs & 15);
+            } else {
+                ea += (uint32_t)((bit_ofs >> 5) * 4);
+                index = (unsigned)(bit_ofs & 31);
+            }
+        } else {
+            /* Immediate index: modulo the operand width. */
+            index = (unsigned)(raw_index & (width - 1U));
+        }
+        byte_off = (uint32_t)(index >> 3); /* 0..width/8-1 */
+        p = (uint8_t *)i686_guest_ptr(ctx, ea + byte_off);
+        bitpos = index & 7U;
 
         if (insn->pfx_lock != 0U && mode != (unsigned)BT_TEST) {
             /* RC-U3-r3 #5: hold the split lock across the atomic byte
@@ -123,51 +148,51 @@ static int bt_common(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mode,
     return I686_INTERP_CONTINUE;
 }
 
-/* _EvGv forms: the bit index is the reg-field register (its low bits are
- * all that survive the modulo, so a full 32-bit read is equivalent). */
+/* _EvGv forms (0F A3/AB/B3/BB): the index is the reg-field register;
+ * against memory it is a signed offset (address scaling in bt_common). */
 static int h_bt_evgy(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     return bt_common(ctx, insn, (unsigned)BT_TEST,
-                     x86_reg_read(ctx, insn->modrm_reg, 32U));
+                     x86_reg_read(ctx, insn->modrm_reg, 32U), 1U);
 }
 
 static int h_bts_evgy(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     return bt_common(ctx, insn, (unsigned)BT_SET,
-                     x86_reg_read(ctx, insn->modrm_reg, 32U));
+                     x86_reg_read(ctx, insn->modrm_reg, 32U), 1U);
 }
 
 static int h_btr_evgy(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     return bt_common(ctx, insn, (unsigned)BT_RESET,
-                     x86_reg_read(ctx, insn->modrm_reg, 32U));
+                     x86_reg_read(ctx, insn->modrm_reg, 32U), 1U);
 }
 
 static int h_btc_evgy(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     return bt_common(ctx, insn, (unsigned)BT_COMPLEMENT,
-                     x86_reg_read(ctx, insn->modrm_reg, 32U));
+                     x86_reg_read(ctx, insn->modrm_reg, 32U), 1U);
 }
 
-/* _EvIb forms (0F BA /4../7): immediate index, same modulo rule. */
+/* _EvIb forms (0F BA /4../7): immediate index, modulo the width. */
 static int h_bt_evib(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    return bt_common(ctx, insn, (unsigned)BT_TEST, insn->imm);
+    return bt_common(ctx, insn, (unsigned)BT_TEST, insn->imm, 0U);
 }
 
 static int h_bts_evib(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    return bt_common(ctx, insn, (unsigned)BT_SET, insn->imm);
+    return bt_common(ctx, insn, (unsigned)BT_SET, insn->imm, 0U);
 }
 
 static int h_btr_evib(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    return bt_common(ctx, insn, (unsigned)BT_RESET, insn->imm);
+    return bt_common(ctx, insn, (unsigned)BT_RESET, insn->imm, 0U);
 }
 
 static int h_btc_evib(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    return bt_common(ctx, insn, (unsigned)BT_COMPLEMENT, insn->imm);
+    return bt_common(ctx, insn, (unsigned)BT_COMPLEMENT, insn->imm, 0U);
 }
 
 /* ------------------------------------------------------------------ */

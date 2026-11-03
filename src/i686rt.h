@@ -177,8 +177,12 @@ typedef struct i686_ctx {
     uint32_t fpu_dp;                    /* 0x194 last x87 data pointer */
     uint32_t mxcsr;                     /* 0x198 */
     uint32_t mxcsr_mask;                /* 0x19c */
+    /* Signal mask and pending set: every access (including bit set
+     * and clear) runs through the __atomic builtins with
+     * __ATOMIC_SEQ_CST; plain '|=', '&=' or '=' would race across
+     * threads and signal handlers. */
     uint64_t          sig_mask;         /* 0x1a0 */
-    volatile uint64_t pending_signals;  /* 0x1a8 */
+    uint64_t          pending_signals;  /* 0x1a8 */
     bool              trace_enabled;    /* 0x1b0 */
     bool              gdb_enabled;      /* 0x1b1 */
     bool              single_step;      /* 0x1b2 */

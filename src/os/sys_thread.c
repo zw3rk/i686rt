@@ -78,16 +78,19 @@ static long sys_thread_raise(i686_ctx_t *target, int32_t sig)
     extern int i686_gsig_is_ignored(int signum);
     extern void i686_thread_registry_wake(i686_ctx_t *target);
     uint64_t bit;
+    uint64_t mask;
 
     if (sig == 0) {
         return 0; /* existence probe: kernel delivers nothing */
     }
     bit = (uint64_t)1U << (uint32_t)(sig - 1);
-    if ((target->sig_mask & bit) == 0ULL && i686_gsig_is_ignored(sig)) {
+    mask = __atomic_load_n(&target->sig_mask, __ATOMIC_SEQ_CST);
+    if ((mask & bit) == 0ULL && i686_gsig_is_ignored(sig)) {
         return 0;
     }
-    target->pending_signals |= bit;
-    if ((target->sig_mask & bit) == 0ULL) {
+    __atomic_fetch_or(&target->pending_signals, bit, __ATOMIC_SEQ_CST);
+    mask = __atomic_load_n(&target->sig_mask, __ATOMIC_SEQ_CST);
+    if ((mask & bit) == 0ULL) {
         i686_thread_registry_wake(target);
     }
     return 0;

@@ -134,6 +134,19 @@ int i686_thread_is_main(i686_ctx_t *ctx)
     return is_main;
 }
 
+/* Space check for r_clone: reserve the verdict before the child
+ * starts so a full table fails the clone instead of running a thread
+ * the registry cannot track. */
+static int thread_registry_has_space(void);
+static int thread_registry_has_space(void)
+{
+    int space;
+    (void)pthread_mutex_lock(&s_registry_lock);
+    space = (s_registry_n < I686_THREAD_REGISTRY_MAX);
+    (void)pthread_mutex_unlock(&s_registry_lock);
+    return space;
+}
+
 void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid);
 void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
 {
@@ -647,6 +660,15 @@ static int64_t r_clone(i686_ctx_t *ctx)
         return -ENOMEM;
     }
     memcpy(child, ctx, sizeof(*child));
+    /* A copied ctx must not inherit the parent's exit coordination: the
+     * child starts with no pending signals, no robust list, and a
+     * clear_child_tid only when CLONE_CHILD_CLEARTID was passed (else
+     * the child would clear the parent's TID word on exit). */
+    child->pending_signals = 0U;
+    child->robust_list_head = 0U;
+    child->robust_list_len = 0U;
+    child->clear_child_tid =
+        ((flags & I686_CLONE_CHILD_CLEARTID) != 0U) ? child_tid : 0U;
     /* C2-2: the parent's IBTC/RAS cache host pointers must not leak into
      * the child.  The child owns a separate __thread translation cache
      * and IBTC epoch space; an inherited {key, host_code, entry} tuple
@@ -693,8 +715,14 @@ static int64_t r_clone(i686_ctx_t *ctx)
     if ((flags & I686_CLONE_CHILD_SETTID) != 0U && child_tid != 0U) {
         ca->child_tid_va = child_tid;
     }
-    if ((flags & I686_CLONE_CHILD_CLEARTID) != 0U && child_tid != 0U) {
-        child->clear_child_tid = child_tid;
+    /* child->clear_child_tid was reset right after the memcpy above:
+     * present only when CLONE_CHILD_CLEARTID was passed. */
+
+    if (!thread_registry_has_space()) {
+        (void)pthread_mutex_destroy(&ca->mtx);
+        (void)pthread_cond_destroy(&ca->cond);
+        free(child); free(ca);
+        return -EAGAIN;
     }
 
 #ifndef I686RT_NO_DBT
