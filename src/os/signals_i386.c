@@ -99,6 +99,8 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
     i686_fpstate_32_t fp;
     uint32_t sp = ctx->gpr[I686_REG_ESP];
     uint32_t fp_va, frame_va;
+    uint32_t saved_sp = 0U, saved_flags = 0U, saved_size = 0U;
+    int disarm_altstack = 0;
     int i;
 
     if (ga == NULL || ga->handler == 0U || ga->handler == 1U) {
@@ -142,6 +144,12 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
         (ctx->altstack_flags & 0x2U /* SS_DISABLE */) == 0U &&
         (sp < ctx->altstack_sp ||
          sp >= ctx->altstack_sp + ctx->altstack_size)) {
+        if ((ctx->altstack_flags & 0x80000000U /* SS_AUTODISARM */) != 0U) {
+            saved_sp = ctx->altstack_sp;
+            saved_flags = ctx->altstack_flags;
+            saved_size = ctx->altstack_size;
+            disarm_altstack = 1;
+        }
         sp = ctx->altstack_sp + ctx->altstack_size;
         ctx->altstack_onstack = 1U; /* entered on the alternate stack */
     }
@@ -166,6 +174,11 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
     fp.cwd = ctx->fctrl;
     fp.swd = ctx->fstat;
     fp.twd = ctx->ftag;
+    fp.fip = ctx->fpu_ip;
+    fp.foo = ctx->fpu_dp;
+    fp.fop = ctx->fop;
+    fp.fpu_ip2 = ctx->fpu_ip;
+    fp.fpu_dp2 = ctx->fpu_dp;
     fp.mxcsr = ctx->mxcsr;
     /* D34 / I686-10: st_space is 8 x 10-byte x87 registers (80 bytes);
      * ctx->x87_st is 8 x 16-byte slots holding IEEE binary64 in default
@@ -301,6 +314,23 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
         (void)i686_copy_to_guest(ctx, frame_va, hdr, sizeof(hdr));
     }
 
+    /* SS_AUTODISARM delivery: the pre-delivery stack rides in
+     * uc.uc_stack and the live stack disarms for the handler's
+     * duration; sigreturn restores it from the frame. */
+    if (disarm_altstack != 0) {
+        if (sa_siginfo != 0) {
+            uint8_t ss[12];
+            memcpy(ss + 0U, &saved_sp, 4U);
+            memcpy(ss + 4U, &saved_flags, 4U);
+            memcpy(ss + 8U, &saved_size, 4U);
+            (void)i686_copy_to_guest(ctx, frame_va + 0x90U + 8U, ss,
+                                     sizeof ss);
+        }
+        ctx->altstack_sp = 0U;
+        ctx->altstack_size = 0U;
+        ctx->altstack_flags = 2U; /* SS_DISABLE */
+    }
+
     /* Kernel-contiguous handler entry (i386): esp = frame base;
      * [esp]=pretcode is the handler return address, [esp+4]=sig,
      * [esp+8]=pinfo, [esp+0xc]=puc — the frame fields ARE the args. */
@@ -341,6 +371,9 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
                           sc.ebp);
         }
     }
+    /* i386 ABI: DF=0 at handler entry; sc already holds the
+     * pre-delivery eflags. DF lives in eflags, not the lazy word. */
+    ctx->eflags &= ~I686_EF_DF;
     ctx->gpr[I686_REG_ESP] = frame_va;
     ctx->sig_last_frame_va = frame_va;
     ctx->sig_last_frame_rt = (uint32_t)sa_siginfo;
@@ -368,7 +401,7 @@ int i686_sigframe_build(i686_ctx_t *ctx, int sig, uint32_t handler,
 int i686_sigreturn(i686_ctx_t *ctx, int rt)
 {
     i686_sigcontext_t sc;
-    uint32_t base, frame;
+    uint32_t base, frame, was_onstack;
     extern int i686_sigtrace_on(void);
 
     /* The kernel locates the frame from the stack, not from bookkeeping
@@ -387,6 +420,7 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
         frame = ctx->sig_last_frame_va;
     }
     ctx->sig_last_frame_va = 0U;
+    was_onstack = ctx->altstack_onstack;
     ctx->altstack_onstack = 0U; /* sigreturn leaves the alternate stack */
     base = frame + (rt ? (0x90U + 20U) : 8U);
     if (i686_copy_from_guest(ctx, &sc, base, sizeof(sc)) != 0) {
@@ -410,6 +444,26 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
         }
         memcpy(&restored, m, sizeof(restored));
         __atomic_store_n(&ctx->sig_mask, restored, __ATOMIC_SEQ_CST);
+        /* SS_AUTODISARM: re-arm the pre-delivery stack saved in
+         * uc.uc_stack at delivery time. */
+        {
+            uint8_t ss[12];
+            uint32_t s_sp, s_flags, s_size;
+            if (i686_copy_from_guest(ctx, ss, frame + 0x90U + 8U,
+                                     sizeof(ss)) == 0) {
+                memcpy(&s_sp, ss + 0U, 4U);
+                memcpy(&s_flags, ss + 4U, 4U);
+                memcpy(&s_size, ss + 8U, 4U);
+                if ((s_flags & 0x80000000U) != 0U) {
+                    if (was_onstack == 0U) {
+                        s_flags &= ~1U; /* not on it: clear SS_ONSTACK */
+                    }
+                    ctx->altstack_sp = s_sp;
+                    ctx->altstack_flags = s_flags;
+                    ctx->altstack_size = s_size;
+                }
+            }
+        }
     } else {
         __atomic_store_n(&ctx->sig_mask, (uint64_t)sc.oldmask,
                          __ATOMIC_SEQ_CST);
@@ -447,6 +501,9 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
         i686_fpstate_32_t fp;
         if (i686_copy_from_guest(ctx, &fp, sc.fpstate, sizeof(fp)) == 0) {
             ctx->fctrl = fp.cwd; ctx->fstat = fp.swd; ctx->ftag = fp.twd;
+            ctx->fop = fp.fop;
+            ctx->fpu_ip = (fp.fpu_ip2 != 0U) ? fp.fpu_ip2 : fp.fip;
+            ctx->fpu_dp = (fp.fpu_dp2 != 0U) ? fp.fpu_dp2 : fp.foo;
             /* R7-21: phys_of() indexes the stack by ctx->x87_top, not
              * by the status word — resync TOP from SWD bits 11-13 or
              * every post-sigreturn access hits the wrong register. */

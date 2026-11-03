@@ -134,6 +134,9 @@ static long sys_rt_sigaction(i686_ctx_t *ctx, uint32_t sig, uint32_t act_va,
     if (sigsetsize != 8U || sig == 0U || sig > 64U) {
         return -EINVAL;
     }
+    if (act_va != 0U && (sig == 9U || sig == 19U)) {
+        return -EINVAL; /* SIGKILL/SIGSTOP dispositions are immutable */
+    }
     if (act_va != 0U) {
         if (guest_ptr_bad(act_va) ||
             i686_copy_from_guest(ctx, staged, act_va, sizeof staged) != 0) {
@@ -198,6 +201,7 @@ static long sys_rt_sigprocmask(i686_ctx_t *ctx, uint32_t how, uint32_t set_va,
     if (have_staged) {
         uint64_t m;
         memcpy(&m, staged, 8U);
+        m &= ~((1ULL << 8) | (1ULL << 18)); /* SIGKILL/SIGSTOP not blockable */
         switch (how) {
         case 0U: /* SIG_BLOCK */
             (void)__atomic_fetch_or(&ctx->sig_mask, m,
@@ -219,13 +223,19 @@ static long sys_rt_sigprocmask(i686_ctx_t *ctx, uint32_t how, uint32_t set_va,
 
 static long sys_rt_sigpending(i686_ctx_t *ctx, uint32_t set_va, uint32_t sigsetsize)
 {
-    uint8_t zeros[8] = { 0 };
+    uint8_t out[8];
 
     if (sigsetsize != 8U) {
         return -EINVAL;
     }
+    {
+        uint64_t pend =
+            __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) &
+            ctx->sig_mask;
+        memcpy(out, &pend, sizeof out);
+    }
     if (guest_ptr_bad(set_va) ||
-        i686_copy_to_guest(ctx, set_va, zeros, sizeof zeros) != 0) {
+        i686_copy_to_guest(ctx, set_va, out, sizeof out) != 0) {
         return -EFAULT;
     }
     return 0;
@@ -245,9 +255,23 @@ static long sys_sigaltstack(i686_ctx_t *ctx, uint32_t ss_va, uint32_t old_ss_va)
         old_flags |= 0x1U;
     }
     if (ss_va != 0U) {
+        uint32_t flags;
+        uint32_t size;
         if (guest_ptr_bad(ss_va) ||
             i686_copy_from_guest(ctx, staged, ss_va, sizeof staged) != 0) {
             return -EFAULT;
+        }
+        if (((ctx->altstack_flags & 1U) != 0U) ||
+            ctx->altstack_onstack != 0U) {
+            return -EPERM; /* already executing on the alternate stack */
+        }
+        flags = rd_le32(staged + 4U);
+        size = rd_le32(staged + 8U);
+        if ((flags & ~(2U | 0x80000000U)) != 0U) {
+            return -EINVAL; /* unknown ss_flags (incl. SS_ONSTACK input) */
+        }
+        if ((flags & 2U) == 0U && size < 2048U) {
+            return -ENOMEM; /* ss_size < MINSIGSTKSZ */
         }
         have_staged = 1;
     }
@@ -262,9 +286,16 @@ static long sys_sigaltstack(i686_ctx_t *ctx, uint32_t ss_va, uint32_t old_ss_va)
         }
     }
     if (have_staged) {
-        ctx->altstack_sp    = rd_le32(staged + 0U);
-        ctx->altstack_flags = rd_le32(staged + 4U);
-        ctx->altstack_size  = rd_le32(staged + 8U);
+        uint32_t flags = rd_le32(staged + 4U);
+        if ((flags & 2U) != 0U) {
+            ctx->altstack_sp    = 0U;
+            ctx->altstack_flags = 2U;
+            ctx->altstack_size  = 0U;
+        } else {
+            ctx->altstack_sp    = rd_le32(staged + 0U);
+            ctx->altstack_flags = flags;
+            ctx->altstack_size  = rd_le32(staged + 8U);
+        }
     }
     return 0;
 }
