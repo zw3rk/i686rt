@@ -593,12 +593,15 @@ static int64_t r_madvise(i686_ctx_t *ctx)
     bool mapped;
     int64_t r;
 
-    if (len == 0U || (addr & (uint32_t)(I686_PAGE_SIZE - 1U)) != 0U) {
+    if ((addr & (uint32_t)(I686_PAGE_SIZE - 1U)) != 0U) {
         return -EINVAL;
     }
-    end64 = (uint64_t)addr + (uint64_t)len;
-    if (end64 > 0x100000000ULL) {
-        return -EINVAL;
+    if (len == 0U) {
+        return 0;
+    }
+    end64 = (uint64_t)addr + rt32_page_align_up((uint64_t)len);
+    if (addr < I686_LOW_GUARD_SIZE || end64 > (uint64_t)I686_TASK_SIZE_TOP) {
+        return -ENOMEM;
     }
     rt32_vm_lock_acquire();
     rt32_vm_sync_from_ctx(ctx);
