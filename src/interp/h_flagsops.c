@@ -72,15 +72,7 @@ static int h_STC(i686_ctx_t *ctx, const x86_insn_t *insn)
     return flag_bit(ctx, insn, I686_EF_CF, true);
 }
 
-static int h_CLI(i686_ctx_t *ctx, const x86_insn_t *insn)
-{
-    return flag_bit(ctx, insn, I686_EF_IF, false);
-}
-
-static int h_STI(i686_ctx_t *ctx, const x86_insn_t *insn)
-{
-    return flag_bit(ctx, insn, I686_EF_IF, true);
-}
+/* R7-23: CLI/STI live in h_seg.c (CPL=3 #GP(0)); no local versions. */
 
 static int h_CLD(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
@@ -107,29 +99,68 @@ static int h_LAHF(i686_ctx_t *ctx, const x86_insn_t *insn)
     return step(ctx, insn);
 }
 
-/* Flat stack helpers: little-endian guest memory at gpr[ESP]. */
+/* R7-11: stack helpers run against SS (the old code omitted the SS
+ * base entirely) with the SS.B pointer width and limit checks. */
+extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                                unsigned bytes, unsigned write);
+
+static uint32_t stack_get_sp(i686_ctx_t *ctx)
+{
+    uint32_t esp = ctx->gpr[I686_REG_ESP];
+
+    return (ctx->ss_b != 0u) ? esp : (esp & 0xFFFFu);
+}
+
+static void stack_set_sp(i686_ctx_t *ctx, uint32_t sp)
+{
+    if (ctx->ss_b != 0u) {
+        ctx->gpr[I686_REG_ESP] = sp;
+    } else {
+        ctx->gpr[I686_REG_ESP] =
+            (ctx->gpr[I686_REG_ESP] & 0xFFFF0000u) | (sp & 0xFFFFu);
+    }
+}
+
 static void stack_push(i686_ctx_t *ctx, uint32_t val, unsigned width)
 {
     uint32_t bytes = width / 8U;
-    uint32_t sp = ctx->gpr[I686_REG_ESP] - bytes;
-    uint8_t *p = i686_guest_ptr(ctx, sp);
-    for (uint32_t i = 0U; i < bytes; i++) {
-        p[i] = (uint8_t)(val & 0xFFU);
-        val >>= 8U;
+    uint32_t sp = stack_get_sp(ctx) - bytes;
+    uint32_t linear;
+
+    if (ctx->ss_b == 0u) {
+        sp &= 0xFFFFu;
     }
-    ctx->gpr[I686_REG_ESP] = sp;
+    linear = ctx->seg_base[I686_SEG_SS] + sp;
+    i686_seg_check_data(ctx, I686_SEG_SS, linear, bytes, 1u);
+    {
+        uint8_t *p = i686_guest_ptr(ctx, linear);
+        for (uint32_t i = 0U; i < bytes; i++) {
+            p[i] = (uint8_t)(val & 0xFFU);
+            val >>= 8U;
+        }
+    }
+    stack_set_sp(ctx, sp);
 }
 
 static uint32_t stack_pop(i686_ctx_t *ctx, unsigned width)
 {
     uint32_t bytes = width / 8U;
-    uint32_t sp = ctx->gpr[I686_REG_ESP];
-    const uint8_t *p = i686_guest_ptr(ctx, sp);
+    uint32_t sp = stack_get_sp(ctx);
+    uint32_t linear;
+    const uint8_t *p;
     uint32_t val = 0U;
+    uint32_t next = sp + bytes;
+
+    if (ctx->ss_b == 0u) {
+        next &= 0xFFFFu;
+    }
+    linear = ctx->seg_base[I686_SEG_SS] + sp;
+    i686_seg_check_data(ctx, I686_SEG_SS, linear, bytes, 0u);
+    p = i686_guest_ptr(ctx, linear);
     for (uint32_t i = 0U; i < bytes; i++) {
         val |= (uint32_t)p[i] << (8U * i);
     }
-    ctx->gpr[I686_REG_ESP] = sp + bytes;
+    stack_set_sp(ctx, next);
     return val;
 }
 
@@ -165,8 +196,9 @@ void i686_interp_flagsops_register(void)
     i686_interp_register(I686_OP_CMC, h_CMC);
     i686_interp_register(I686_OP_CLC, h_CLC);
     i686_interp_register(I686_OP_STC, h_STC);
-    i686_interp_register(I686_OP_CLI, h_CLI);
-    i686_interp_register(I686_OP_STI, h_STI);
+    /* R7-23: CLI/STI are owned by h_seg.c (CPL=3 #GP(0)); registering
+     * them here would shadow the privilege check if init order changed,
+     * so this module deliberately leaves those two opcodes alone. */
     i686_interp_register(I686_OP_CLD, h_CLD);
     i686_interp_register(I686_OP_STD, h_STD);
     i686_interp_register(I686_OP_SAHF, h_SAHF);

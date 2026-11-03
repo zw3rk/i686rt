@@ -92,7 +92,7 @@ static int step(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 extern uint8_t x86_ea_seg(const x86_insn_t *insn);
 extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
-                                unsigned bytes);
+                                unsigned bytes, unsigned write);
 /* RC-U3 split lock + span validator (defined in src/dbt/aot/aot.c). */
 extern void i686_split_lock_acquire(void);
 extern void i686_split_lock_release(void);
@@ -112,24 +112,10 @@ static bool alu_mem_operand(const x86_insn_t *insn)
     return insn->modrm_mod != 3U && insn->ea_has != 0U;
 }
 
-static void *alu_locked_hva(i686_ctx_t *ctx, const x86_insn_t *insn,
-                            unsigned width)
-{
-    uint32_t ea = x86_ea_compute(ctx, insn);
-    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, width / 8U);
-    return i686_guest_ptr(ctx, ea);
-}
-
-static uint32_t mem_atomic_load_u(void *p, unsigned width)
-{
-    if (width == 8U) {
-        return __atomic_load_n((const uint8_t *)p, __ATOMIC_SEQ_CST);
-    }
-    if (width == 16U) {
-        return __atomic_load_n((const uint16_t *)p, __ATOMIC_SEQ_CST);
-    }
-    return __atomic_load_n((const uint32_t *)p, __ATOMIC_SEQ_CST);
-}
+/* LOCK/atomics helpers (h_alu_lock.c, split for the 900-line gate). */
+extern void *alu_locked_hva(i686_ctx_t *ctx, const x86_insn_t *insn,
+                            unsigned width);
+extern uint32_t mem_atomic_load_u(void *p, unsigned width);
 
 /* Unified fetch-op for the aligned LOCK path (every caller holds the
  * lane split lock; the hardware op stays atomic against DBT CASAL peers
@@ -168,44 +154,10 @@ static uint32_t mem_atomic_fetch_op(void *p, unsigned width, uint32_t v,
     }
 }
 
-static uint32_t mem_atomic_exchange_u(void *p, unsigned width, uint32_t v)
-{
-    if (width == 8U) {
-        return __atomic_exchange_n((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
-    }
-    if (width == 16U) {
-        return __atomic_exchange_n((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
-    }
-    return __atomic_exchange_n((uint32_t *)p, v, __ATOMIC_SEQ_CST);
-}
-
-/* RC-U3-r2 unified LOCK entry: every LOCK RMW holds the split lock (0 =
- * aligned __atomic_*, 1 = unaligned valid plain bytes, 2 = invalid span
- * plain unlocked); faults with the lock held release it in the catches. */
-static unsigned alu_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
-                               unsigned width)
-{
-    uint32_t ea = x86_ea_compute(ctx, insn);
-
-    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, width / 8U);
-    if (!i686_mem_is_unaligned(i686_guest_ptr(ctx, ea), width)) {
-        i686_split_lock_acquire(); /* unified: aligned no longer bypasses */
-        return 0U;
-    }
-    if (i686_span_mapped_writable(ctx, ea, width / 8U)) {
-        i686_split_lock_acquire();
-        return 1U;
-    }
-    return 2U;
-}
-
-/* Release the split lock when alu_lock_enter held it (how == 0 or 1). */
-static void alu_lock_leave(unsigned how)
-{
-    if (how != 2U) {
-        i686_split_lock_release();
-    }
-}
+extern uint32_t mem_atomic_exchange_u(void *p, unsigned width, uint32_t v);
+extern unsigned alu_lock_enter(i686_ctx_t *ctx, const x86_insn_t *insn,
+                               unsigned width);
+extern void alu_lock_leave(unsigned how);
 
 /* Strong CAS: true exactly when *p == expected (then *p = desired). */
 static bool mem_atomic_cas(void *p, unsigned width, uint32_t expected,
@@ -402,46 +354,40 @@ static int alu_exec(i686_ctx_t *ctx, const x86_insn_t *insn, alu_kind_t kind,
         break;
     }
 
+    /* R7-15: the result is computed first, the faultable store commits
+     * second, and flags publish last — a faulting store leaves the
+     * pre-instruction flags intact for the retry. */
     uint32_t res;
+    uint32_t adc_cf = 0U;
     bool writeback = true;
     switch (kind) {
     case ALU_ADD:
         res = (a + b) & mask;
-        i686_flags_add(ctx, a, b, width);
         break;
-    case ALU_ADC: {
-        uint32_t cf = (i686_flags_read(ctx) & I686_EF_CF) != 0U ? 1U : 0U;
-        res = (a + b + cf) & mask;
-        i686_flags_adc(ctx, a, b, cf, width);
+    case ALU_ADC:
+        adc_cf = (i686_flags_read(ctx) & I686_EF_CF) != 0U ? 1U : 0U;
+        res = (a + b + adc_cf) & mask;
         break;
-    }
     case ALU_AND:
         res = (a & b) & mask;
-        i686_flags_logic(ctx, res, width);
         break;
     case ALU_OR:
         res = (a | b) & mask;
-        i686_flags_logic(ctx, res, width);
         break;
     case ALU_XOR:
         res = (a ^ b) & mask;
-        i686_flags_logic(ctx, res, width);
         break;
     case ALU_TEST:
         res = (a & b) & mask;
-        i686_flags_logic(ctx, res, width);
         writeback = false;
         break;
-    case ALU_SBB: {
-        uint32_t cf = (i686_flags_read(ctx) & I686_EF_CF) != 0U ? 1U : 0U;
-        res = (a - b - cf) & mask;
-        i686_flags_sbb(ctx, a, b, cf, width);
+    case ALU_SBB:
+        adc_cf = (i686_flags_read(ctx) & I686_EF_CF) != 0U ? 1U : 0U;
+        res = (a - b - adc_cf) & mask;
         break;
-    }
     case ALU_SUB:
     case ALU_CMP:
         res = (a - b) & mask;
-        i686_flags_sub(ctx, a, b, width);
         writeback = (kind == ALU_SUB); /* CMP: no writeback */
         break;
     default: /* unreachable: kinds are exhaustive */
@@ -456,6 +402,29 @@ static int alu_exec(i686_ctx_t *ctx, const x86_insn_t *insn, alu_kind_t kind,
         } else {
             x86_reg_write(ctx, dst_reg, width, res);
         }
+    }
+    switch (kind) {
+    case ALU_ADD:
+        i686_flags_add(ctx, a, b, width);
+        break;
+    case ALU_ADC:
+        i686_flags_adc(ctx, a, b, adc_cf, width);
+        break;
+    case ALU_AND:
+    case ALU_OR:
+    case ALU_XOR:
+    case ALU_TEST:
+        i686_flags_logic(ctx, res, width);
+        break;
+    case ALU_SBB:
+        i686_flags_sbb(ctx, a, b, adc_cf, width);
+        break;
+    case ALU_SUB:
+    case ALU_CMP:
+        i686_flags_sub(ctx, a, b, width);
+        break;
+    default: /* unreachable: kinds are exhaustive */
+        break;
     }
     alu_lock_leave(how);
     return step(ctx, insn);
@@ -735,9 +704,24 @@ static int h_XCHG_eAXGv(i686_ctx_t *ctx, const x86_insn_t *insn)
     return step(ctx, insn);
 }
 
+/* R7-17: the architectural destination write cycle happens on either
+ * CMPXCHG outcome, so a mismatching compare against read-only memory
+ * must fault.  The probe writes back the value just read (invisible on
+ * writable memory, which takes no store here at all) before any flag
+ * or register commit, so the fault leaves pre-instruction state. */
+static void cmpxchg_probe_write(i686_ctx_t *ctx, const x86_insn_t *insn,
+                                unsigned width, uint32_t rmv)
+{
+    uint32_t ea = x86_ea_compute(ctx, insn);
+
+    if (!i686_span_mapped_writable(ctx, ea, width / 8U)) {
+        x86_rm_write(ctx, insn, width, rmv);
+    }
+}
+
 /* CMPXCHG r/m, r: compare the accumulator with r/m (flags as CMP); if
  * equal, r/m <- r; otherwise accumulator <- r/m.  The reg operand is never
- * written. */
+ * written.  R7-15: flags publish after the faultable store/probe. */
 static int cmpxchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
 {
     uint32_t mask = width_mask(width);
@@ -751,11 +735,13 @@ static int cmpxchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
             uint32_t src = x86_reg_read(ctx, insn->modrm_reg, width) & mask;
             for (;;) {
                 uint32_t rmv = mem_atomic_load_u(hva, width) & mask;
-                i686_flags_sub(ctx, acc, rmv, width);
                 if (acc != rmv) {
+                    cmpxchg_probe_write(ctx, insn, width, rmv);
+                    i686_flags_sub(ctx, acc, rmv, width);
                     x86_reg_write(ctx, I686_REG_EAX, width, rmv);
                     break;
                 }
+                i686_flags_sub(ctx, acc, rmv, width);
                 if (mem_atomic_cas(hva, width, rmv, src)) {
                     break;
                 }
@@ -766,11 +752,14 @@ static int cmpxchg_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
     }
     {
         uint32_t rmv = x86_rm_read(ctx, insn, width) & mask;
-        i686_flags_sub(ctx, acc, rmv, width);
         if (acc == rmv) {
             x86_rm_write(ctx, insn, width,
                          x86_reg_read(ctx, insn->modrm_reg, width) & mask);
-        } else {
+        } else if (alu_mem_operand(insn)) {
+            cmpxchg_probe_write(ctx, insn, width, rmv);
+        }
+        i686_flags_sub(ctx, acc, rmv, width);
+        if (acc != rmv) {
             x86_reg_write(ctx, I686_REG_EAX, width, rmv);
         }
     }
@@ -806,12 +795,18 @@ static int xadd_exec(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
             return step(ctx, insn);
         }
     }
-    {
-        uint32_t old_rm = x86_rm_read(ctx, insn, width) & mask;
-        i686_flags_add(ctx, old_rm, src, width);
+    /* R7-15: flags publish after the faultable store.  R7-18: when
+     * both operands name the same register, Intel order (TEMP=SRC+DEST;
+     * SRC=DEST; DEST=TEMP, DEST last) leaves the sum in the register —
+     * the naive second assignment would destroy it. */
+    uint32_t old_rm = x86_rm_read(ctx, insn, width) & mask;
+    if (insn->modrm_mod == 3U && insn->modrm_rm == insn->modrm_reg) {
+        x86_reg_write(ctx, insn->modrm_reg, width, (old_rm + src) & mask);
+    } else {
         x86_rm_write(ctx, insn, width, (old_rm + src) & mask);
         x86_reg_write(ctx, insn->modrm_reg, width, old_rm);
     }
+    i686_flags_add(ctx, old_rm, src, width);
     alu_lock_leave(how);
     return step(ctx, insn);
 }

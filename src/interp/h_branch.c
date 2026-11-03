@@ -82,23 +82,59 @@ static uint32_t mem_load(const i686_ctx_t *ctx, uint32_t va, unsigned width)
 }
 
 /* Near CALL/RET run against SS like PUSH/POP (h_mov.c): the stack
- * pointer is an offset from the SS base, wrapping in 32 bits. */
+ * pointer is an offset from the SS base.  R7-11: the pointer width
+ * follows SS.B (16-bit stacks wrap SP mod 64K, upper ESP preserved)
+ * and every access is SS-limit-checked. */
+extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                                unsigned bytes, unsigned write);
+
+static uint32_t stack_get_sp(i686_ctx_t *ctx)
+{
+    uint32_t esp = ctx->gpr[I686_REG_ESP];
+
+    return (ctx->ss_b != 0u) ? esp : (esp & 0xFFFFu);
+}
+
+static void stack_set_sp(i686_ctx_t *ctx, uint32_t sp)
+{
+    if (ctx->ss_b != 0u) {
+        ctx->gpr[I686_REG_ESP] = sp;
+    } else {
+        ctx->gpr[I686_REG_ESP] =
+            (ctx->gpr[I686_REG_ESP] & 0xFFFF0000u) | (sp & 0xFFFFu);
+    }
+}
+
 static void stack_push(i686_ctx_t *ctx, uint32_t val, unsigned width)
 {
     unsigned bytes = width / 8U;
-    uint32_t sp = ctx->gpr[I686_REG_ESP] - bytes; /* wraps in 32 bits */
+    uint32_t sp = stack_get_sp(ctx) - bytes;
+    uint32_t linear;
 
-    mem_store(ctx, ctx->seg_base[I686_SEG_SS] + sp, val, width);
-    ctx->gpr[I686_REG_ESP] = sp;
+    if (ctx->ss_b == 0u) {
+        sp &= 0xFFFFu;
+    }
+    linear = ctx->seg_base[I686_SEG_SS] + sp;
+    i686_seg_check_data(ctx, I686_SEG_SS, linear, bytes, 1u);
+    mem_store(ctx, linear, val, width);
+    stack_set_sp(ctx, sp);
 }
 
 static uint32_t stack_pop(i686_ctx_t *ctx, unsigned width)
 {
     unsigned bytes = width / 8U;
-    uint32_t sp = ctx->gpr[I686_REG_ESP];
-    uint32_t v = mem_load(ctx, ctx->seg_base[I686_SEG_SS] + sp, width);
+    uint32_t sp = stack_get_sp(ctx);
+    uint32_t linear;
+    uint32_t v;
+    uint32_t next = sp + bytes;
 
-    ctx->gpr[I686_REG_ESP] = sp + bytes;
+    if (ctx->ss_b == 0u) {
+        next &= 0xFFFFu;
+    }
+    linear = ctx->seg_base[I686_SEG_SS] + sp;
+    i686_seg_check_data(ctx, I686_SEG_SS, linear, bytes, 0u);
+    v = mem_load(ctx, linear, width);
+    stack_set_sp(ctx, next);
     return v;
 }
 
@@ -328,7 +364,16 @@ static int h_hlt(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_wait(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    ctx->eip = next_eip_of(ctx, insn); /* fwait: no-op in v1 */
+    /* R7-30: WAIT checks for a pending unmasked x87 exception
+     * (#MF, EIP stays at the WAIT); otherwise it is a no-op. */
+    if ((ctx->fstat & 0x80U) != 0U) {
+        extern void i686_fault_sig_record(int sig);
+
+        ctx->exit_arg = 16U; /* #MF trapno */
+        i686_fault_sig_record(8); /* SIGFPE */
+        return I686_EXIT_FAULT;
+    }
+    ctx->eip = next_eip_of(ctx, insn);
     return I686_INTERP_CONTINUE;
 }
 
@@ -379,6 +424,12 @@ void i686_interp_branch_init(void)
     i686_interp_register(I686_OP_IRET, h_iret);
     i686_interp_register(I686_OP_HLT, h_hlt);
     i686_interp_register(I686_OP_WAIT, h_wait);
+    {
+        /* R7-30: WAIT joins the FP ops for the pending-#MF check. */
+        extern void i686_interp_mark_fp(uint16_t op);
+
+        i686_interp_mark_fp(I686_OP_WAIT);
+    }
     i686_interp_register(I686_OP_UD2, h_ud2);
     i686_interp_register(I686_OP_SYSENTER, h_sysenter);
     i686_interp_register(I686_OP_NOP, h_nop);

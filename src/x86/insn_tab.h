@@ -228,10 +228,10 @@ typedef enum {
     I686_OP_FILD_m64, I686_OP_FCOMIP, I686_OP_FISTP_m64, I686_OP_FXSAVE,
     I686_OP_FXRSTOR, I686_OP_SFENCE, I686_OP_FISTTP_m32, I686_OP_FISTTP_m64,
     I686_OP_FISTTP_m16, I686_OP_FNSAVE, I686_OP_FCOM_STi, I686_OP_FUCOM_STi,
-    I686_OP_FCOMP_STi,
+    I686_OP_FCOMP_STi, I686_OP_FCMOV_STi,
 } i686_op_t;
 
-#define I686_OP_COUNT 367u /* including I686_OP_INVALID */
+#define I686_OP_COUNT 368u /* including I686_OP_INVALID */
 
 /* Per-opcode descriptor (frozen in docs/lanes/phase-1.md). */
 typedef struct {

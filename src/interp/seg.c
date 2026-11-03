@@ -73,6 +73,7 @@ void i686_seg_init(i686_ctx_t *ctx)
     ctx->ldt = st;
     ctx->ldt_entries = I686_LDT_ENTRIES;
     ctx->cs_d = 1u; /* flat process default (phase-7.md freeze) */
+    ctx->ss_b = 1u; /* R7-11: flat stack default follows SS */
 }
 
 /* Lazy state accessor: flat processes never pay for the descriptor
@@ -113,6 +114,14 @@ static void desc_flat_data(i686_desc_t *d)
     d->flags = I686_DESC_PRESENT;
 }
 
+/* R7-8: the null selector is index 0 with TI=0 (sel 0..3, RPL
+ * ignored); loads into data regs succeed, use faults later, loads into
+ * CS/SS fault now (enforced in seg_load). */
+static unsigned is_null_sel(uint16_t sel)
+{
+    return (sel & 0xFFFCu) == 0u;
+}
+
 int i686_seg_lookup(const i686_ctx_t *ctx, uint16_t sel, i686_desc_t *out)
 {
     uint32_t idx;
@@ -121,7 +130,7 @@ int i686_seg_lookup(const i686_ctx_t *ctx, uint16_t sel, i686_desc_t *out)
         return SEG_F_GP;
     }
     memset(out, 0, sizeof(*out));
-    if (sel == 0u) {
+    if (is_null_sel(sel)) {
         return SEG_F_OK; /* null: zero descriptor, use faults later */
     }
     idx = (uint32_t)sel >> 3;
@@ -171,10 +180,14 @@ int i686_seg_lookup(const i686_ctx_t *ctx, uint16_t sel, i686_desc_t *out)
         out->flags = I686_DESC_PRESENT;
         return SEG_F_OK;
     }
+    /* R7-8: only the known flat aliases exist (idx 4 = __USER_CS, idx 5
+     * = flat data); any other nonzero GDT index is nonexistent -> #GP. */
     if (idx == 4u) {
         desc_flat_code(out);
-    } else {
+    } else if (idx == 5u) {
         desc_flat_data(out);
+    } else {
+        return SEG_F_GP;
     }
     return SEG_F_OK;
 }
@@ -199,7 +212,13 @@ int i686_seg_load(i686_ctx_t *ctx, unsigned reg, uint16_t sel)
     if (f != SEG_F_OK) {
         return f;
     }
-    if (sel != 0u) {
+    /* R7-8: a null selector never loads into CS/SS (#GP(0)); data
+     * registers accept it and fault on use. */
+    if (is_null_sel(sel)) {
+        if (reg == I686_SEG_CS || reg == I686_SEG_SS) {
+            return SEG_F_GP;
+        }
+    } else {
         bool code = ((d.type & 0x18u) == 0x18u);
         bool system = ((d.type & 0x10u) == 0u);
 
@@ -242,9 +261,12 @@ int i686_seg_load(i686_ctx_t *ctx, unsigned reg, uint16_t sel)
     }
 
     ctx->seg_sel[reg] = sel;
-    ctx->seg_base[reg] = (sel == 0u) ? 0u : d.base;
+    ctx->seg_base[reg] = is_null_sel(sel) ? 0u : d.base;
     if (reg == I686_SEG_CS) {
         ctx->cs_d = (d.d_bit != 0u) ? 1u : 0u; /* D8: default size follows CS */
+    }
+    if (reg == I686_SEG_SS) {
+        ctx->ss_b = (d.d_bit != 0u) ? 1u : 0u; /* R7-11: stack size follows SS */
     }
     return SEG_F_OK;
 }
@@ -278,6 +300,42 @@ bool i686_seg_flat_cs(const i686_ctx_t *ctx)
     return ctx->seg_sel[I686_SEG_CS] == 0x23u;
 }
 
+/* R7-9: DBT eligibility covers every segment assumption the emitted code
+ * bakes in (emitted accesses skip limit/null checks): flat CS (the
+ * existing rule), GDT-only data selectors, non-null stack/data
+ * selectors, and a 32-bit stack.  Anything else runs in the
+ * interpreter until equivalent checks exist in emitted code. */
+bool i686_seg_dbt_eligible(const i686_ctx_t *ctx)
+{
+    static const uint8_t regs[] = {
+        I686_SEG_DS, I686_SEG_ES, I686_SEG_SS, I686_SEG_FS, I686_SEG_GS
+    };
+    unsigned i;
+
+    if (!i686_seg_flat_cs(ctx)) {
+        return false;
+    }
+    if (ctx->ss_b == 0u) {
+        return false; /* R7-11: 16-bit stacks are interpreter-only */
+    }
+    for (i = 0u; i < sizeof(regs); i++) {
+        i686_desc_t d;
+        uint16_t sel = ctx->seg_sel[regs[i]];
+        if ((sel & 0x4u) != 0u) {
+            return false; /* LDT-limited: interpreter enforces limits */
+        }
+        /* R7-8: null uses fault and invalid selectors fail their next
+         * use in the interpreter; emitted code checks neither. */
+        if (is_null_sel(sel)) {
+            return false;
+        }
+        if (i686_seg_lookup(ctx, sel, &d) != SEG_F_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Data-limit enforcement (LDT selectors; decode.c EA path)            */
 /* ------------------------------------------------------------------ */
@@ -296,17 +354,22 @@ bool i686_seg_flat_cs(const i686_ctx_t *ctx)
  * Either way execution never returns: the interpreter resumes at the
  * guest handler with EIP at the faulting instruction.
  */
-static void raise_limit_fault(i686_ctx_t *ctx, uint32_t linear)
+static void raise_seg_fault(i686_ctx_t *ctx, uint32_t linear, uint32_t trapno)
 {
-    ctx->exit_arg = 13u; /* #GP trapno; nonzero -> deliver_sync: SIGSEGV */
+    ctx->exit_arg = trapno; /* nonzero -> deliver_sync: SIGSEGV */
     ctx->fault_addr = linear;
     ctx->exit_dest = 0u; /* error code 0 (SDM: limit violation = #GP(0)) */
     (void)*(volatile uint8_t *)i686_guest_ptr(ctx, linear);
     (void)*(volatile uint8_t *)i686_guest_ptr(ctx, 0u);
 }
 
+static void raise_limit_fault(i686_ctx_t *ctx, uint32_t linear)
+{
+    raise_seg_fault(ctx, linear, 13u); /* #GP trapno */
+}
+
 void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
-                         unsigned bytes)
+                         unsigned bytes, unsigned write)
 {
     uint16_t sel;
     i686_desc_t d;
@@ -316,16 +379,41 @@ void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
         return;
     }
     sel = ctx->seg_sel[seg];
+    if (is_null_sel(sel)) {
+        raise_limit_fault(ctx, linear); /* R7-8: null use is #GP(0) */
+        return;
+    }
     if ((sel & 0x4u) == 0u) {
         return; /* GDT/flat: v1-compatible, never limit-checked (D8) */
     }
-    if (i686_seg_lookup(ctx, sel, &d) != SEG_F_OK) {
-        return; /* load-time validation already covered #NP */
+    {
+        int f = i686_seg_lookup(ctx, sel, &d);
+        if (f != SEG_F_OK) {
+            /* Load-time validation normally covers this, but the blind
+             * sigcontext reload can install an invalid selector, which
+             * faults on its next use (R7-8) — #NP for not-present LDT
+             * entries, #GP otherwise. */
+            raise_seg_fault(ctx, linear, (f == SEG_F_NP) ? 11u : 13u);
+            return;
+        }
+    }
+    /* R7-9: writes need a writable data segment; code segments (even
+     * readable ones loaded into data regs) never accept writes. */
+    if (write != 0u) {
+        if (((d.type & 0x08u) != 0u) || ((d.type & 0x02u) == 0u)) {
+            raise_limit_fault(ctx, linear);
+            return;
+        }
     }
     off = linear - ctx->seg_base[seg];
-    if ((d.type & 0x18u) == 0u && (d.type & 0x04u) != 0u) {
-        /* expand-down data: valid offsets are >= limit */
-        if (off < d.limit) {
+    /* R7-10: expand-down is E set on a data descriptor (the stored type
+     * folds in bit 0x10, so the old 0x18 mask never matched).  Valid
+     * offsets are (limit, upper] with the upper bound from D/B, and the
+     * whole access extent must fit. */
+    if (((d.type & 0x08u) == 0u) && ((d.type & 0x04u) != 0u)) {
+        uint32_t upper = (d.d_bit != 0u) ? 0xFFFFFFFFu : 0xFFFFu;
+        uint64_t last = (uint64_t)off + (uint64_t)bytes - 1u;
+        if (off <= d.limit || last > (uint64_t)upper) {
             raise_limit_fault(ctx, linear);
         }
         return;
@@ -333,6 +421,16 @@ void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
     if (d.limit < (uint32_t)(bytes - 1u) ||
         off > d.limit - (uint32_t)(bytes - 1u)) {
         raise_limit_fault(ctx, linear);
+    }
+}
+
+/* R7-43: instruction-specific alignment (#GP(0) before any memory or
+ * architectural-state side effect).  Aligned SIMD moves (MOVAPS,
+ * MOVAPD, MOVDQA) and FXSAVE/FXRSTOR require 16-byte operands. */
+void i686_seg_check_align(i686_ctx_t *ctx, uint32_t linear, unsigned align)
+{
+    if (align > 1u && (linear & (uint32_t)(align - 1u)) != 0u) {
+        raise_seg_fault(ctx, linear, 13u); /* #GP(0) */
     }
 }
 

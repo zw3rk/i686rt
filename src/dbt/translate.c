@@ -333,9 +333,18 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
         /* Category dispatch (lane modules). Order matters only for
          * testing; ids are disjoint. */
         if (insn->pfx_lock != 0U) {
-            extern int i686_emit_atomic(i686_emit_ctx_t *,
-                                        const x86_insn_t *);
-            rc = i686_emit_atomic(&e, insn);
+            /* R7-7: illegal LOCK forms never reach the emitters (which
+             * would lower them to plain non-atomic code); the block
+             * ends with UNDEF and the interpreter delivers #UD. */
+            if (!x86_lock_legal(insn)) {
+                i686_emit_exit(&e, I686_EXIT_UNDEF, insn->len, pc);
+                break;
+            }
+            {
+                extern int i686_emit_atomic(i686_emit_ctx_t *,
+                                            const x86_insn_t *);
+                rc = i686_emit_atomic(&e, insn);
+            }
         } else {
             rc = i686_emit_alu(&e, insn);
         }

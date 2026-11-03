@@ -15,6 +15,7 @@
 #include "i686rt.h"
 #include "interp/flags.h"
 #include "interp/interp.h"
+#include "interp/seg.h"
 #include "interp/x87.h"
 #include "interp/x87_80.h"
 #include "x86/decode.h"
@@ -36,6 +37,10 @@
 #define SW_C2 0x0400U
 #define SW_C3 0x4000U
 #define SW_CC_MASK (SW_C0 | SW_C1 | SW_C2 | SW_C3)
+#define SW_SF 0x40U /* stack fault */
+#define SW_ES 0x80U /* error summary */
+#define SW_B 0x8000U /* FPU busy */
+#define X87_SRC_EMPTY 1 /* x87_val_src: empty but masked (substitute) */
 
 /* Shared epilogue: advance EIP, continue (frozen handler contract). */
 static inline int done(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -51,6 +56,117 @@ static inline int undef_form(i686_ctx_t *ctx, const x86_insn_t *insn)
     (void)ctx;
     (void)insn;
     return I686_EXIT_UNDEF;
+}
+
+/* R7-31: checked push (x87.c): the destination tag is validated
+ * before TOP moves.  Overflow sets IE + SF with C1=1; unmasked
+ * records #MF and returns FAULT with state unchanged; masked
+ * proceeds (circular stack). */
+int x87_push_checked(i686_ctx_t *ctx);
+
+/* R7-31: stack-operand validation.  Checks ST(i) BEFORE the op
+ * reads it: nonempty returns CONTINUE.  Empty sets IE + SF with
+ * C1=0; unmasked records #MF and returns FAULT (no state change);
+ * masked returns X87_SRC_EMPTY so the caller substitutes the
+ * indefinite operand (quiet NaN / x87_80_nan image) and runs on. */
+static inline int x87_val_src(i686_ctx_t *ctx, unsigned i)
+{
+    extern void i686_fault_sig_record(int sig);
+    unsigned p = ((unsigned)ctx->x87_top + i) & 7U;
+
+    if ((((unsigned)ctx->ftag >> (p * 2U)) & 3U) != 3U) {
+        return I686_INTERP_CONTINUE;
+    }
+    ctx->fstat = (uint16_t)((ctx->fstat | SW_IE | SW_SF) & ~SW_C1);
+    if ((SW_IE & ~(unsigned)ctx->fctrl & 0x3fU) != 0U) {
+        ctx->fstat = (uint16_t)(ctx->fstat | SW_ES | SW_B);
+        ctx->exit_arg = 16U; /* #MF trapno */
+        i686_fault_sig_record(8); /* SIGFPE */
+        return I686_EXIT_FAULT;
+    }
+    return X87_SRC_EMPTY;
+}
+
+/* R7-31: stage the indefinite value in ST(i) WITHOUT touching
+ * tags (the slot stays empty): the op below consumes it as its
+ * masked-underflow operand, so NaN propagation yields the masked
+ * response (indefinite result, unordered compare, indefinite
+ * store) with no per-op substitute plumbing. */
+static inline void x87_stage_indef(i686_ctx_t *ctx, unsigned i)
+{
+    unsigned p = ((unsigned)ctx->x87_top + i) & 7U;
+
+    if (!ctx->x87_80) {
+        double q = (double)NAN;
+
+        memcpy(&ctx->x87_st[p][0], &q, 8);
+    } else {
+        x87_80_nan(&ctx->x87_st[p][0], false, false);
+    }
+}
+
+/* R7-31: validate-and-stage one stack source.  Nonempty returns
+ * CONTINUE.  Empty-masked stages the indefinite operand and
+ * returns CONTINUE; empty-unmasked returns FAULT (no state change
+ * beyond IE/SF).  Callers check each stack operand before reading:
+ *   if (x87_src(ctx, i)) return I686_EXIT_FAULT; */
+static inline int x87_src(i686_ctx_t *ctx, unsigned i)
+{
+    int v = x87_val_src(ctx, i);
+
+    if (v == X87_SRC_EMPTY) {
+        x87_stage_indef(ctx, i);
+        return I686_INTERP_CONTINUE;
+    }
+    return v;
+}
+
+/* R7-31: post-helper check for void push paths (FILD): entry ES
+ * is guaranteed clear by the dispatch checks, so a set ES means
+ * the push just raised unmasked overflow (store inhibited
+ * inside).  Returns FAULT with EIP at the instruction. */
+static inline int x87_es_fault(i686_ctx_t *ctx)
+{
+    extern void i686_fault_sig_record(int sig);
+
+    if ((ctx->fstat & SW_ES) == 0U) {
+        return I686_INTERP_CONTINUE;
+    }
+    ctx->exit_arg = 16U; /* #MF trapno */
+    i686_fault_sig_record(8); /* SIGFPE */
+    return I686_EXIT_FAULT;
+}
+
+/* R7-30: FP-op marking for the interpreter's pending-#MF check
+ * (owned by interp.c).  The x87 init functions register through
+ * fp_reg so every FP/WAIT opcode carries the mark. */
+void i686_interp_mark_fp(uint16_t op);
+
+static inline void fp_reg(uint16_t op, i686_interp_fn fn)
+{
+    i686_interp_register(op, fn);
+    i686_interp_mark_fp(op);
+}
+
+/* R7-30: raise-and-check.  Sets exc, then faults #MF (SIGFPE)
+ * when an unmasked exception is pending — which the dispatch checks
+ * (interp.c) keep clear at FP entry, so a set ES means this op just
+ * raised one.  The caller places this BEFORE its store/pop and
+ * returns the fault with EIP at the instruction (stores/pops
+ * inhibited); masked status continues to done().  With exc == 0 it
+ * is a pure post-computation check for value helpers (d_*) that set
+ * status internally. */
+static inline int x87_exc_raise(i686_ctx_t *ctx, unsigned exc)
+{
+    extern void i686_fault_sig_record(int sig);
+
+    x87_set_exc(ctx, exc);
+    if ((ctx->fstat & 0x80U) != 0U) {
+        ctx->exit_arg = 16U; /* #MF trapno */
+        i686_fault_sig_record(8); /* SIGFPE */
+        return I686_EXIT_FAULT;
+    }
+    return I686_INTERP_CONTINUE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -130,17 +246,16 @@ static inline int cc_of_cmp(double a, double b, i686_ctx_t *ctx)
     return 0;
 }
 
-/* COM raises IE on any NaN; UCOM only on SNaN (v1 flag discipline; no
- * traps are delivered). */
-static inline void exc_ie_cmp(i686_ctx_t *ctx, double a, double b, int unordered,
-                              bool ucom)
+/* COM raises IE on any NaN; UCOM only on SNaN (R7-30: checked —
+ * an unmasked raise faults, inhibiting the caller's pop). */
+static inline int exc_ie_cmp(i686_ctx_t *ctx, double a, double b, int unordered,
+                             bool ucom)
 {
     if (!unordered) {
-        return;
+        return I686_INTERP_CONTINUE;
     }
     if (!ucom) {
-        x87_set_exc(ctx, SW_IE);
-        return;
+        return x87_exc_raise(ctx, SW_IE);
     }
     {
         uint64_t ba, bb;
@@ -151,15 +266,21 @@ static inline void exc_ie_cmp(i686_ctx_t *ctx, double a, double b, int unordered
              (ba & 0x0008000000000000ULL) == 0U) ||
             (isnan(b) && (bb & 0x0007ffffffffffffULL) != 0U &&
              (bb & 0x0008000000000000ULL) == 0U)) {
-            x87_set_exc(ctx, SW_IE);
+            return x87_exc_raise(ctx, SW_IE);
         }
     }
+    return I686_INTERP_CONTINUE;
 }
 
 /* ------------------------------------------------------------------ */
 /* Default-mode double arithmetic with CW RC (exact-residual tricks)   */
 /* ------------------------------------------------------------------ */
 
+/* R7-39: all four rounding directions with exactness at zero.
+ * err is the exact residual (true value = s + err, |err| < 1 ulp):
+ * a nonzero err on the rounding side steps one ulp, otherwise s is
+ * already correctly rounded.  Zero is signed: +tiny rounds to +0.0
+ * or -0.0 according to direction, never across the zero. */
 static inline double d_round_rc(i686_ctx_t *ctx, double s, double err)
 {
     unsigned rc = x87_round_mode(ctx);
@@ -167,27 +288,62 @@ static inline double d_round_rc(i686_ctx_t *ctx, double s, double err)
     if (err == 0.0 || isnan(s) || isinf(s)) {
         return s;
     }
-    if (rc == 1U && err < 0.0) {
-        return nextafter(s, -INFINITY);
-    }
-    if (rc == 2U && err > 0.0) {
-        return nextafter(s, INFINITY);
-    }
-    if (rc == 3U) {
-        if (s > 0.0 && err < 0.0) {
+    if (rc == 1U) {
+        /* Toward -inf: a low true value steps down (this also
+         * carries +0.0 to -0.0); a high true value landing on
+         * -0.0 steps up to +0.0. */
+        if (err < 0.0) {
             return nextafter(s, -INFINITY);
         }
-        if (s < 0.0 && err > 0.0) {
+        if (err > 0.0 && s == 0.0 && signbit(s) != 0) {
             return nextafter(s, INFINITY);
         }
+        return s;
     }
-    return s;
+    if (rc == 2U) {
+        /* Toward +inf: mirror image (+0.0 with a low true value
+         * steps down to -0.0). */
+        if (err > 0.0) {
+            return nextafter(s, INFINITY);
+        }
+        if (err < 0.0 && s == 0.0 && signbit(s) == 0) {
+            return nextafter(s, -INFINITY);
+        }
+        return s;
+    }
+    if (rc == 3U) {
+        /* Toward zero, signed by signbit so +tiny truncates to
+         * +0.0 and -tiny to -0.0. */
+        if (signbit(s) == 0) {
+            if (err < 0.0) {
+                return nextafter(s, -INFINITY);
+            }
+        } else if (err > 0.0) {
+            return nextafter(s, INFINITY);
+        }
+        return s;
+    }
+    return s; /* rc == 0: the host already rounds to nearest-even */
+}
+
+/* Quiet-bit test for a double SNaN (mirrors the UCOM branch of
+ * exc_ie_cmp below). */
+static inline int d_is_snan(double d)
+{
+    uint64_t bits;
+
+    memcpy(&bits, &d, 8);
+    return isnan(d) && (bits & 0x0007ffffffffffffULL) != 0U &&
+           (bits & 0x0008000000000000ULL) == 0U;
 }
 
 static inline void d_exc(i686_ctx_t *ctx, double a, double b, double s, double err)
 {
     if (isnan(s)) {
-        if (isnan(a) || isnan(b)) {
+        /* R7-44: a NaN result is invalid when an input signals
+         * (SNaN) or when no input is NaN at all (Inf-Inf, Inf*0,
+         * Inf/Inf); quiet inputs propagate without IE. */
+        if (d_is_snan(a) || d_is_snan(b) || (!isnan(a) && !isnan(b))) {
             x87_set_exc(ctx, SW_IE);
         }
         return;
@@ -241,12 +397,15 @@ static inline double d_div(i686_ctx_t *ctx, double a, double b)
     double err;
 
     if (b == 0.0 && !isnan(a)) {
-        x87_set_exc(ctx, SW_ZE);
+        /* R7-44: 0/0 and Inf/0 are invalid (indefinite QNaN),
+         * not zero-divide; only a finite nonzero dividend
+         * divides by zero to signed infinity. */
         if (a == 0.0 || isinf(a)) {
             x87_set_exc(ctx, SW_IE);
+            return (double)NAN;
         }
-        return a == 0.0 ? (double)NAN : copysign(HUGE_VAL, copysign(1.0, a) *
-                                                           copysign(1.0, b));
+        x87_set_exc(ctx, SW_ZE);
+        return copysign(HUGE_VAL, copysign(1.0, a) * copysign(1.0, b));
     }
     err = (isfinite(a) && isfinite(b) && !isinf(s)) ? fma(-s, b, a) : 0.0;
     {
@@ -314,9 +473,13 @@ static inline unsigned x80calc(i686_ctx_t *ctx, unsigned kind, uint8_t out[10],
 /* Loads / stores                                                      */
 /* ------------------------------------------------------------------ */
 
-static inline void push_f32(i686_ctx_t *ctx, float f)
+/* R7-31: checked pushes (overflow validated before TOP moves;
+ * the caller returns the fault with EIP at the instruction). */
+static inline int push_f32(i686_ctx_t *ctx, float f)
 {
-    x87_push(ctx);
+    if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     if (ctx->x87_80) {
         uint8_t b[10];
 
@@ -325,11 +488,14 @@ static inline void push_f32(i686_ctx_t *ctx, float f)
     } else {
         x87_set_f64(ctx, 0, (double)f);
     }
+    return I686_INTERP_CONTINUE;
 }
 
-static inline void push_f64(i686_ctx_t *ctx, double d)
+static inline int push_f64(i686_ctx_t *ctx, double d)
 {
-    x87_push(ctx);
+    if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     if (ctx->x87_80) {
         uint8_t b[10];
 
@@ -338,6 +504,7 @@ static inline void push_f64(i686_ctx_t *ctx, double d)
     } else {
         x87_set_f64(ctx, 0, d);
     }
+    return I686_INTERP_CONTINUE;
 }
 
 static inline void push_int(i686_ctx_t *ctx, int64_t v)
@@ -346,11 +513,16 @@ static inline void push_int(i686_ctx_t *ctx, int64_t v)
 }
 
 /* CW-RC-aware double -> float for FST m32 (default mode). */
+/* R7-39: directed float32 conversion with exactness at zero
+ * (+tiny truncates to +0.0, not +denormal; -tiny to -0.0). */
 static inline float d_to_f32_rc(i686_ctx_t *ctx, double d)
 {
     float f = (float)d;
     unsigned rc = x87_round_mode(ctx);
 
+    if (isnan(d) || isinf(d)) {
+        return f;
+    }
     if (rc == 1U) {
         if ((double)f > d) {
             f = nextafterf(f, -INFINITY);
@@ -360,8 +532,10 @@ static inline float d_to_f32_rc(i686_ctx_t *ctx, double d)
             f = nextafterf(f, INFINITY);
         }
     } else if (rc == 3U) {
-        if ((double)f > d) {
-            f = nextafterf(f, -INFINITY);
+        if (signbit(d) == 0) {
+            if ((double)f > d) {
+                f = nextafterf(f, -INFINITY);
+            }
         } else if ((double)f < d) {
             f = nextafterf(f, INFINITY);
         }
@@ -369,7 +543,9 @@ static inline float d_to_f32_rc(i686_ctx_t *ctx, double d)
     return f;
 }
 
-static inline void st_f32(i686_ctx_t *ctx, uint32_t va)
+/* R7-30: checked (an unmasked raise inhibits the memory store;
+ * the caller inhibits its pop on a fault return). */
+static inline int st_f32(i686_ctx_t *ctx, uint32_t va)
 {
     float f;
 
@@ -380,7 +556,9 @@ static inline void st_f32(i686_ctx_t *ctx, uint32_t va)
         x80_set_mode(ctx, 0);
         x87_get_ext80(ctx, 0, b);
         exc = x87_80_to_f32(b, &f);
-        x87_set_exc(ctx, exc);
+        if (x87_exc_raise(ctx, exc) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
     } else {
         f = d_to_f32_rc(ctx, x87_get_f64(ctx, 0));
     }
@@ -390,9 +568,11 @@ static inline void st_f32(i686_ctx_t *ctx, uint32_t va)
         memcpy(&bits, &f, 4);
         mem_wr(ctx, va, 4, bits);
     }
+    return I686_INTERP_CONTINUE;
 }
 
-static inline void st_f64(i686_ctx_t *ctx, uint32_t va)
+/* R7-30: checked, as above. */
+static inline int st_f64(i686_ctx_t *ctx, uint32_t va)
 {
     double d;
 
@@ -403,7 +583,9 @@ static inline void st_f64(i686_ctx_t *ctx, uint32_t va)
         x80_set_mode(ctx, 0);
         x87_get_ext80(ctx, 0, b);
         exc = x87_80_to_f64(b, &d);
-        x87_set_exc(ctx, exc);
+        if (x87_exc_raise(ctx, exc) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
     } else {
         d = x87_get_f64(ctx, 0);
     }
@@ -413,6 +595,7 @@ static inline void st_f64(i686_ctx_t *ctx, uint32_t va)
         memcpy(&bits, &d, 8);
         mem_wr(ctx, va, 8, bits);
     }
+    return I686_INTERP_CONTINUE;
 }
 
 static inline void st_m80(i686_ctx_t *ctx, uint32_t va)
@@ -425,36 +608,52 @@ static inline void st_m80(i686_ctx_t *ctx, uint32_t va)
     }
 }
 
-static inline void st_int(i686_ctx_t *ctx, uint32_t va, unsigned bytes)
+/* R7-26: status-returning conversion (x87.c; kept out of frozen
+ * x87.h).  Narrow-width overflow is detected here so FIST m16/m32 of
+ * an out-of-range value stores the indefinite integer with IE. */
+int64_t x87_get_int_exc(const i686_ctx_t *ctx, unsigned i, unsigned rc,
+                        unsigned *exc);
+
+static inline int st_int_checked(i686_ctx_t *ctx, uint32_t va,
+                                  unsigned bytes, unsigned rc)
 {
-    int64_t v = x87_get_int(ctx, 0);
+    unsigned exc;
+    int64_t v = x87_get_int_exc(ctx, 0, rc, &exc);
     uint64_t out;
 
     if (bytes == 2) {
-        out = (v < -32768 || v > 32767) ? 0x8000U : (uint64_t)v & 0xffffU;
+        if (v < -32768 || v > 32767) {
+            out = 0x8000U;
+            exc |= SW_IE;
+        } else {
+            out = (uint64_t)v & 0xffffU;
+        }
     } else if (bytes == 4) {
-        out = (v < -2147483648LL || v > 2147483647LL) ? 0x80000000U
-                                                      : (uint64_t)v & 0xffffffffU;
+        if (v < -2147483648LL || v > 2147483647LL) {
+            out = 0x80000000U;
+            exc |= SW_IE;
+        } else {
+            out = (uint64_t)v & 0xffffffffU;
+        }
     } else {
         out = (uint64_t)v;
     }
+    /* R7-30: an unmasked raise inhibits the memory store. */
+    if (x87_exc_raise(ctx, exc) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     mem_wr(ctx, va, bytes, out);
+    return I686_INTERP_CONTINUE;
 }
 
-static inline void st_int_trunc(i686_ctx_t *ctx, uint32_t va, unsigned bytes)
+static inline int st_int(i686_ctx_t *ctx, uint32_t va, unsigned bytes)
 {
-    int64_t v = x87_get_int_trunc(ctx, 0);
-    uint64_t out;
+    return st_int_checked(ctx, va, bytes, x87_round_mode(ctx));
+}
 
-    if (bytes == 2) {
-        out = (v < -32768 || v > 32767) ? 0x8000U : (uint64_t)v & 0xffffU;
-    } else if (bytes == 4) {
-        out = (v < -2147483648LL || v > 2147483647LL) ? 0x80000000U
-                                                      : (uint64_t)v & 0xffffffffU;
-    } else {
-        out = (uint64_t)v;
-    }
-    mem_wr(ctx, va, bytes, out);
+static inline int st_int_trunc(i686_ctx_t *ctx, uint32_t va, unsigned bytes)
+{
+    return st_int_checked(ctx, va, bytes, 3U);
 }
 
 static inline void img_wr16(uint8_t *img, unsigned off, uint16_t v)
@@ -485,19 +684,19 @@ static inline uint32_t img_rd32(const uint8_t *img, unsigned off)
 /* Cross-TU helpers in h_x87_math.c */
 void i686_x87_op_fchs(i686_ctx_t *ctx);
 void i686_x87_op_fabs(i686_ctx_t *ctx);
-void i686_x87_op_ftst(i686_ctx_t *ctx);
+int i686_x87_op_ftst(i686_ctx_t *ctx); /* R7-30: checked */
 void i686_x87_op_fxam(i686_ctx_t *ctx);
-void i686_x87_op_fld_const(i686_ctx_t *ctx, unsigned rm);
+int i686_x87_op_fld_const(i686_ctx_t *ctx, unsigned rm); /* R7-31 */
 void i686_x87_op_fsin(i686_ctx_t *ctx, int is_cos);
 void i686_x87_op_fsincos(i686_ctx_t *ctx);
 void i686_x87_op_fsqrt(i686_ctx_t *ctx);
 void i686_x87_op_frndint(i686_ctx_t *ctx);
-void i686_x87_op_fnstenv(i686_ctx_t *ctx, uint32_t va);
-void i686_x87_op_fldenv(i686_ctx_t *ctx, uint32_t va);
+void i686_x87_op_fnstenv(i686_ctx_t *ctx, uint32_t va, unsigned op16);
+void i686_x87_op_fldenv(i686_ctx_t *ctx, uint32_t va, unsigned op16);
 void i686_x87_op_fxsave(i686_ctx_t *ctx, uint32_t va);
 void i686_x87_op_fxrstor(i686_ctx_t *ctx, uint32_t va);
-void i686_x87_op_fnsave(i686_ctx_t *ctx, uint32_t va);
-void i686_x87_op_frstor(i686_ctx_t *ctx, uint32_t va);
+void i686_x87_op_fnsave(i686_ctx_t *ctx, uint32_t va, unsigned op16);
+void i686_x87_op_frstor(i686_ctx_t *ctx, uint32_t va, unsigned op16);
 void i686_x87_op_f2xm1(i686_ctx_t *ctx);
 void i686_x87_op_fyl2x(i686_ctx_t *ctx, int p1);
 void i686_x87_op_fptan(i686_ctx_t *ctx);

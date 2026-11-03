@@ -762,6 +762,7 @@ static int64_t r_execve(i686_ctx_t *ctx)
     memset(ctx->seg_base, 0, sizeof(ctx->seg_base));
     ctx->cs_d = 1U; /* exec reloads flat segment regs; the LDT itself
                      * persists (per-mm on i386), segment state resets */
+    ctx->ss_b = 1U; /* R7-11: flat stack is 32-bit */
     {
         extern void i686_seg_exec_reset_tls(i686_ctx_t *ctx);
         i686_seg_exec_reset_tls(ctx);
@@ -800,7 +801,13 @@ long i686_handle_syscall(i686_ctx_t *ctx)
                       ctx->gpr[I686_REG_ECX], ctx->gpr[I686_REG_EDX],
                       ctx->gpr[I686_REG_ESI]);
     }
-    ctx->gpr[I686_REG_EAX] = (uint32_t)ret;
+    /* R7-20: a successful sigreturn (119/173) restores EAX from the
+     * sigcontext (like the kernel) — storing the handler's return code
+     * would clobber it.  Only failed restores (-EFAULT) set EAX. */
+    if (!(((long)I686__NR_sigreturn == nr || (long)I686__NR_rt_sigreturn == nr) &&
+          ret == 0L)) {
+        ctx->gpr[I686_REG_EAX] = (uint32_t)ret;
+    }
     return ret;
 }
 

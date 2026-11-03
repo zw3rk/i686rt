@@ -327,12 +327,26 @@ static void classify_sse_x87_modrm(const x86_insn_t *insn,
         }
         if (op == I686_OP_UCOMISS || op == I686_OP_COMISS) {
             w = (insn->pfx_opsize != 0u) ? 8u : 4u;
-        } else if (insn->pfx_rep == 1u) { /* F3 scalar SS / MOVQ */
-            w = (op == I686_OP_MOVQ_xmm || op == I686_OP_MOVDQA)
-                    ? ((op_byte == 0x7Eu) ? 8u : 16u)
-                    : 4u;
-        } else if (insn->pfx_rep == 2u) { /* F2 scalar SD */
-            w = (op == I686_OP_CVTPS2PD || op == I686_OP_CVTTPS2PI) ? 8u : 8u;
+        } else if (insn->pfx_rep == 1u) { /* F3 */
+            /* R7-1: packed F3 converts/shuffles read whole vectors —
+             * CVTTPS2DQ (0x5B) reads m128 and the PSHUFHW handler
+             * fetches 16 bytes; the rest are scalar dwords. */
+            if (op == I686_OP_MOVQ_xmm || op == I686_OP_MOVDQA) {
+                w = (op_byte == 0x7Eu) ? 8u : 16u;
+            } else if (op_byte == 0x5Bu || op_byte == 0x70u) {
+                w = 16u;
+            } else {
+                w = 4u;
+            }
+        } else if (insn->pfx_rep == 2u) { /* F2 */
+            /* R7-1: the old ternary was a tautology (always 8).
+             * PSHUFLW (0x70) fetches 16 bytes in its handler and
+             * 0x5B has no F2 form (executes the 16-byte plain path). */
+            if (op_byte == 0x70u || op_byte == 0x5Bu) {
+                w = 16u;
+            } else {
+                w = 8u;
+            }
         } else if (op == I686_OP_MOVLPS || op == I686_OP_MOVHPS ||
                    op == I686_OP_MOVQ2DQ || op == I686_OP_CVTPI2PS ||
                    (op == I686_OP_CVTPS2PD && insn->pfx_opsize == 0u)) {

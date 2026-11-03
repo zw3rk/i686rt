@@ -13,21 +13,40 @@
 static int h_fld_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     if (insn->modrm_mod == 3U) {
-        if (!ctx->x87_80) {
-            double v = x87_get_f64(ctx, insn->modrm_rm);
+        /* R7-31: an empty source reads indefinite (masked) or
+         * faults (unmasked); the push is validated before TOP
+         * moves in either mode. */
+        int vs = x87_val_src(ctx, insn->modrm_rm);
 
-            x87_push(ctx);
+        if (vs == I686_EXIT_FAULT) {
+            return I686_EXIT_FAULT;
+        }
+        if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
+        if (!ctx->x87_80) {
+            double v = (vs == X87_SRC_EMPTY)
+                           ? (double)NAN
+                           : x87_get_f64(ctx, insn->modrm_rm);
+
             x87_set_f64(ctx, 0, v);
         } else {
             uint8_t b[10];
 
-            x87_get_ext80(ctx, insn->modrm_rm, b);
-            x87_push(ctx);
+            if (vs == X87_SRC_EMPTY) {
+                x87_80_nan(b, false, false);
+            } else {
+                x87_get_ext80(ctx, insn->modrm_rm, b);
+            }
             x87_set_ext80(ctx, 0, b);
         }
         return done(ctx, insn);
     }
-    push_f32(ctx, ld_f32(ctx, x86_ea_compute(ctx, insn)));
+    /* R7-31: overflow faults with TOP unchanged. */
+    if (push_f32(ctx, ld_f32(ctx, x86_ea_compute(ctx, insn))) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     return done(ctx, insn);
 }
 
@@ -43,6 +62,10 @@ static int h_fxch(i686_ctx_t *ctx, const x86_insn_t *insn)
 
     if (insn->modrm_mod != 3U) {
         return undef_form(ctx, insn);
+    }
+    /* R7-31: empty sides read indefinite (masked) or fault. */
+    if (x87_src(ctx, 0) || x87_src(ctx, insn->modrm_rm)) {
+        return I686_EXIT_FAULT;
     }
     memcpy(tmp, &ctx->x87_st[p0][0], 16);
     memcpy(&ctx->x87_st[p0][0], &ctx->x87_st[p1][0], 16);
@@ -63,7 +86,15 @@ static int h_fst_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return done(ctx, insn); /* FNOP */
     }
-    st_f32(ctx, x86_ea_compute(ctx, insn));
+    /* R7-31: an empty source reads indefinite (masked) or
+     * faults (unmasked). */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_f32(ctx, x86_ea_compute(ctx, insn)) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     return done(ctx, insn);
 }
 
@@ -73,7 +104,15 @@ static int h_fstp_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    st_f32(ctx, x86_ea_compute(ctx, insn));
+    /* R7-31: an empty source reads indefinite (masked) or
+     * faults (unmasked). */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_f32(ctx, x86_ea_compute(ctx, insn)) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     x87_pop(ctx);
     return done(ctx, insn);
 }
@@ -89,9 +128,14 @@ static int h_fldenv(i686_ctx_t *ctx, const x86_insn_t *insn)
         case 1:
             i686_x87_op_fabs(ctx);
             break;
-        case 4:
-            i686_x87_op_ftst(ctx);
+        case 4: {
+            int fr = i686_x87_op_ftst(ctx);
+
+            if (fr != I686_INTERP_CONTINUE) {
+                return fr; /* R7-30: unmasked #MF, EIP stays */
+            }
             break;
+        }
         case 5:
             i686_x87_op_fxam(ctx);
             break;
@@ -100,7 +144,8 @@ static int h_fldenv(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return done(ctx, insn);
     }
-    i686_x87_op_fldenv(ctx, x86_ea_compute(ctx, insn));
+    i686_x87_op_fldenv(ctx, x86_ea_compute(ctx, insn),
+                       insn->pfx_opsize != 0U);
     return done(ctx, insn);
 }
 
@@ -111,7 +156,11 @@ static int h_fldcw(i686_ctx_t *ctx, const x86_insn_t *insn)
         if (insn->modrm_rm > 6U) {
             return undef_form(ctx, insn);
         }
-        i686_x87_op_fld_const(ctx, insn->modrm_rm);
+        /* R7-31: overflow faults with TOP unchanged. */
+        if (i686_x87_op_fld_const(ctx, insn->modrm_rm) !=
+            I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         return done(ctx, insn);
     }
     ctx->fctrl = (uint16_t)mem_rd(ctx, x86_ea_compute(ctx, insn), 2);
@@ -151,9 +200,19 @@ static int h_fnstenv(i686_ctx_t *ctx, const x86_insn_t *insn)
             x87_update_fstat(ctx);
             break;
         }
+        /* R7-30: a fixed-form op that raised unmasked returns #MF
+         * here (its store/push was inhibited inside the op). */
+        if ((ctx->fstat & 0x80U) != 0U) {
+            extern void i686_fault_sig_record(int sig);
+
+            ctx->exit_arg = 16U; /* #MF trapno */
+            i686_fault_sig_record(8); /* SIGFPE */
+            return I686_EXIT_FAULT;
+        }
         return done(ctx, insn);
     }
-    i686_x87_op_fnstenv(ctx, x86_ea_compute(ctx, insn));
+    i686_x87_op_fnstenv(ctx, x86_ea_compute(ctx, insn),
+                        insn->pfx_opsize != 0U);
     return done(ctx, insn);
 }
 
@@ -188,6 +247,15 @@ static int h_fnstcw(i686_ctx_t *ctx, const x86_insn_t *insn)
             i686_x87_op_fsin(ctx, 1);
             break;
         }
+        /* R7-30: a fixed-form op that raised unmasked returns #MF
+         * here (its store/push was inhibited inside the op). */
+        if ((ctx->fstat & 0x80U) != 0U) {
+            extern void i686_fault_sig_record(int sig);
+
+            ctx->exit_arg = 16U; /* #MF trapno */
+            i686_fault_sig_record(8); /* SIGFPE */
+            return I686_EXIT_FAULT;
+        }
         return done(ctx, insn);
     }
     mem_wr(ctx, x86_ea_compute(ctx, insn), 2, ctx->fctrl);
@@ -203,7 +271,11 @@ static int h_fld_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
         x87_mark_empty(ctx, insn->modrm_rm);
         return done(ctx, insn);
     }
-    push_f64(ctx, ld_f64(ctx, x86_ea_compute(ctx, insn)));
+    /* R7-31: overflow faults with TOP unchanged. */
+    if (push_f64(ctx, ld_f64(ctx, x86_ea_compute(ctx, insn))) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     return done(ctx, insn);
 }
 
@@ -211,6 +283,11 @@ static int h_fld_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_fst_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     if (insn->modrm_mod == 3U) {
+        /* R7-31: an empty source reads indefinite (masked) or
+         * faults (unmasked). */
+        if (x87_src(ctx, 0)) {
+                return I686_EXIT_FAULT;
+        }
         if (!ctx->x87_80) {
             x87_set_f64(ctx, insn->modrm_rm, x87_get_f64(ctx, 0));
         } else {
@@ -221,7 +298,15 @@ static int h_fst_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return done(ctx, insn);
     }
-    st_f64(ctx, x86_ea_compute(ctx, insn));
+    /* R7-31: an empty source reads indefinite (masked) or
+     * faults (unmasked). */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_f64(ctx, x86_ea_compute(ctx, insn)) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     return done(ctx, insn);
 }
 
@@ -229,6 +314,11 @@ static int h_fst_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_fstp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     if (insn->modrm_mod == 3U) {
+        /* R7-31: an empty source reads indefinite (masked) or
+         * faults (unmasked). */
+        if (x87_src(ctx, 0)) {
+                return I686_EXIT_FAULT;
+        }
         if (!ctx->x87_80) {
             x87_set_f64(ctx, insn->modrm_rm, x87_get_f64(ctx, 0));
         } else {
@@ -240,7 +330,15 @@ static int h_fstp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
         x87_pop(ctx);
         return done(ctx, insn);
     }
-    st_f64(ctx, x86_ea_compute(ctx, insn));
+    /* R7-31: an empty source reads indefinite (masked) or
+     * faults (unmasked). */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_f64(ctx, x86_ea_compute(ctx, insn)) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     x87_pop(ctx);
     return done(ctx, insn);
 }
@@ -251,15 +349,23 @@ static int h_fucom(i686_ctx_t *ctx, const x86_insn_t *insn)
     int un;
 
     if (insn->modrm_mod != 3U) {
-        i686_x87_op_frstor(ctx, x86_ea_compute(ctx, insn));
+        i686_x87_op_frstor(ctx, x86_ea_compute(ctx, insn),
+                           insn->pfx_opsize != 0U);
         return done(ctx, insn);
+    }
+    /* R7-31: empty sources read indefinite or fault. */
+    if (x87_src(ctx, 0) || x87_src(ctx, insn->modrm_rm)) {
+        return I686_EXIT_FAULT;
     }
     if (!ctx->x87_80) {
         double a = x87_get_f64(ctx, 0);
         double b = x87_get_f64(ctx, insn->modrm_rm);
 
         un = cc_of_cmp(a, b, ctx);
-        exc_ie_cmp(ctx, a, b, un, true);
+        /* R7-30: an unmasked raise faults (no pop in this form). */
+        if (exc_ie_cmp(ctx, a, b, un, true) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         return done(ctx, insn);
     }
     {
@@ -275,7 +381,11 @@ static int h_fucom(i686_ctx_t *ctx, const x86_insn_t *insn)
         set_cc(ctx, c0, 0, c2, c3);
         if ((c0 && c2 && c3) &&
             (x87_80_is_snan(sa) || x87_80_is_snan(sb))) {
-            x87_set_exc(ctx, SW_IE);
+            /* R7-30: an unmasked raise faults (no pop here;
+             * h_fucomp pops only on CONTINUE). */
+            if (x87_exc_raise(ctx, SW_IE) != I686_INTERP_CONTINUE) {
+                return I686_EXIT_FAULT;
+            }
         }
     }
     return done(ctx, insn);
@@ -302,7 +412,8 @@ static int h_fnsave(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    i686_x87_op_fnsave(ctx, x86_ea_compute(ctx, insn));
+    i686_x87_op_fnsave(ctx, x86_ea_compute(ctx, insn),
+                       insn->pfx_opsize != 0U);
     return done(ctx, insn);
 }
 
@@ -326,19 +437,40 @@ static int h_emms(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_fxsave(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
+    uint32_t va;
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    i686_x87_op_fxsave(ctx, x86_ea_compute(ctx, insn));
+    va = x86_ea_compute(ctx, insn);
+    /* R7-43: FXSAVE faults #GP(0) on misaligned operands before
+     * any state side effect. */
+    i686_seg_check_align(ctx, va, 16u);
+    i686_x87_op_fxsave(ctx, va);
     return done(ctx, insn);
 }
 
 static int h_fxrstor(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
+    uint32_t va;
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    i686_x87_op_fxrstor(ctx, x86_ea_compute(ctx, insn));
+    va = x86_ea_compute(ctx, insn);
+    /* R7-43: FXRSTOR faults #GP(0) on misaligned operands before
+     * any state side effect. */
+    i686_seg_check_align(ctx, va, 16u);
+    /* R7-37: reserved MXCSR image bits fault #GP(0) before any
+     * state commit (DAZ itself loads via the op below). */
+    if (((uint32_t)mem_rd(ctx, va + 24U, 4) & ~0xFFFFu) != 0U) {
+        extern void i686_fault_sig_record(int sig);
+
+        ctx->exit_arg = 13U; /* #GP */
+        i686_fault_sig_record(11); /* SIGSEGV */
+        ctx->exit_dest = 0U; /* error code */
+        ctx->fault_addr = 0u;
+        return I686_EXIT_FAULT;
+    }
+    i686_x87_op_fxrstor(ctx, va);
     return done(ctx, insn);
 }
 
@@ -351,24 +483,24 @@ void i686_interp_x87_init(void)
     i686_interp_x87_init_arith();
 
     /* D9 */
-    i686_interp_register(I686_OP_FLD_m32, h_fld_m32);
-    i686_interp_register(I686_OP_FXCH, h_fxch);
-    i686_interp_register(I686_OP_FST_m32, h_fst_m32);
-    i686_interp_register(I686_OP_FSTP_m32, h_fstp_m32);
-    i686_interp_register(I686_OP_FLDENV, h_fldenv);
-    i686_interp_register(I686_OP_FLDCW, h_fldcw);
-    i686_interp_register(I686_OP_FNSTENV, h_fnstenv);
-    i686_interp_register(I686_OP_FNSTCW, h_fnstcw);
+    fp_reg(I686_OP_FLD_m32, h_fld_m32);
+    fp_reg(I686_OP_FXCH, h_fxch);
+    fp_reg(I686_OP_FST_m32, h_fst_m32);
+    fp_reg(I686_OP_FSTP_m32, h_fstp_m32);
+    fp_reg(I686_OP_FLDENV, h_fldenv);
+    fp_reg(I686_OP_FLDCW, h_fldcw);
+    fp_reg(I686_OP_FNSTENV, h_fnstenv);
+    fp_reg(I686_OP_FNSTCW, h_fnstcw);
     /* DD */
-    i686_interp_register(I686_OP_FLD_m64, h_fld_m64);
-    i686_interp_register(I686_OP_FST_m64, h_fst_m64);
-    i686_interp_register(I686_OP_FSTP_m64, h_fstp_m64);
-    i686_interp_register(I686_OP_FUCOM, h_fucom);
-    i686_interp_register(I686_OP_FUCOMP, h_fucomp);
-    i686_interp_register(I686_OP_FNSTSW_m16, h_fnstsw_m16);
-    i686_interp_register(I686_OP_FNSAVE, h_fnsave); /* DD /6; /4 mem = FRSTOR */
+    fp_reg(I686_OP_FLD_m64, h_fld_m64);
+    fp_reg(I686_OP_FST_m64, h_fst_m64);
+    fp_reg(I686_OP_FSTP_m64, h_fstp_m64);
+    fp_reg(I686_OP_FUCOM, h_fucom);
+    fp_reg(I686_OP_FUCOMP, h_fucomp);
+    fp_reg(I686_OP_FNSTSW_m16, h_fnstsw_m16);
+    fp_reg(I686_OP_FNSAVE, h_fnsave); /* DD /6; /4 mem = FRSTOR */
     /* 0F map */
     i686_interp_register(I686_OP_EMMS, h_emms);
-    i686_interp_register(I686_OP_FXSAVE, h_fxsave);
-    i686_interp_register(I686_OP_FXRSTOR, h_fxrstor);
+    fp_reg(I686_OP_FXSAVE, h_fxsave);
+    fp_reg(I686_OP_FXRSTOR, h_fxrstor);
 }

@@ -260,7 +260,8 @@ typedef struct i686_ctx {
     /* Segment/v86 mode state (Phases 7-8; C-only tail, extend at end) */
     uint8_t  cs_d;              /* current CS default size: 1=32, 0=16 */
     uint8_t  v86;               /* bit0: vm86 mode active (Phase 8) */
-    uint8_t  pad_seg[6];
+    uint8_t  ss_b;              /* current SS default size: 1=32, 0=16 (R7-11) */
+    uint8_t  pad_seg[5];
     void    *v86state;          /* v86.c-owned state (Phase 8) */
 
     /* Signal-frame anchor, PER-THREAD (RC7b: the file-static was shared

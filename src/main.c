@@ -289,6 +289,7 @@ static int run_guest(i686_ctx_t *ctx)
     ctx->seg_base[I686_SEG_SS] = 0;
     ctx->seg_base[I686_SEG_FS] = 0;
     ctx->seg_base[I686_SEG_GS] = 0;
+    ctx->ss_b = 1U; /* R7-11: flat stack is 32-bit */
 
 #ifdef I686RT_STRTRACE
     {

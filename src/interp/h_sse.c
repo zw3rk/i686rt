@@ -394,6 +394,12 @@ static int h_movups(i686_ctx_t *ctx, const x86_insn_t *insn)
             sse_get_xmm(ctx, insn->modrm_rm, src);
             memcpy(dst, src, size);
         } else {
+            /* R7-34: legacy scalar memory loads (MOVSS/MOVSD)
+             * zero the upper lanes; preservation applies only
+             * to register-source forms. */
+            if (size != 16U) {
+                memset(dst, 0, sizeof dst);
+            }
             sse_ld(ctx, insn, dst, size);
         }
         sse_set_xmm(ctx, insn->modrm_reg, dst);
@@ -416,6 +422,9 @@ static int h_movaps(i686_ctx_t *ctx, const x86_insn_t *insn)
     int load = (insn->opnd[0] == I686_OPND_R32);
     uint8_t buf[16];
 
+    /* R7-43: MOVAPS/MOVAPD fault #GP(0) on misaligned memory
+     * operands before any side effect. */
+    sse_align16(ctx, insn);
     if (load) {
         src128(ctx, insn, buf);
         sse_set_xmm(ctx, insn->modrm_reg, buf);
@@ -438,7 +447,7 @@ static int h_movlps(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (load) {
         sse_get_xmm(ctx, insn->modrm_reg, dst);
         if (insn->modrm_mod == 3U) {
-            if (insn->pfx_opsize != 0U) {
+            if (insn->pfx_66 != 0U) {
                 return I686_EXIT_UNDEF;
             }
             sse_get_xmm(ctx, insn->modrm_rm, src);
@@ -462,7 +471,7 @@ static int h_movhps(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (load) {
         sse_get_xmm(ctx, insn->modrm_reg, dst);
         if (insn->modrm_mod == 3U) {
-            if (insn->pfx_opsize != 0U) {
+            if (insn->pfx_66 != 0U) {
                 return I686_EXIT_UNDEF;
             }
             sse_get_xmm(ctx, insn->modrm_rm, src);
@@ -489,7 +498,7 @@ static int h_movq_xmm(i686_ctx_t *ctx, const x86_insn_t *insn)
         } else {
             sse_ld(ctx, insn, &v, 4);
         }
-        if (insn->pfx_opsize != 0U) {
+        if (insn->pfx_66 != 0U) {
             uint8_t x[16];
             memset(x, 0, sizeof x);
             memcpy(x, &v, 4);
@@ -512,7 +521,7 @@ static int h_movq_xmm(i686_ctx_t *ctx, const x86_insn_t *insn)
         sse_set_xmm(ctx, insn->modrm_reg, dst);
     } else {
         uint32_t v;
-        if (insn->pfx_opsize != 0U) {
+        if (insn->pfx_66 != 0U) {
             uint8_t src[16];
             sse_get_xmm(ctx, insn->modrm_reg, src);
             memcpy(&v, src, 4);
@@ -558,7 +567,7 @@ static int h_arith(i686_ctx_t *ctx, const x86_insn_t *insn, fop_kind k)
             sse_ld(ctx, insn, &s, 8);
         }
         set_lane64(dst, 0, sse_f64_op(ctx, lane64(dst, 0), s, k));
-    } else if (insn->pfx_opsize != 0U) {
+    } else if (insn->pfx_66 != 0U) {
         uint8_t src[16];
         src128(ctx, insn, src);
         set_lane64(dst, 0, sse_f64_op(ctx, lane64(dst, 0), lane64(src, 0), k));
@@ -616,7 +625,7 @@ static int h_xorps(i686_ctx_t *ctx, const x86_insn_t *insn)  { return h_logic(ct
 
 static int h_plogic(i686_ctx_t *ctx, const x86_insn_t *insn, log_kind k)
 {
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         return h_logic(ctx, insn, k);
     }
     {
@@ -675,7 +684,7 @@ static int h_cvtpi2ps(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         w0 = (uint32_t)s;
         w1 = (uint32_t)(s >> 32);
-        if (insn->pfx_opsize != 0U) {
+        if (insn->pfx_66 != 0U) {
             set_lane64(dst, 0, f64_bits((double)(int32_t)w0));
             set_lane64(dst, 1, f64_bits((double)(int32_t)w1));
         } else {
@@ -717,7 +726,7 @@ static int h_cvttps2pi(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     {
         uint64_t out = 0U;
-        if (insn->pfx_opsize != 0U) {
+        if (insn->pfx_66 != 0U) {
             uint8_t src[16];
             src128(ctx, insn, src);
             out = (uint64_t)sse_cvtt_f2i(ctx, f64_from(sse_f64_src(ctx, lane64(src, 0)))) |
@@ -768,7 +777,7 @@ static int h_cvtps2pd(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         set_lane32(dst, 0,
                    sse_round_f64_to_f32(ctx, f64_from(sse_f64_src(ctx, s))));
-    } else if (insn->pfx_opsize != 0U) {
+    } else if (insn->pfx_66 != 0U) {
         uint8_t src[16];
         src128(ctx, insn, src);
         set_lane32(dst, 0,
@@ -809,7 +818,7 @@ static int h_cvtdq2ps(i686_ctx_t *ctx, const x86_insn_t *insn)
         sse_ld(ctx, insn, src, 16);
     }
 
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         for (i = 0U; i < 4U; i++) {
             uint32_t s = lane32(src, i);
             set_lane32(dst, i, sse_cvt_f2i(ctx, (double)f32_from(sse_f32_src(ctx, s))));

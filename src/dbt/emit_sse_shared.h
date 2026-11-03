@@ -33,8 +33,11 @@
  * rounding is not mapped into FPCR (default NEON rounding); FTZ/DAZ
  * arithmetic and out-of-range scalar CVTTSS2SI/CVTTSD2SI take the D2
  * interpret-one path instead (exact flags and 0x80000000), while
- * packed CVTT* NaN/overflow still produce NEON saturation instead of
- * x86's integer indefinite 0x80000000.  SSE guest memory loads/stores
+ * CVTTPS2PI/CVTTPD2PI NaN/overflow still produce NEON saturation
+ * instead of x86's integer indefinite 0x80000000.  (R7-51: the
+ * ADD/SUB/MUL/DIV PS/PD/SS/SD and CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ NEON
+ * paths are declined to D2 until guest rounding/status/result
+ * semantics match.)  SSE guest memory loads/stores
  * emit dmb ishld / dmb ish barriers in TSO mode.  MMX-writing insns
  * set the x87 tag word to valid (0x0000) and EMMS sets it empty
  * (0xFFFF); fstat.TOP and the x87_st payload otherwise stay untouched.
@@ -345,8 +348,8 @@ static inline void sse_umov_s(a64_buf_t *b, unsigned wd, unsigned vn,
 }
 
 /* FP arithmetic bases (op order add/sub/mul/div mirrors the dispatch
- * table). The per-width tables live in emit_sse.c next to their only
- * user (sse_emit_fparith). */
+ * table). Retained for the R7-51 re-enable; no current user while the
+ * ADD/SUB/MUL/DIV PS/PD/SS/SD row is declined to D2. */
 static inline void sse_fp_vec(a64_buf_t *b, uint32_t base, unsigned vd,
                               unsigned vn, unsigned vm)
 {
@@ -560,11 +563,13 @@ static inline void sse_eor_w11_1(a64_buf_t *b)
 /* ---- RC7b T1 raw SIMD words (verified against the cross assembler) -- */
 
 /* EXT Vd.16B, Vn.16B, Vm.16B, #imm4: result[j] = concat(Vn:Vm)[j+imm4]
- * (whole-register byte shifts against a zero temp). */
+ * (whole-register byte shifts against a zero temp). R7-50: the base
+ * word carries a zero immediate field (0x6E000000, verified against
+ * the native assembler); the old 0x6E001800 base forced imm4|3. */
 static inline void sse_ext_16b(a64_buf_t *b, unsigned vd, unsigned vn,
                                unsigned vm, unsigned imm4)
 {
-    a64_emit(b, 0x6E001800U | ((imm4 & 15U) << 11) | ((vm & 31U) << 16) |
+    a64_emit(b, 0x6E000000U | ((imm4 & 15U) << 11) | ((vm & 31U) << 16) |
                      ((vn & 31U) << 5) | (vd & 31U));
 }
 

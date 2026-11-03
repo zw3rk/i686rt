@@ -7,8 +7,11 @@
 
 #include "interp/x87_80_internal.h"
 
-unsigned i686_x87_80_rc = 0u;  /* x87 CW RC: 0 NE, 1 down(-inf), 2 up(+inf), 3 zero */
-unsigned i686_x87_80_pc = 64u; /* x87 CW PC: 24 / 53 / 64 */
+/* R7-32: per-thread rounding state.  x80_set_mode rewrites these on
+ * every computational op, so plain globals race across guest threads
+ * (clone) and corrupt in-flight conversions. */
+_Thread_local unsigned i686_x87_80_rc = 0u;  /* x87 CW RC: 0 NE, 1 down, 2 up, 3 zero */
+_Thread_local unsigned i686_x87_80_pc = 64u; /* x87 CW PC: 24 / 53 / 64 */
 
 unsigned x87_80_set_round(unsigned rc)
 {
@@ -349,6 +352,22 @@ void x87_80_fcom(const uint8_t av[10], const uint8_t bv[10],
 
 /* --- fprem / fprem1 --------------------------------------------------------- */
 
+/* R7-42: FPREM/FPREM1 report the low 3 bits of the SIGNED quotient
+ * (two's complement, matching the default path's q8 wrap): a
+ * negative quotient wraps mod 8 instead of reporting magnitude
+ * bits, which lose the sign.  (The inc-branch remainder sign
+ * !a.sign is correct as written: rounding the quotient up flips
+ * the remainder relative to the dividend.) */
+static uint32_t prem_qq(uint64_t qmag, bool neg)
+{
+    uint32_t q3 = (uint32_t)(qmag & 7u);
+
+    if (neg && q3 != 0U) {
+        q3 = 8U - q3;
+    }
+    return q3;
+}
+
 static unsigned fprem_core(uint8_t out[10], const uint8_t av[10], const uint8_t bv[10],
                            uint32_t *qq, bool *complete, bool ieee)
 {
@@ -403,18 +422,19 @@ static unsigned fprem_core(uint8_t out[10], const uint8_t av[10], const uint8_t 
             div_u2_u64(A, 0u, mb, &q, &rem);
             if (ieee) {
                 uint64_t q0 = q.lo;
+                bool neg = (a.sign != b.sign);
                 bool inc = rem > (mb - rem);
                 if (!inc && rem == (mb - rem) && (q0 & 1u) != 0u) inc = true;
                 if (inc) {
-                    *qq = (uint32_t)((q0 + 1u) & 7u);
+                    *qq = prem_qq(q0 + 1u, neg);
                     xf_out_sig(out, !a.sign, mb - rem, eb - 63);
                     return flags;
                 }
-                *qq = (uint32_t)(q0 & 7u);
+                *qq = prem_qq(q0, neg);
                 xf_out_sig(out, a.sign, rem, eb - 63);
                 return flags;
             }
-            *qq = (uint32_t)(q.lo & 7u);
+            *qq = prem_qq(q.lo, a.sign != b.sign);
             xf_out_sig(out, a.sign, rem, eb - 63);
             return flags;
         }

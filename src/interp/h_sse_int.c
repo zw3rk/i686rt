@@ -34,7 +34,11 @@ static int cmp_eval(i686_ctx_t *ctx, uint64_t a, uint64_t b, unsigned pred,
     if (wide == 0 ? (f32_nan(a32) || f32_nan(b32)) : (f64_nan(a) || f64_nan(b))) {
         int sn = wide == 0 ? (f32_snan(a32) || f32_snan(b32))
                            : (f64_snan(a) || f64_snan(b));
-        if (pred <= 2U || sn) {
+        /* R7-36: only LT/LE/NLT/NLE (1,2,5,6) signal on quiet
+         * NaNs; EQ/UNORD/NEQ/ORD (0,3,4,7) stay quiet.  Any
+         * signaling NaN raises IE for every predicate. */
+        if (pred == 1U || pred == 2U || pred == 5U || pred == 6U ||
+            sn) {
             ctx->mxcsr |= MXCSR_IE;
         }
         unord = 1;
@@ -88,7 +92,7 @@ static int h_cmpps(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         set_lane64(dst, 0, cmp_eval(ctx, lane64(dst, 0), s, pred, 1)
                              ? 0xFFFFFFFFFFFFFFFFull : 0U);
-    } else if (insn->pfx_opsize != 0U) {
+    } else if (insn->pfx_66 != 0U) {
         uint8_t src[16];
         unsigned i;
         src128(ctx, insn, src);
@@ -128,7 +132,7 @@ static void comis_flags(i686_ctx_t *ctx, unsigned kind)
 
 static int h_comis(i686_ctx_t *ctx, const x86_insn_t *insn, int signaling)
 {
-    int wide = (insn->pfx_opsize != 0U);
+    int wide = (insn->pfx_66 != 0U);
 
     if (wide) {
         uint8_t src[16];
@@ -192,7 +196,7 @@ static int h_movmskps(i686_ctx_t *ctx, const x86_insn_t *insn)
         return I686_EXIT_UNDEF;
     }
     sse_get_xmm(ctx, insn->modrm_rm, src);
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         r = (uint32_t)((lane64(src, 0) >> 63) | ((lane64(src, 1) >> 62) & 2U));
     } else {
         unsigned i;
@@ -208,7 +212,7 @@ static int h_movmskps(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_paddd(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 4U : 2U;
     unsigned i;
 
@@ -227,7 +231,7 @@ static int h_paddd(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_psubd(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 4U : 2U;
     unsigned i;
 
@@ -247,7 +251,7 @@ static int h_psubd(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_pq(i686_ctx_t *ctx, const x86_insn_t *insn, int sub)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 2U : 1U;
     unsigned i;
 
@@ -270,7 +274,7 @@ static int h_psubq(i686_ctx_t *ctx, const x86_insn_t *insn) { return h_pq(ctx, i
 static int h_pmullw(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 8U : 4U;
     unsigned i;
 
@@ -290,7 +294,7 @@ static int h_pmullw(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_pmuludq(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 2U : 1U;
     unsigned i;
 
@@ -312,7 +316,7 @@ static int h_punpck(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned esize,
                     int high)
 {
     uint8_t d[16], s[16], out[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned per = xmm ? 16U : 8U;
     unsigned n = per / esize;
     unsigned take = n / 2U;
@@ -342,13 +346,13 @@ static int h_pshufw(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t d[16], s[16], out[16];
     int xmm = int_vec_src(ctx, insn, s,
-                          insn->pfx_opsize != 0U || insn->pfx_rep != 0U);
+                          insn->pfx_66 != 0U || insn->pfx_rep != 0U);
     unsigned imm = insn->imm & 0xFFu;
 
     int_vec_dst_fetch(ctx, insn, d, xmm);
     memset(out, 0, sizeof out);
 
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         unsigned j;
         for (j = 0U; j < 4U; j++) {
             unsigned sel = (imm >> (2U * j)) & 3U;
@@ -390,7 +394,7 @@ static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->pfx_rep == 2U) {
         return I686_EXIT_UNDEF;
     }
-    if (insn->pfx_opsize == 0U && insn->pfx_rep == 0U) {
+    if (insn->pfx_66 == 0U && insn->pfx_rep == 0U) {
         uint64_t v;
         if (load) {
             if (insn->modrm_mod == 3U) {
@@ -409,6 +413,9 @@ static int h_movdqa(i686_ctx_t *ctx, const x86_insn_t *insn)
         }
         return sse_done(ctx, insn);
     }
+    /* R7-43: MOVDQA faults #GP(0) on misaligned memory operands
+     * before any side effect (the MMX MOVQ path above has none). */
+    sse_align16(ctx, insn);
     if (load) {
         src128(ctx, insn, buf);
         sse_set_xmm(ctx, insn->modrm_reg, buf);
@@ -428,7 +435,7 @@ static int h_movq2dq(i686_ctx_t *ctx, const x86_insn_t *insn)
     uint8_t src[16];
     uint64_t v;
 
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         sse_get_xmm(ctx, insn->modrm_reg, src);
         memcpy(&v, src, 8);
         if (insn->modrm_mod == 3U) {
@@ -463,7 +470,7 @@ static int h_movntdq(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->pfx_rep != 0U || insn->modrm_mod == 3U) {
         return I686_EXIT_UNDEF;
     }
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         uint8_t buf[16];
         sse_get_xmm(ctx, insn->modrm_reg, buf);
         sse_st(ctx, insn, buf, 16);
@@ -482,7 +489,7 @@ static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->pfx_rep != 0U) {
         return I686_EXIT_UNDEF;
     }
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         uint8_t s[16], out[16];
         if (dig != 2U && dig != 3U && dig != 6U && dig != 7U) {
             return I686_EXIT_UNDEF;
@@ -500,14 +507,18 @@ static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
         } else {
             uint64_t lo = lane64(s, 0);
             uint64_t hi = lane64(s, 1);
-            unsigned cnt = imm & 63U;
-            if (cnt != 0U) {
+            /* R7-35: counts above 63 zero the lanes (the old
+             * imm & 63 wrapped 64 into a no-op). */
+            if (imm > 63U) {
+                lo = 0U;
+                hi = 0U;
+            } else if (imm != 0U) {
                 if (dig == 2U) {
-                    lo >>= cnt;
-                    hi >>= cnt;
+                    lo >>= imm;
+                    hi >>= imm;
                 } else {
-                    lo <<= cnt;
-                    hi <<= cnt;
+                    lo <<= imm;
+                    hi <<= imm;
                 }
             }
             set_lane64(out, 0, lo);
@@ -516,7 +527,6 @@ static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
         sse_set_xmm(ctx, insn->modrm_rm, out);
     } else {
         uint64_t v;
-        unsigned cnt;
         if (dig != 2U && dig != 6U) {
             return I686_EXIT_UNDEF;
         }
@@ -525,9 +535,11 @@ static int h_pshiftdq(i686_ctx_t *ctx, const x86_insn_t *insn)
         } else {
             sse_ld(ctx, insn, &v, 8);
         }
-        cnt = imm & 63U;
-        if (cnt != 0U) {
-            v = (dig == 2U) ? (v >> cnt) : (v << cnt);
+        /* R7-35: counts above 63 zero the quadword (no masking). */
+        if (imm > 63U) {
+            v = 0U;
+        } else if (imm != 0U) {
+            v = (dig == 2U) ? (v >> imm) : (v << imm);
         }
         mm_wr(ctx, insn->modrm_rm, v);
     }
@@ -539,7 +551,7 @@ typedef enum { PCMP_GT8 = 0, PCMP_EQ8, PCMP_EQ32 } pcmp_kind;
 static int h_pcmp(i686_ctx_t *ctx, const x86_insn_t *insn, pcmp_kind k)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 16U : 8U;
     unsigned esz = (k == PCMP_EQ32) ? 4U : 1U;
     unsigned i;
@@ -573,7 +585,7 @@ static int h_pmovmskb(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod != 3U || insn->pfx_rep != 0U) {
         return I686_EXIT_UNDEF;
     }
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         sse_get_xmm(ctx, insn->modrm_rm, src);
         n = 16U;
     } else {
@@ -592,7 +604,7 @@ static int h_pmovmskb(i686_ctx_t *ctx, const x86_insn_t *insn)
 static int h_pminmaxub(i686_ctx_t *ctx, const x86_insn_t *insn, int is_max)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 16U : 8U;
     unsigned i;
 
@@ -610,7 +622,7 @@ static int h_pmaxub(i686_ctx_t *ctx, const x86_insn_t *insn) { return h_pminmaxu
 static int h_psubb(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint8_t d[16], s[16];
-    int xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    int xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     unsigned n = xmm ? 16U : 8U;
     unsigned i;
 
@@ -624,7 +636,7 @@ static int h_psubb(i686_ctx_t *ctx, const x86_insn_t *insn)
 
 static int h_prefetch(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    if (insn->pfx_opsize != 0U || insn->pfx_rep != 0U) {
+    if (insn->pfx_66 != 0U || insn->pfx_rep != 0U) {
         return I686_EXIT_UNDEF;
     }
     return sse_done(ctx, insn);
@@ -653,7 +665,7 @@ static int h_ldmxcsr(i686_ctx_t *ctx, const x86_insn_t *insn)
         return I686_EXIT_FAULT;
     }
     sse_set_mxcsr(ctx, v);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_stmxcsr(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -665,13 +677,13 @@ static int h_stmxcsr(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     v = sse_get_mxcsr(ctx);
     sse_st(ctx, insn, &v, 4);
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_emms(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     ctx->ftag = 0xFFFFu;
-    return sse_done(ctx, insn);
+    return sse_done_nocheck(ctx, insn);
 }
 
 static int h_unpckps(i686_ctx_t *ctx, const x86_insn_t *insn, int hi)
@@ -682,7 +694,7 @@ static int h_unpckps(i686_ctx_t *ctx, const x86_insn_t *insn, int hi)
     }
     sse_get_xmm(ctx, insn->modrm_reg, d);
     src128(ctx, insn, s);
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         unsigned off = hi ? 8U : 0U;
         memcpy(out + 0, d + off, 8);
         memcpy(out + 8, s + off, 8);
@@ -709,7 +721,7 @@ static int h_packuswb(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->pfx_rep != 0U) {
         return I686_EXIT_UNDEF;
     }
-    xmm = int_vec_src(ctx, insn, s, insn->pfx_opsize != 0U);
+    xmm = int_vec_src(ctx, insn, s, insn->pfx_66 != 0U);
     int_vec_dst_fetch(ctx, insn, d, xmm);
     half = xmm ? 8U : 4U;
     memset(out, 0, sizeof out);
@@ -733,7 +745,7 @@ static int h_shufps(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     sse_get_xmm(ctx, insn->modrm_reg, d);
     src128(ctx, insn, s);
-    if (insn->pfx_opsize != 0U) {
+    if (insn->pfx_66 != 0U) {
         memcpy(out + 0, d + 8U * ((imm >> 0) & 1U), 8);
         memcpy(out + 8, s + 8U * ((imm >> 1) & 1U), 8);
     } else {

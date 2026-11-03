@@ -105,14 +105,17 @@ void x86_reg_write(i686_ctx_t *ctx, uint8_t reg, unsigned width, uint32_t val)
  * Phase 7 also exposes this to the les/lds/lss handlers (h_seg.c). */
 static uint8_t ea_default_seg(const x86_insn_t *insn)
 {
+    /* R7-4: the default segment derives from the decoded base register,
+     * not from mod.  [ESP] via SIB (mod 00) and 16-bit [BP+SI]/[BP+DI]
+     * (mod 00) are SS-based; displacement-only forms carry no base and
+     * stay DS. */
     if (insn->pfx_addrsize) {
-        if (insn->modrm_mod != 0U && insn->ea_base == I686_REG_EBP) {
+        if (insn->ea_base == I686_REG_EBP) {
             return I686_SEG_SS;
         }
         return I686_SEG_DS;
     }
-    if (insn->modrm_mod != 0U && (insn->ea_base == I686_REG_EBP ||
-                                   insn->ea_base == I686_REG_ESP)) {
+    if (insn->ea_base == I686_REG_EBP || insn->ea_base == I686_REG_ESP) {
         return I686_SEG_SS;
     }
     return I686_SEG_DS;
@@ -148,12 +151,13 @@ uint32_t x86_ea_compute(i686_ctx_t *ctx, const x86_insn_t *insn)
 /* LDT data-limit enforcement on the EA path (interp/seg.c); flat and
  * GDT selectors are never checked (i686_seg_check_data filters). */
 static void seg_limit_check(i686_ctx_t *ctx, const x86_insn_t *insn,
-                            uint32_t ea, unsigned bytes)
+                            uint32_t ea, unsigned bytes, unsigned write)
 {
     extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg,
-                                    uint32_t linear, unsigned bytes);
+                                    uint32_t linear, unsigned bytes,
+                                    unsigned write);
     if (bytes != 0U) {
-        i686_seg_check_data(ctx, x86_ea_seg(insn), ea, bytes);
+        i686_seg_check_data(ctx, x86_ea_seg(insn), ea, bytes, write);
     }
 }
 
@@ -198,7 +202,7 @@ uint32_t x86_rm_read(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width)
     }
     {
         uint32_t ea = x86_ea_compute(ctx, insn);
-        seg_limit_check(ctx, insn, ea, width / 8U);
+        seg_limit_check(ctx, insn, ea, width / 8U, 0u);
         return mem_load(ctx, ea, width / 8U);
     }
 }
@@ -212,18 +216,31 @@ void x86_rm_write(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned width,
     }
     {
         uint32_t ea = x86_ea_compute(ctx, insn);
-        seg_limit_check(ctx, insn, ea, width / 8U);
+        seg_limit_check(ctx, insn, ea, width / 8U, 1u);
         mem_store(ctx, ea, width / 8U, val);
     }
+}
+
+/* R7-55: the 15-byte instruction-length budget covers every
+ * code-stream byte.  A fetch that would consume byte 15+ overruns the
+ * architectural limit and decodes as invalid (D2: caller reports UNDEF). */
+static int code_ok(uint32_t pc, uint32_t eip, unsigned need)
+{
+    return (pc >= eip) && (pc - eip + need) <= 15u;
 }
 
 /* Decode ModRM + optional SIB/displacement; advances *pc.  cs_base is
  * the CS base for instruction-stream fetches (displacements/immediates
  * live in the code stream, Phase 7). */
-static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
-                         uint32_t cs_base)
+static int decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
+                        uint32_t cs_base, uint32_t eip)
 {
-    uint8_t m = fetch8(ctx, cs_base + *pc);
+    uint8_t m;
+
+    if (!code_ok(*pc, eip, 1u)) {
+        return -1;
+    }
+    m = fetch8(ctx, cs_base + *pc);
     (*pc)++;
 
     out->has_modrm = 1;
@@ -237,7 +254,7 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
 
     if (out->modrm_mod == 3U) {
         out->ea_has = 0;
-        return;
+        return 0;
     }
     out->ea_has = 1;
 
@@ -248,8 +265,12 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
             I686_REG_ESP, I686_REG_EBP, I686_REG_ESI, I686_REG_EDI
         };
         if (out->modrm_rm == 4U) { /* SIB */
-            uint8_t sib = fetch8(ctx, cs_base + *pc);
+            uint8_t sib;
             uint8_t base;
+            if (!code_ok(*pc, eip, 1u)) {
+                return -1;
+            }
+            sib = fetch8(ctx, cs_base + *pc);
             (*pc)++;
             out->ea_scale = (sib >> 6) & 3U;
             out->ea_index = ((sib >> 3) & 7U) == 4U
@@ -258,6 +279,9 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
             base = sib & 7U;
             if (base == 5U && out->modrm_mod == 0U) {
                 out->ea_base = REG_NONE; /* disp32-only SIB base */
+                if (!code_ok(*pc, eip, 4u)) {
+                    return -1;
+                }
                 out->ea_disp = mem_load(ctx, cs_base + *pc, 4);
                 *pc += 4;
             } else {
@@ -265,15 +289,24 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
             }
         } else if (out->modrm_rm == 5U && out->modrm_mod == 0U) {
             out->ea_base = REG_NONE; /* absolute disp32 (no rip-rel on i386) */
+            if (!code_ok(*pc, eip, 4u)) {
+                return -1;
+            }
             out->ea_disp = mem_load(ctx, cs_base + *pc, 4);
             *pc += 4;
         } else {
             out->ea_base = base_map[out->modrm_rm]; /* rm 4 never reaches here */
         }
         if (out->modrm_mod == 1U) {
+            if (!code_ok(*pc, eip, 1u)) {
+                return -1;
+            }
             out->ea_disp = (uint32_t)(int32_t)(int8_t)fetch8(ctx, cs_base + *pc);
             (*pc)++;
         } else if (out->modrm_mod == 2U) {
+            if (!code_ok(*pc, eip, 4u)) {
+                return -1;
+            }
             out->ea_disp = mem_load(ctx, cs_base + *pc, 4);
             *pc += 4;
         }
@@ -289,6 +322,9 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
         };
         if (out->modrm_rm == 6U && out->modrm_mod == 0U) {
             out->ea_base = REG_NONE; /* disp16 absolute */
+            if (!code_ok(*pc, eip, 2u)) {
+                return -1;
+            }
             out->ea_disp = mem_load(ctx, cs_base + *pc, 2);
             *pc += 2;
         } else {
@@ -297,13 +333,20 @@ static void decode_modrm(i686_ctx_t *ctx, uint32_t *pc, x86_insn_t *out,
         }
         out->ea_scale = 0;
         if (out->modrm_mod == 1U) {
+            if (!code_ok(*pc, eip, 1u)) {
+                return -1;
+            }
             out->ea_disp = (uint32_t)(int32_t)(int8_t)fetch8(ctx, cs_base + *pc);
             (*pc)++;
         } else if (out->modrm_mod == 2U) {
+            if (!code_ok(*pc, eip, 2u)) {
+                return -1;
+            }
             out->ea_disp = mem_load(ctx, cs_base + *pc, 2);
             *pc += 2;
         }
     }
+    return 0;
 }
 
 static unsigned opnd_is_mem(uint8_t k)
@@ -364,59 +407,86 @@ static int far_op_decode(i686_ctx_t *ctx, uint8_t b1, uint8_t b2,
         out->op = I686_OP7_JMPF;
         goto far_ptr;
     far_ptr:
-        out->imm = mem_load(ctx, cs_base + *pc, o);
+        /* R7-3: offset and selector ride dedicated fields — a 16:32
+         * target is 48 bits and shifting a uint32_t by 32 is UB. */
+        if (!code_ok(*pc, eip, o) || !code_ok(*pc + o, eip, 2u)) {
+            return -1;
+        }
+        out->far_off = mem_load(ctx, cs_base + *pc, o);
         *pc += o;
-        out->imm |= (uint32_t)mem_load(ctx, cs_base + *pc, 2) << (o * 8u);
+        out->far_sel = (uint16_t)mem_load(ctx, cs_base + *pc, 2);
         *pc += 2;
+        out->imm = out->far_off;
         out->imm_size = (uint8_t)(o + 2u);
         break;
     case 0xC4u:
         out->op = I686_OP7_LES;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0xC5u:
         out->op = I686_OP7_LDS;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0xCBu: /* RETF */
         out->op = I686_OP7_RETF;
         break;
     case 0x0FB2u:
         out->op = I686_OP7_LSS;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0x0FB4u:
         out->op = I686_OP7_LFS;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0x0FB5u:
         out->op = I686_OP7_LGS;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0x0F14u:
         out->op = I686_OP7_UNPCKLPS;
         out->opnd[0] = I686_OPND_R32;
         out->opnd[1] = I686_OPND_RM32;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0x0F15u:
         out->op = I686_OP7_UNPCKHPS;
         out->opnd[0] = I686_OPND_R32;
         out->opnd[1] = I686_OPND_RM32;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0x0F67u:
         out->op = I686_OP7_PACKUSWB;
         out->opnd[0] = I686_OPND_R32;
         out->opnd[1] = I686_OPND_RM32;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         break;
     case 0x0FC6u:
         out->op = I686_OP7_SHUFPS;
         out->opnd[0] = I686_OPND_R32;
         out->opnd[1] = I686_OPND_RM32;
         out->opnd[2] = I686_OPND_I8;
-        decode_modrm(ctx, pc, out, cs_base);
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
+        if (!code_ok(*pc, eip, 1u)) {
+            return -1;
+        }
         out->imm = fetch8(ctx, cs_base + *pc);
         out->imm_size = 1u;
         (*pc)++;
@@ -438,8 +508,13 @@ static int far_op_decode(i686_ctx_t *ctx, uint8_t b1, uint8_t b2,
         }
         out->op = I686_OP7_PRIV;
         if (key >= 0x0F20u && key <= 0x0F23u) {
-            decode_modrm(ctx, pc, out, cs_base);
+            if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+                return -1;
+            }
         } else if (key <= 0xE7u) {
+            if (!code_ok(*pc, eip, 1u)) {
+                return -1;
+            }
             (*pc)++; /* imm8 forms */
         }
         break;
@@ -451,6 +526,64 @@ static int far_op_decode(i686_ctx_t *ctx, uint8_t b1, uint8_t b2,
         return -1;
     }
     return 0;
+}
+
+/* R7-7: central LOCK-legality predicate (SDM Vol 2A).  Only the
+ * read-modify-write whitelist with a memory destination is legal;
+ * XCHG is implicitly locked in every form.  Shifts/rotates, MOV,
+ * register-destination ALU, BT, SHLD/SHRD, BSF/BSR and everything else
+ * with F0 are #UD. */
+int x86_lock_legal(const x86_insn_t *insn)
+{
+    unsigned mem_dst;
+
+    if (insn->pfx_lock == 0U) {
+        return 1;
+    }
+    switch (insn->op) {
+    case I686_OP_XCHG_EbGb:
+    case I686_OP_XCHG_EvGv:
+    case I686_OP_XCHG_eAXGv:
+        return 1; /* implicitly locked, any operand form */
+    case I686_OP_CMPXCHG8B:
+        return (insn->modrm_mod != 3U && insn->ea_has != 0U);
+    default:
+        break;
+    }
+    mem_dst = (insn->modrm_mod != 3U) && (insn->ea_has != 0U) &&
+              (insn->opnd[0] == I686_OPND_RM8 ||
+               insn->opnd[0] == I686_OPND_RM16 ||
+               insn->opnd[0] == I686_OPND_RM32);
+    if (!mem_dst) {
+        return 0;
+    }
+    switch (insn->op) {
+    case I686_OP_ADD_EbGb: case I686_OP_ADD_EvGv:
+    case I686_OP_ADD_EbIb: case I686_OP_ADD_EvIz: case I686_OP_ADD_EvIbSX:
+    case I686_OP_OR_EbGb: case I686_OP_OR_EvGv:
+    case I686_OP_OR_EbIb: case I686_OP_OR_EvIz: case I686_OP_OR_EvIbSX:
+    case I686_OP_ADC_EbGb: case I686_OP_ADC_EvGv:
+    case I686_OP_ADC_EbIb: case I686_OP_ADC_EvIz: case I686_OP_ADC_EvIbSX:
+    case I686_OP_SBB_EbGb: case I686_OP_SBB_EvGv:
+    case I686_OP_SBB_EbIb: case I686_OP_SBB_EvIz: case I686_OP_SBB_EvIbSX:
+    case I686_OP_AND_EbGb: case I686_OP_AND_EvGv:
+    case I686_OP_AND_EbIb: case I686_OP_AND_EvIz: case I686_OP_AND_EvIbSX:
+    case I686_OP_SUB_EbGb: case I686_OP_SUB_EvGv:
+    case I686_OP_SUB_EbIb: case I686_OP_SUB_EvIz: case I686_OP_SUB_EvIbSX:
+    case I686_OP_XOR_EbGb: case I686_OP_XOR_EvGv:
+    case I686_OP_XOR_EbIb: case I686_OP_XOR_EvIz: case I686_OP_XOR_EvIbSX:
+    case I686_OP_NOT_Eb: case I686_OP_NOT_Ev:
+    case I686_OP_NEG_Eb: case I686_OP_NEG_Ev:
+    case I686_OP_INC_Eb: case I686_OP_INC_Ev:
+    case I686_OP_DEC_Eb: case I686_OP_DEC_Ev:
+    case I686_OP_CMPXCHG_EbGb: case I686_OP_CMPXCHG_EvGv:
+    case I686_OP_XADD_EbGb: case I686_OP_XADD_EvGv:
+    case I686_OP_BTS_EvGv: case I686_OP_BTR_EvGv: case I686_OP_BTC_EvGv:
+    case I686_OP_BTS_EvIb: case I686_OP_BTR_EvIb: case I686_OP_BTC_EvIb:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 int x86_decode(i686_ctx_t *ctx, uint32_t eip, x86_insn_t *out)
@@ -474,11 +607,18 @@ int x86_decode(i686_ctx_t *ctx, uint32_t eip, x86_insn_t *out)
     memset(out, 0, sizeof(*out));
     out->pfx_seg = SEG_NONE;
 
-    /* Legacy prefixes: take the last of each class. */
-    for (n = 0; n < 12; n++) {
-        uint8_t b = fetch8(ctx, cs_base + pc);
+    /* Legacy prefixes: take the last of each class (R7-55: up to 15
+     * total bytes; longer prefix runs overrun the budget like any other
+     * overlength instruction). */
+    for (n = 0; n < 15; n++) {
+        uint8_t b;
+        if (!code_ok(pc, eip, 1u)) {
+            return -1;
+        }
+        b = fetch8(ctx, cs_base + pc);
         if (b == 0x66U) {
             out->pfx_opsize = 1;
+            out->pfx_66 = 1; /* R7-6: raw 66 survives CS.D normalization */
         } else if (b == 0x67U) {
             out->pfx_addrsize = 1;
         } else if (b == 0xf0U) {
@@ -511,9 +651,15 @@ prefixes_done:;
         out->pfx_addrsize = (uint8_t)(out->pfx_addrsize ^ 1u);
     }
 
+    if (!code_ok(pc, eip, 1u)) {
+        return -1;
+    }
     b1 = fetch8(ctx, cs_base + pc);
     pc++;
     if (b1 == 0x0fU) {
+        if (!code_ok(pc, eip, 1u)) {
+            return -1;
+        }
         b2 = fetch8(ctx, cs_base + pc);
         pc++;
         desc = &i686_insn_tab_0f[b2];
@@ -523,7 +669,10 @@ prefixes_done:;
     }
     if (desc->group_op) {
         const i686_group_t *g;
-        decode_modrm(ctx, &pc, out, cs_base); /* fills reg field, advances pc */
+        /* fills reg field, advances pc */
+        if (decode_modrm(ctx, &pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
         g = group_lookup(b1 == 0x0fU, b1 == 0x0fU ? b2 : b1);
         if (g == NULL || g->reg[out->modrm_reg] == I686_OP_INVALID) {
             return -1;
@@ -555,7 +704,9 @@ prefixes_done:;
             out->modrm_rm = r;
             out->ea_has = 0;
         } else if (desc->modrm) {
-            decode_modrm(ctx, &pc, out, cs_base);
+            if (decode_modrm(ctx, &pc, out, cs_base, eip) != 0) {
+                return -1;
+            }
         }
     }
 
@@ -568,6 +719,9 @@ prefixes_done:;
     if ((opnd_is_mem(out->opnd[0]) || opnd_is_mem(out->opnd[1])) &&
         !out->has_modrm) {
         unsigned w = out->pfx_addrsize ? 2U : 4U;
+        if (!code_ok(pc, eip, w)) {
+            return -1;
+        }
         out->ea_has = 1;
         out->ea_base = REG_NONE;
         out->ea_index = REG_NONE;
@@ -606,20 +760,32 @@ prefixes_done:;
         switch (out->opnd[n]) {
         case I686_OPND_I8:
         case I686_OPND_I8SX:
+            if (!code_ok(pc, eip, 1u)) {
+                return -1;
+            }
             v = fetch8(ctx, cs_base + pc);
             vsz = 1;
             break;
         case I686_OPND_I16:
+            if (!code_ok(pc, eip, 2u)) {
+                return -1;
+            }
             v = mem_load(ctx, cs_base + pc, 2);
             vsz = 2;
             break;
         case I686_OPND_I32:
         case I686_OPND_REL32:
             w = out->pfx_opsize ? 2U : 4U;
+            if (!code_ok(pc, eip, w)) {
+                return -1;
+            }
             v = mem_load(ctx, cs_base + pc, w);
             vsz = w;
             break;
         case I686_OPND_REL8:
+            if (!code_ok(pc, eip, 1u)) {
+                return -1;
+            }
             v = (uint32_t)(int32_t)(int8_t)fetch8(ctx, cs_base + pc);
             vsz = 1;
             break;

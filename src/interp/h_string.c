@@ -81,13 +81,14 @@ static void mem_write(i686_ctx_t *ctx, uint32_t va, unsigned width, uint32_t val
     }
 }
 
-/* Source-side segment base: DS default, pfx_seg override. */
-static uint32_t src_seg_base(const i686_ctx_t *ctx, const x86_insn_t *insn)
+/* Source-side segment: DS default, pfx_seg override. */
+static uint8_t src_seg_idx(const x86_insn_t *insn)
 {
-    uint8_t seg = (insn->pfx_seg != I686_NONE) ? insn->pfx_seg : I686_SEG_DS;
-
-    return ctx->seg_base[seg];
+    return (insn->pfx_seg != I686_NONE) ? insn->pfx_seg : I686_SEG_DS;
 }
+
+extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                                unsigned bytes, unsigned write);
 
 /* String index register as a linear address component. */
 static uint32_t str_addr(const i686_ctx_t *ctx, uint8_t reg, uint32_t seg_base,
@@ -150,16 +151,23 @@ static uint32_t iteration_count(const i686_ctx_t *ctx, const x86_insn_t *insn)
 static void movs_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
 {
     uint8_t addr16 = insn->pfx_addrsize;
-    uint32_t src_base = src_seg_base(ctx, insn);
+    uint8_t src_seg = src_seg_idx(insn);
+    uint32_t src_base = ctx->seg_base[src_seg];
     uint32_t dst_base = ctx->seg_base[I686_SEG_ES];
     int32_t step = str_step(ctx, w);
     bool is_rep = insn->pfx_rep != 0U;
     uint32_t remaining = iteration_count(ctx, insn);
 
     while (remaining > 0U) {
-        uint32_t v = mem_read(ctx, str_addr(ctx, I686_REG_ESI, src_base, addr16), w);
+        uint32_t sva = str_addr(ctx, I686_REG_ESI, src_base, addr16);
+        uint32_t dva = str_addr(ctx, I686_REG_EDI, dst_base, addr16);
+        uint32_t v;
 
-        mem_write(ctx, str_addr(ctx, I686_REG_EDI, dst_base, addr16), w, v);
+        /* R7-9: string accesses honor segment limits every element. */
+        i686_seg_check_data(ctx, src_seg, sva, w, 0u);
+        i686_seg_check_data(ctx, I686_SEG_ES, dva, w, 1u);
+        v = mem_read(ctx, sva, w);
+        mem_write(ctx, dva, w, v);
         str_bump(ctx, I686_REG_ESI, step, addr16);
         str_bump(ctx, I686_REG_EDI, step, addr16);
         if (is_rep) {
@@ -176,24 +184,39 @@ static void movs_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
 static void cmps_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
 {
     uint8_t addr16 = insn->pfx_addrsize;
-    uint32_t src_base = src_seg_base(ctx, insn);
+    uint8_t src_seg = src_seg_idx(insn);
+    uint32_t src_base = ctx->seg_base[src_seg];
     uint32_t dst_base = ctx->seg_base[I686_SEG_ES];
     int32_t step = str_step(ctx, w);
     bool is_rep = insn->pfx_rep != 0U;
     uint32_t mask = width_mask(w);
     uint32_t remaining = iteration_count(ctx, insn);
 
-    while (remaining > 0U) {
-        uint32_t a = mem_read(ctx, str_addr(ctx, I686_REG_ESI, src_base, addr16), w);
-        uint32_t b = mem_read(ctx, str_addr(ctx, I686_REG_EDI, dst_base, addr16), w);
+    /* R7-15: flags publish once, after the last completed element —
+     * a fault mid-loop retries with the entry flags while the
+     * already-advanced indices/count are retained. */
+    uint32_t last_a = 0U;
+    uint32_t last_b = 0U;
+    bool have = false;
 
-        i686_flags_sub(ctx, a & mask, b & mask, w * 8U);
+    while (remaining > 0U) {
+        uint32_t sva = str_addr(ctx, I686_REG_ESI, src_base, addr16);
+        uint32_t dva = str_addr(ctx, I686_REG_EDI, dst_base, addr16);
+        uint32_t a, b;
+
+        i686_seg_check_data(ctx, src_seg, sva, w, 0u);
+        i686_seg_check_data(ctx, I686_SEG_ES, dva, w, 0u);
+        a = mem_read(ctx, sva, w);
+        b = mem_read(ctx, dva, w);
+        last_a = a;
+        last_b = b;
+        have = true;
         str_bump(ctx, I686_REG_ESI, step, addr16);
         str_bump(ctx, I686_REG_EDI, step, addr16);
         if (is_rep) {
             rep_count_dec(ctx, insn);
             /* REPE (F3) stops on ZF=0, REPNE (F2) stops on ZF=1; the ZF
-             * of the just-recorded lazy SUB equals (a - b) & mask == 0. */
+             * of the just-computed pair equals (a - b) & mask == 0. */
             bool zf = ((a - b) & mask) == 0U;
 
             if (insn->pfx_rep == 1U) {
@@ -208,6 +231,9 @@ static void cmps_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
         }
         remaining--;
     }
+    if (have) {
+        i686_flags_sub(ctx, last_a & mask, last_b & mask, w * 8U);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -221,10 +247,14 @@ static void stos_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
     int32_t step = str_step(ctx, w);
     bool is_rep = insn->pfx_rep != 0U;
     uint32_t remaining = iteration_count(ctx, insn);
-    uint32_t v = x86_reg_read(ctx, I686_REG_EAX, w);
+    /* R7-16: x86_reg_read takes a BIT width; byte counts clobber EAX. */
+    uint32_t v = x86_reg_read(ctx, I686_REG_EAX, w * 8U);
 
     while (remaining > 0U) {
-        mem_write(ctx, str_addr(ctx, I686_REG_EDI, dst_base, addr16), w, v);
+        uint32_t dva = str_addr(ctx, I686_REG_EDI, dst_base, addr16);
+
+        i686_seg_check_data(ctx, I686_SEG_ES, dva, w, 1u);
+        mem_write(ctx, dva, w, v);
         str_bump(ctx, I686_REG_EDI, step, addr16);
         if (is_rep) {
             rep_count_dec(ctx, insn);
@@ -241,15 +271,20 @@ static void stos_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
 static void lods_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
 {
     uint8_t addr16 = insn->pfx_addrsize;
-    uint32_t src_base = src_seg_base(ctx, insn);
+    uint8_t src_seg = src_seg_idx(insn);
+    uint32_t src_base = ctx->seg_base[src_seg];
     int32_t step = str_step(ctx, w);
     bool is_rep = insn->pfx_rep != 0U;
     uint32_t remaining = iteration_count(ctx, insn);
 
     while (remaining > 0U) {
-        uint32_t v = mem_read(ctx, str_addr(ctx, I686_REG_ESI, src_base, addr16), w);
+        uint32_t sva = str_addr(ctx, I686_REG_ESI, src_base, addr16);
+        uint32_t v;
 
-        x86_reg_write(ctx, I686_REG_EAX, w, v);
+        i686_seg_check_data(ctx, src_seg, sva, w, 0u);
+        v = mem_read(ctx, sva, w);
+        /* R7-16: x86_reg_write takes a BIT width; byte counts zero EAX. */
+        x86_reg_write(ctx, I686_REG_EAX, w * 8U, v);
         str_bump(ctx, I686_REG_ESI, step, addr16);
         if (is_rep) {
             rep_count_dec(ctx, insn);
@@ -270,6 +305,10 @@ static void scas_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
     bool is_rep = insn->pfx_rep != 0U;
     uint32_t mask = width_mask(w);
     uint32_t remaining = iteration_count(ctx, insn);
+    /* R7-15: flags publish once, after the last completed element. */
+    uint32_t last_a = 0U;
+    uint32_t last_b = 0U;
+    bool have = false;
 
     while (remaining > 0U) {
         /* SCAS compares only the width-sized low bits of EAX; the lazy
@@ -277,10 +316,17 @@ static void scas_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
          * later jcc materializes the width-correct ZF, not a 32-bit one
          * polluted by upper EAX garbage (S2 fix: musl strrchr relies on
          * exactly this after repne scasb). */
-        uint32_t a = x86_reg_read(ctx, I686_REG_EAX, w) & mask;
-        uint32_t b = mem_read(ctx, str_addr(ctx, I686_REG_EDI, dst_base, addr16), w);
+        /* R7-16: x86_reg_read takes a BIT width, not bytes. */
+        uint32_t dva = str_addr(ctx, I686_REG_EDI, dst_base, addr16);
+        uint32_t a = x86_reg_read(ctx, I686_REG_EAX, w * 8U) & mask;
+        uint32_t b;
 
-        i686_flags_sub(ctx, a, b, w * 8U);
+        i686_seg_check_data(ctx, I686_SEG_ES, dva, w, 0u);
+        b = mem_read(ctx, dva, w);
+        last_a = a;
+        last_b = b;
+        have = true;
+
         str_bump(ctx, I686_REG_EDI, step, addr16);
         if (is_rep) {
             rep_count_dec(ctx, insn);
@@ -297,6 +343,9 @@ static void scas_core(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned w)
             }
         }
         remaining--;
+    }
+    if (have) {
+        i686_flags_sub(ctx, last_a, last_b, w * 8U);
     }
 }
 

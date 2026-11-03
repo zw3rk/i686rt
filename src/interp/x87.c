@@ -32,6 +32,18 @@
 
 #include "interp/x87.h"
 
+/* Status-word positions (R7-31: used by the checked push/pop helpers
+ * above as well as the conversion status below). */
+#define X87_SW_IE 0x01U
+#define X87_SW_PE 0x20U
+#define X87_SW_SF 0x40U
+#define X87_SW_C1 0x0200U
+#define X87_SW_ES 0x80U
+#define X87_SW_B 0x8000U
+/* Handler codes without pulling in interp/interp.h (this TU stays
+ * link-self-contained): 0 continues, I686_EXIT_FAULT is i686rt.h. */
+#define X87_CONTINUE 0
+
 /* --- little-endian byte helpers ---------------------------------------- */
 
 static uint64_t rd64(const uint8_t *p)
@@ -79,6 +91,32 @@ void x87_push(i686_ctx_t *ctx)
 {
     ctx->x87_top = (ctx->x87_top + 7U) & 7U;
     x87_update_fstat(ctx);
+}
+
+/* R7-31: checked push (declared for handler TU's in
+ * interp/h_x87_internal.h so frozen x87.h is untouched).  The
+ * destination tag is validated before TOP moves: overflow sets
+ * IE + SF with C1=1; unmasked records #MF and faults with state
+ * unchanged; masked proceeds (circular stack). */
+int x87_push_checked(i686_ctx_t *ctx)
+{
+    extern void i686_fault_sig_record(int sig);
+    unsigned dest = (ctx->x87_top + 7U) & 7U;
+
+    if (((ctx->ftag >> (dest * 2U)) & 3U) != 3U) {
+        ctx->fstat = (uint16_t)((ctx->fstat | X87_SW_IE | X87_SW_SF) |
+                               X87_SW_C1);
+        if ((X87_SW_IE & ~(unsigned)ctx->fctrl & 0x3fU) != 0U) {
+            ctx->fstat = (uint16_t)(ctx->fstat | X87_SW_ES | X87_SW_B);
+            ctx->exit_arg = 16U; /* #MF trapno */
+            i686_fault_sig_record(8); /* SIGFPE */
+            return (int)I686_EXIT_FAULT;
+        }
+        /* Masked: proceed (circular stack overwrites). */
+    }
+    ctx->x87_top = dest;
+    x87_update_fstat(ctx);
+    return X87_CONTINUE;
 }
 
 /* Pop frees the popped physical slot (hardware frees ST(0) on pop). */
@@ -188,8 +226,11 @@ void x87_f64_to_ext80(double v, uint8_t out[10])
             int unb;
 
             if (be == 0U) {
-                /* binary64 subnormal: normalize the 52-bit fraction. */
-                unb = -1022;
+                /* binary64 subnormal: normalize the 52-bit fraction.
+                 * R7-40: the initial exponent is -1023 (a top-bit-set
+                 * fraction is 1.F x 2^-1023, not x 2^-1022); -1022
+                 * doubles every subnormal. */
+                unb = -1023;
                 while ((frac & (1ULL << 51)) == 0U) {
                     frac <<= 1;
                     unb--;
@@ -399,18 +440,43 @@ static void i64_to_ext80(int64_t v, uint8_t out[10])
 
 /* Round an extended value held as normalized (m,e,sign) to int64 per rc.
  * rc: 0 nearest-even, 1 down, 2 up, 3 toward zero.  Out-of-range, Inf and
- * NaN produce the x87 integer indefinite. */
+ * NaN produce the x87 integer indefinite.  R7-26: the conversion status
+ * rides *exc (IE on invalid/overflow, PE on inexact rounding). */
 static int64_t ext80_parts_to_i64(uint64_t m, int eff, unsigned sign,
-                                  unsigned rc)
+                                  unsigned rc, unsigned *exc)
 {
     uint64_t q;
 
     if (eff >= 63) {
         /* Integral but |v| >= 2^63: only -2^63 itself is representable. */
         if (sign != 0U && eff == 63 && m == (1ULL << 63)) {
+            *exc = 0U;
             return INT64_MIN;
         }
+        *exc = X87_SW_IE;
         return X87_I64_INDEFINITE;
+    }
+    if (eff < 0) {
+        /* R7-26: |v| < 1 (0.5 already needs drop == 64: building
+         * the mask or shifting by it is undefined).  The rounded
+         * result is 0 or +-1; a nonzero value is always inexact. */
+        bool one;
+
+        if (rc == 0U) {
+            /* nearest-even: |v| > 0.5 (eff == -1 above the half)
+             * rounds to 1; one-half itself is even (0). */
+            one = (eff == -1 && m > (1ULL << 63));
+        } else if (rc == 3U) {
+            one = false;
+        } else {
+            one = (rc == 1U && sign != 0U) ||
+                  (rc == 2U && sign == 0U);
+        }
+        *exc = X87_SW_PE;
+        if (!one) {
+            return 0;
+        }
+        return sign != 0U ? -1 : 1;
     }
     {
         unsigned drop = (unsigned)(63 - eff);
@@ -432,17 +498,25 @@ static int64_t ext80_parts_to_i64(uint64_t m, int eff, unsigned sign,
                 q++; /* toward +inf */
             }
         }
+        *exc = (r != 0U) ? X87_SW_PE : 0U;
         if (q > (1ULL << 63)) {
+            *exc = X87_SW_IE;
             return X87_I64_INDEFINITE;
         }
         if (q == (1ULL << 63)) {
-            return sign != 0U ? INT64_MIN : X87_I64_INDEFINITE;
+            if (sign == 0U) {
+                *exc = X87_SW_IE;
+                return X87_I64_INDEFINITE;
+            }
+            *exc = (r != 0U) ? X87_SW_PE : 0U;
+            return INT64_MIN;
         }
         return sign != 0U ? -(int64_t)q : (int64_t)q;
     }
 }
 
-static int64_t ext80_to_i64(const uint8_t in[10], unsigned rc)
+static int64_t ext80_to_i64(const uint8_t in[10], unsigned rc,
+                            unsigned *exc)
 {
     uint64_t m = rd64(in);
     uint16_t se = rd16(&in[8]);
@@ -450,7 +524,12 @@ static int64_t ext80_to_i64(const uint8_t in[10], unsigned rc)
     unsigned e = se & 0x7fffU;
 
     if (e == 0x7fffU || m == 0U) {
-        return (e == 0x7fffU) ? X87_I64_INDEFINITE : 0;
+        if (e == 0x7fffU) {
+            *exc = X87_SW_IE;
+            return X87_I64_INDEFINITE;
+        }
+        *exc = 0U;
+        return 0;
     }
     {
         int eff = (e == 0U) ? -16382 : (int)e - 16383;
@@ -459,15 +538,16 @@ static int64_t ext80_to_i64(const uint8_t in[10], unsigned rc)
             m <<= 1;
             eff--;
         }
-        return ext80_parts_to_i64(m, eff, sign, rc);
+        return ext80_parts_to_i64(m, eff, sign, rc, exc);
     }
 }
 
-static int64_t f64_to_i64_rc(double d, unsigned rc)
+static int64_t f64_to_i64_rc(double d, unsigned rc, unsigned *exc)
 {
     double r;
 
     if (isnan(d) || isinf(d)) {
+        *exc = X87_SW_IE;
         return X87_I64_INDEFINITE;
     }
     switch (rc) {
@@ -485,8 +565,10 @@ static int64_t f64_to_i64_rc(double d, unsigned rc)
         break;
     }
     if (r >= 9223372036854775808.0 || r < -9223372036854775808.0) {
+        *exc = X87_SW_IE;
         return X87_I64_INDEFINITE;
     }
+    *exc = (r != d) ? X87_SW_PE : 0U;
     if (r == -9223372036854775808.0) {
         return INT64_MIN;
     }
@@ -495,7 +577,12 @@ static int64_t f64_to_i64_rc(double d, unsigned rc)
 
 void x87_set_int(i686_ctx_t *ctx, int64_t v)
 {
-    x87_push(ctx);
+    /* R7-31: overflow validated before TOP moves; on an unmasked
+     * fault the store is inhibited and ES trips the caller's
+     * post-check (FILD handlers) or the next FP dispatch check. */
+    if (x87_push_checked(ctx) != X87_CONTINUE) {
+        return;
+    }
     if (ctx->x87_80) {
         uint8_t buf[10];
 
@@ -507,39 +594,41 @@ void x87_set_int(i686_ctx_t *ctx, int64_t v)
     set_tag(ctx, x87_top(ctx), classify(ctx, x87_top(ctx)));
 }
 
-int64_t x87_get_int(const i686_ctx_t *ctx, unsigned i)
+/* R7-26: status-returning integer conversion (IE on
+ * invalid/overflow, PE on inexact rounding).  The frozen x87.h keeps
+ * the plain accessors; handler TU's declare this via
+ * interp/h_x87_internal.h. */
+int64_t x87_get_int_exc(const i686_ctx_t *ctx, unsigned i, unsigned rc,
+                        unsigned *exc)
 {
     unsigned p = phys_of(ctx, i);
-    unsigned rc = x87_round_mode(ctx);
 
     if (ctx->x87_80) {
-        return ext80_to_i64(&ctx->x87_st[p][0], rc);
+        return ext80_to_i64(&ctx->x87_st[p][0], rc, exc);
     }
     {
         uint64_t bits = rd64(&ctx->x87_st[p][0]);
         double d;
 
         memcpy(&d, &bits, 8);
-        return f64_to_i64_rc(d, rc);
+        return f64_to_i64_rc(d, rc, exc);
     }
+}
+
+int64_t x87_get_int(const i686_ctx_t *ctx, unsigned i)
+{
+    unsigned dummy;
+
+    return x87_get_int_exc(ctx, i, x87_round_mode(ctx), &dummy);
 }
 
 int64_t x87_get_int_trunc(const i686_ctx_t *ctx, unsigned i)
 {
-    unsigned p = phys_of(ctx, i);
+    unsigned dummy;
 
     /* FISTTP (SSE3): always truncates toward zero, regardless of the
      * CW rounding control. */
-    if (ctx->x87_80) {
-        return ext80_to_i64(&ctx->x87_st[p][0], 3U);
-    }
-    {
-        uint64_t bits = rd64(&ctx->x87_st[p][0]);
-        double d;
-
-        memcpy(&d, &bits, 8);
-        return f64_to_i64_rc(d, 3U);
-    }
+    return x87_get_int_exc(ctx, i, 3U, &dummy);
 }
 
 /* --- environment --------------------------------------------------------- */

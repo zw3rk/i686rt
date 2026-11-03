@@ -32,6 +32,7 @@ static long sig_host_gettid(void)
 }
 
 #include "i686rt.h"
+#include "interp/flags.h"
 #include "interp/interp.h"
 #include "interp/x87.h"
 #include "os/marshal.h"
@@ -214,7 +215,9 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
     sc.err = (sig == 11) ? (uint32_t)ctx->exit_dest : 0; /* seg error code */
     sc.eip = ctx->eip;
     sc.cs = ctx->seg_sel[I686_SEG_CS];
-    sc.eflags = ctx->eflags;
+    /* R7-19: materialize lazy arithmetic flags — the raw field is stale
+     * whenever lazy_op is live (pushed stale ZF/CF/SF/OF/PF/AF). */
+    sc.eflags = i686_flags_read(ctx);
     sc.esp_at_signal = ctx->gpr[I686_REG_ESP];
     sc.ss = ctx->seg_sel[I686_SEG_SS];
     sc.fpstate = fp_va;
@@ -416,7 +419,10 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
     ctx->gpr[I686_REG_EBX] = sc.ebx; ctx->gpr[I686_REG_EDX] = sc.edx;
     ctx->gpr[I686_REG_ECX] = sc.ecx; ctx->gpr[I686_REG_EAX] = sc.eax;
     ctx->eip = sc.eip;
+    /* R7-19: the restored eflags are authoritative — drop any stale
+     * lazy descriptor, same as the CLI/STI paths. */
     ctx->eflags = sc.eflags;
+    ctx->lazy_op = I686_FOP_NONE;
     ctx->fault_addr = sc.cr2;
     /* Segment-register round-trip (phase-7.md freeze): kernel reloads
      * blindly from the sigcontext; invalid selectors fault on next use.
@@ -441,6 +447,10 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
         i686_fpstate_32_t fp;
         if (i686_copy_from_guest(ctx, &fp, sc.fpstate, sizeof(fp)) == 0) {
             ctx->fctrl = fp.cwd; ctx->fstat = fp.swd; ctx->ftag = fp.twd;
+            /* R7-21: phys_of() indexes the stack by ctx->x87_top, not
+             * by the status word — resync TOP from SWD bits 11-13 or
+             * every post-sigreturn access hits the wrong register. */
+            x87_set_top(ctx, (uint8_t)((fp.swd >> 11) & 7u));
             ctx->mxcsr = fp.mxcsr;
             for (unsigned st_i = 0U; st_i < 8U; st_i++) {
                 const uint8_t *ext = (const uint8_t *)fp.st_space + st_i * 10U;

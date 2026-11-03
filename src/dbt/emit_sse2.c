@@ -17,8 +17,8 @@
  *   CVTPI2PS/PD, CVTSI2SS/SD (SCVTF; 2S->2D via SSHLL#0 + SCVTF),
  *     CVTTPS2PI, CVTTSS2SI/CVTTSD2SI (FCVTZS), CVTTPD2PI (FCVTZS.2D
  *     + XTN), CVTPS2PD (FCVTL), CVTPD2PS (FCVTN + zero upper),
- *     CVTSS2SD/CVTSD2SS (FCVT), CVTDQ2PS (SCVTF), CVTPS2DQ (FCVTNS),
- *     CVTTPS2DQ (FCVTZS)
+ *     CVTSS2SD/CVTSD2SS (FCVT); CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ
+ *     (R7-51: declined to D2, guest conversion semantics unmet)
  *   LDMXCSR/STMXCSR (0F AE /2 /3, m32; LDMXCSR bails to the
  *     interpreter to enforce #GP on reserved bits),
  *     SFENCE lives in emit_sse.c
@@ -31,7 +31,7 @@
  *
  * Scalar reads copy only the low lane from the cached slot (only lane 0
  * is consumed below; verified per call site). Full dest overwrites
- * (CVTPD2PS, CVTDQ2PS-class) skip the dst preimage load and write the
+ * (CVTPD2PS) skips the dst preimage load and writes the
  * computed scratch register through. The declined encodings, v1
  * deviations and scratch map are documented in emit_sse.c and
  * emit_sse_shared.h.
@@ -347,30 +347,19 @@ static int sse_emit_cvt_5a(i686_emit_ctx_t *e, const x86_insn_t *insn)
     return 0;
 }
 
-/* CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ (0F 5B): full-width overwrites of the
- * dest from the src (no dest preimage needed). */
+/* CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ (0F 5B).
+ *
+ * R7-51: declined to the D2 interpret-one path.  The retired NEON
+ * forms used A64 saturating conversions (NaN/overflow yield
+ * 0x7FFFFFFF/0x0 instead of the x86 integer indefinite 0x80000000),
+ * CVTPS2DQ hardcoded nearest rounding instead of MXCSR RC, and none
+ * accumulated guest IE/PE status.  Re-enable only with guest
+ * rounding/status/result semantics proven against the interpreter. */
 static int sse_emit_cvt_5b(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
-    a64_buf_t *b = &e->buf;
-
-    if (insn->pfx_rep == 2U) {
-        return -1; /* F2 5B = CVTPD2DQ (unlisted) */
-    }
-    if (insn->modrm_mod == 3U) {
-        sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
-    } else {
-        sse_guest_addr(e, insn);
-        sse_ldr_q(b, 1U, SSE_ADDR, 0U);
-    }
-    if (insn->pfx_rep == 1U) {
-        sse_fcvtzs_4s(b, 0U, 1U); /* CVTTPS2DQ (truncate) */
-    } else if (insn->pfx_opsize != 0U) {
-        sse_fcvtns_4s(b, 0U, 1U); /* CVTPS2DQ (nearest-even, v1) */
-    } else {
-        sse_scvtf_4s(b, 0U, 1U); /* CVTDQ2PS */
-    }
-    sse_q_str(e, insn->modrm_reg & 7U, 0U);
-    return 0;
+    (void)e;
+    (void)insn;
+    return -1;
 }
 
 /* LDMXCSR/STMXCSR (0F AE /2 /3, m32). */
@@ -507,9 +496,11 @@ static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_mov_v_v(b, 0U, 1U);
         } else if (imm < 16U) {
+            /* R7-50: EXT(zero:src)[j+imm]; the old 16-imm count
+             * shifted the wrong way. */
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_movi_v_zero(b, 2U);
-            sse_ext_16b(b, 0U, 2U, 1U, 16U - imm);
+            sse_ext_16b(b, 0U, 2U, 1U, imm);
         } else {
             sse_movi_v_zero(b, 0U);
         }
@@ -518,9 +509,11 @@ static int sse_emit_psrldq(i686_emit_ctx_t *e, const x86_insn_t *insn)
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_mov_v_v(b, 0U, 1U);
         } else if (imm < 16U) {
+            /* R7-50: EXT(src:zero)[j+16-imm]; the old imm count
+             * shifted the wrong way. */
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
             sse_movi_v_zero(b, 2U);
-            sse_ext_16b(b, 0U, 1U, 2U, imm);
+            sse_ext_16b(b, 0U, 1U, 2U, 16U - imm);
         } else {
             sse_movi_v_zero(b, 0U);
         }

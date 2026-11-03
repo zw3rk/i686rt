@@ -97,19 +97,18 @@ void i686_emit_exit(i686_emit_ctx_t *e, uint32_t reason, uint32_t arg,
 }
 
 /* Segment index for a data EA — mirrors decode.c's ea_default_seg plus
- * the override rule (pfx_seg wins; SS for BP-based EAs, else DS). */
+ * the override rule (pfx_seg wins; SS for BP/ESP-based EAs, else DS).
+ * R7-4: the base register decides, not mod (SIB [ESP] and 16-bit
+ * [BP+SI]/[BP+DI] with mod 00 are SS-based). */
 static unsigned ea_seg_index(const x86_insn_t *insn)
 {
     if (insn->pfx_seg != 0xFFU) {
         return insn->pfx_seg;
     }
     if (insn->pfx_addrsize != 0U) {
-        return (insn->modrm_mod != 0U && insn->ea_base == I686_REG_EBP)
-                   ? I686_SEG_SS
-                   : I686_SEG_DS;
+        return (insn->ea_base == I686_REG_EBP) ? I686_SEG_SS : I686_SEG_DS;
     }
-    return (insn->modrm_mod != 0U &&
-            (insn->ea_base == I686_REG_EBP || insn->ea_base == I686_REG_ESP))
+    return (insn->ea_base == I686_REG_EBP || insn->ea_base == I686_REG_ESP)
                ? I686_SEG_SS
                : I686_SEG_DS;
 }
@@ -177,6 +176,12 @@ void i686_emit_ea(i686_emit_ctx_t *e, const x86_insn_t *insn, int add_seg)
         if (started == 0) {
             a64_emit_movz_w(b, 21U, 0U, 0U);
         }
+    }
+
+    /* R7-5: 16-bit effective addresses wrap mod 64K before the segment
+     * base is added (67 prefix; DBT otherwise uses full 32-bit regs). */
+    if (insn->pfx_addrsize != 0U) {
+        a64_emit_ubfm_w(b, 21U, 21U, 0U, 15U);
     }
 
     if (add_seg != 0) {

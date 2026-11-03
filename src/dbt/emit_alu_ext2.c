@@ -180,11 +180,17 @@ int xalu_mul1(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_imul)
         } else {
             a64_emit_umaddl_x(b, XALU_T1, XALU_A, XALU_B, 31U);
         }
-        /* CF = (xT1 != sext_w(low w bits of xT1)); the check runs on
-         * a copy so the product in xT1 survives for the stores. */
-        xalu_orr_x(b, 11U, 31U, XALU_T1); /* x11 = xZR | xT1 */
-        xalu_sbfx_x(b, XALU_T2, 11U, 0U, width);
-        xalu_subs_x(b, 11U, XALU_T2);
+        /* CF/OF check runs on a copy so the product in xT1 survives
+         * for the stores. IMUL: xT1 != sext_w(low w bits); MUL
+         * (R7-47): upper half != 0. */
+        if (is_imul != 0) {
+            xalu_orr_x(b, 11U, 31U, XALU_T1); /* x11 = xZR | xT1 */
+            xalu_sbfx_x(b, XALU_T2, 11U, 0U, width);
+            xalu_subs_x(b, 11U, XALU_T2);
+        } else {
+            xalu_lsr_x_imm(b, 11U, XALU_T1, width); /* upper half */
+            xalu_subs_x(b, 11U, 31U); /* cmp upper, #0 */
+        }
         xalu_cset_w(b, XALU_T2, A64_COND_NE);
         if (width == 16U) {
             xalu_store_reg(b, XALU_T1, I686_REG_EAX, 16U);

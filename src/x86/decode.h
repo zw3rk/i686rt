@@ -46,7 +46,8 @@ typedef struct x86_insn {
     uint16_t op;           /* i686_op_t */
     uint8_t  opnd[3];      /* I686_OPND_* copied from the descriptor     */
     uint8_t  len;          /* total instruction length in bytes          */
-    uint8_t  pfx_opsize;   /* 1 if 66 present                            */
+    uint8_t  pfx_opsize;   /* effective 16-bit op size (66 XOR CS.D)     */
+    uint8_t  pfx_66;       /* raw 66 presence: mandatory SIMD prefix (R7-6) */
     uint8_t  pfx_addrsize; /* 1 if 67 present (16-bit addressing, interp) */
     uint8_t  pfx_rep;      /* 0 none, 1 F3, 2 F2                         */
     uint8_t  pfx_seg;      /* I686_SEG_* override, 0xFF if none          */
@@ -61,7 +62,19 @@ typedef struct x86_insn {
     uint32_t ea_disp;      /* zero- or sign-extended displacement         */
     uint32_t imm;          /* raw immediate, right-aligned               */
     uint8_t  imm_size;     /* 0, 1, 2, or 4 bytes fetched                */
+    /* Far pointer target (9A/EA): 16:16/16:32 need 48 bits, which imm
+     * cannot hold (R7-3).  far_off/far_sel carry the full target. */
+    uint32_t far_off;
+    uint16_t far_sel;
 } x86_insn_t;
+
+/* R7-7: LOCK legality (SDM Vol 2A): the F0 prefix is legal only on the
+ * read-modify-write whitelist with a memory destination — XCHG is
+ * implicitly locked, so any form is accepted.  Every other LOCK form
+ * (MOV, register-destination ALU, BT, shifts, SHLD, ...) is #UD.
+ * Consumed by the interpreter dispatch and the DBT translator before
+ * any side effect. */
+int x86_lock_legal(const x86_insn_t *insn);
 
 /* Decode one instruction at guest EIP (fetch via CS base + window).
  * Returns 0 on success (out filled, out->len >= 1), -1 if the opcode has

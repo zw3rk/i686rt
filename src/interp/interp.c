@@ -38,7 +38,7 @@
 /* x86 helpers owned by sibling lanes (same extern pattern as h_alu.c). */
 extern uint8_t x86_ea_seg(const x86_insn_t *insn);
 extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
-                                unsigned bytes);
+                                unsigned bytes, unsigned write);
 
 /* Host-fault -> guest-fault checkpoint (Phase 4).  The handler runs on
  * the faulting host thread; sigsetjmp/siglongjmp restores the interp
@@ -71,6 +71,17 @@ __thread volatile uint64_t g_fault_x[29];
  * mutate them mid-instruction, so restoring on fault is exact. */
 static __thread uint32_t s_saved_esp;
 static __thread uint32_t s_saved_ebp;
+/* R7-15: pre-instruction lazy-flag checkpoint.  Handlers commit flags
+ * after their faultable stores, but a fault between the two (or inside
+ * x87/SSE flag updates) must not leak the half-published descriptor
+ * into the retry: the whole EFLAGS state is restored with ESP/EBP. */
+static __thread uint32_t s_saved_eflags;
+static __thread uint32_t s_saved_lazy_op;
+static __thread uint32_t s_saved_lazy_res;
+static __thread uint32_t s_saved_lazy_src1;
+static __thread uint32_t s_saved_lazy_src2;
+static __thread uint32_t s_saved_lazy_cf_in;
+static __thread uint32_t s_saved_lazy_width;
 /* Last guest address remapped-and-resumed by the #4 path below: a fault
  * at the same address twice in a row is not healing, so deliver it.
  * The delivery path resets it to "none", so a later transient may heal. */
@@ -302,38 +313,9 @@ int  i686_syscall_is_exit(long nr);
 
 #define I686_REGISTRY_MAX 512U
 
-/* I686-R5-3: LOCK is only legal on memory-destination ADD/ADC/AND/BTC/
- * BTR/BTS/CMPXCHG/CMPXCHG8B/DEC/INC/NEG/NOT/OR/SBB/SUB/XOR/XADD/XCHG.
- * LOCK on shifts/rotates is #UD even when the masked count is 0. */
-static int interp_lock_illegal_shift(uint16_t op)
-{
-    switch (op) {
-    case I686_OP_ROL_Eb1: case I686_OP_ROL_Ev1:
-    case I686_OP_ROL_EbCL: case I686_OP_ROL_EvCL:
-    case I686_OP_ROL_EbIb: case I686_OP_ROL_EvIb:
-    case I686_OP_ROR_Eb1: case I686_OP_ROR_Ev1:
-    case I686_OP_ROR_EbCL: case I686_OP_ROR_EvCL:
-    case I686_OP_ROR_EbIb: case I686_OP_ROR_EvIb:
-    case I686_OP_RCL_Eb1: case I686_OP_RCL_Ev1:
-    case I686_OP_RCL_EbCL: case I686_OP_RCL_EvCL:
-    case I686_OP_RCL_EbIb: case I686_OP_RCL_EvIb:
-    case I686_OP_RCR_Eb1: case I686_OP_RCR_Ev1:
-    case I686_OP_RCR_EbCL: case I686_OP_RCR_EvCL:
-    case I686_OP_RCR_EbIb: case I686_OP_RCR_EvIb:
-    case I686_OP_SHL_Eb1: case I686_OP_SHL_Ev1:
-    case I686_OP_SHL_EbCL: case I686_OP_SHL_EvCL:
-    case I686_OP_SHL_EbIb: case I686_OP_SHL_EvIb:
-    case I686_OP_SHR_Eb1: case I686_OP_SHR_Ev1:
-    case I686_OP_SHR_EbCL: case I686_OP_SHR_EvCL:
-    case I686_OP_SHR_EbIb: case I686_OP_SHR_EvIb:
-    case I686_OP_SAR_Eb1: case I686_OP_SAR_Ev1:
-    case I686_OP_SAR_EbCL: case I686_OP_SAR_EvCL:
-    case I686_OP_SAR_EbIb: case I686_OP_SAR_EvIb:
-        return 1;
-    default:
-        return 0;
-    }
-}
+/* R7-7: LOCK legality is decided centrally in the decoder
+ * (x86_lock_legal, SDM Vol 2A whitelist + memory destination); the
+ * shift-only check it replaces lives on in h_shift.c as a backstop. */
 
 static i686_interp_fn s_registry[I686_REGISTRY_MAX];
 
@@ -342,6 +324,44 @@ void i686_interp_register(uint16_t op, i686_interp_fn fn)
     if ((unsigned)op < I686_REGISTRY_MAX) {
         s_registry[op] = fn;
     }
+}
+
+/* R7-30: FP/WAIT op marking for the pending-#MF check.  The x87 init
+ * functions mark their registered ops (interp.c owns the bits, so
+ * frozen interp.h needs no new entry; handler TU's declare the
+ * marker via interp/h_x87_internal.h). */
+static uint64_t s_fp_ops[I686_REGISTRY_MAX / 64U];
+
+void i686_interp_mark_fp(uint16_t op)
+{
+    if ((unsigned)op < I686_REGISTRY_MAX) {
+        s_fp_ops[(unsigned)op / 64U] |=
+            (uint64_t)1 << ((unsigned)op % 64U);
+    }
+}
+
+static int i686_interp_is_fp(uint16_t op)
+{
+    if ((unsigned)op >= I686_REGISTRY_MAX) {
+        return 0;
+    }
+    return ((s_fp_ops[(unsigned)op / 64U] >>
+             ((unsigned)op % 64U)) & 1U) != 0U;
+}
+
+/* R7-30: a pending unmasked x87 exception (ES) raises #MF before the
+ * next FP/WAIT instruction executes; EIP stays at it (fault). */
+static int fp_pending_trap(i686_ctx_t *ctx, uint16_t op)
+{
+    extern void i686_fault_sig_record(int sig);
+
+    if (!i686_interp_is_fp(op) || (ctx->fstat & 0x80U) == 0U) {
+        return I686_INTERP_CONTINUE;
+    }
+    ctx->exit_reason = I686_EXIT_FAULT;
+    ctx->exit_arg = 16U; /* #MF trapno */
+    i686_fault_sig_record(8); /* SIGFPE */
+    return I686_EXIT_FAULT;
 }
 
 static int s_trace;
@@ -429,11 +449,17 @@ int i686_interp_step(i686_ctx_t *ctx)
         (void)fprintf(stderr, "\n");
         return I686_EXIT_UNDEF;
     }
-    if (insn.pfx_lock != 0U && interp_lock_illegal_shift(insn.op)) {
+    if (insn.pfx_lock != 0U && !x86_lock_legal(&insn)) {
         i686_vm32_exec_leave();
         ctx->exit_reason = I686_EXIT_UNDEF;
         ctx->exit_arg = insn.op;
         return I686_EXIT_UNDEF;
+    }
+    /* R7-30: pending unmasked x87 exception (the engine delivers
+     * the FAULT it returns). */
+    if (fp_pending_trap(ctx, insn.op) != I686_INTERP_CONTINUE) {
+        i686_vm32_exec_leave();
+        return I686_EXIT_FAULT;
     }
     fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
     if (fn == NULL) {
@@ -501,6 +527,16 @@ int i686_interp_run(i686_ctx_t *ctx)
         i686_split_lock_release_if_held();
         ctx->gpr[I686_REG_ESP] = s_saved_esp;
         ctx->gpr[I686_REG_EBP] = s_saved_ebp;
+        /* R7-15: restore the pre-instruction EFLAGS state with ESP/EBP
+         * so the retry observes the flags the faulting instruction
+         * found (STC; ADC [ro],0 retries with its entry carry). */
+        ctx->eflags = s_saved_eflags;
+        ctx->lazy_op = s_saved_lazy_op;
+        ctx->lazy_res = s_saved_lazy_res;
+        ctx->lazy_src1 = s_saved_lazy_src1;
+        ctx->lazy_src2 = s_saved_lazy_src2;
+        ctx->lazy_cf_in = s_saved_lazy_cf_in;
+        ctx->lazy_width = s_saved_lazy_width;
         s_in_run = 1;
         if (fa >= ctx->guest_base &&
             fa < ctx->guest_base + 0x100000000ULL) {
@@ -576,15 +612,31 @@ run_loop:
 
         /* RC-U3 checkpoint for the fault path above (must precede
          * x86_decode so an instruction-fetch fault on a widened page
-         * never restores a stale ESP/EBP from the previous insn). */
+         * never restores a stale ESP/EBP from the previous insn).
+         * R7-15: the EFLAGS descriptor rides the same checkpoint. */
         s_saved_esp = ctx->gpr[I686_REG_ESP];
         s_saved_ebp = ctx->gpr[I686_REG_EBP];
+        s_saved_eflags = ctx->eflags;
+        s_saved_lazy_op = ctx->lazy_op;
+        s_saved_lazy_res = ctx->lazy_res;
+        s_saved_lazy_src1 = ctx->lazy_src1;
+        s_saved_lazy_src2 = ctx->lazy_src2;
+        s_saved_lazy_cf_in = ctx->lazy_cf_in;
+        s_saved_lazy_width = ctx->lazy_width;
         i686_vm32_exec_enter(ctx);
         if (x86_decode(ctx, ctx->eip, &insn) != 0) {
             uint32_t b;
             i686_vm32_exec_leave();
             ctx->exit_reason = I686_EXIT_UNDEF;
             ctx->exit_arg = 0;
+            /* R7-22: undecodable bytes are #UD (a fault: eip still
+             * addresses them) — deliver SIGILL before diagnosing. */
+            {
+                extern int i686_deliver_sync(i686_ctx_t *, int reason);
+                if (i686_deliver_sync(ctx, (int)I686_EXIT_UNDEF) == 0) {
+                    continue;
+                }
+            }
             diag("undecodable instruction", ctx, 0);
             (void)fprintf(stderr, "BYTES %08x:", ctx->eip);
             for (b = 0U; b < 16U; b++) {
@@ -595,7 +647,7 @@ run_loop:
             (void)fprintf(stderr, "\n");
             return I686_EXIT_UNDEF;
         }
-        if (insn.pfx_lock != 0U && interp_lock_illegal_shift(insn.op)) {
+        if (insn.pfx_lock != 0U && !x86_lock_legal(&insn)) {
             i686_vm32_exec_leave();
             ctx->exit_reason = I686_EXIT_UNDEF;
             ctx->exit_arg = insn.op;
@@ -608,11 +660,36 @@ run_loop:
             diag("opcode refused", ctx, insn.op);
             return I686_EXIT_UNDEF;
         }
+        /* R7-30: pending unmasked x87 exception raises #MF
+         * before the next FP/WAIT instruction (delivered like
+         * any synchronous fault below). */
+        if (fp_pending_trap(ctx, insn.op) != I686_INTERP_CONTINUE) {
+            int fpr;
+
+            i686_vm32_exec_leave();
+            {
+                extern int i686_deliver_sync(i686_ctx_t *, int reason);
+                fpr = i686_deliver_sync(ctx, (int)I686_EXIT_FAULT);
+            }
+            if (fpr == 0) {
+                continue;
+            }
+            diag("x87 pending exception (#MF)", ctx, insn.op);
+            return I686_EXIT_FAULT;
+        }
         fn = (unsigned)insn.op < I686_REGISTRY_MAX ? s_registry[insn.op] : NULL;
         if (fn == NULL) {
             i686_vm32_exec_leave();
             ctx->exit_reason = I686_EXIT_UNDEF;
             ctx->exit_arg = insn.op;
+            /* R7-22: unhandled opcodes are #UD — deliver SIGILL
+             * (eip still addresses the faulting insn). */
+            {
+                extern int i686_deliver_sync(i686_ctx_t *, int reason);
+                if (i686_deliver_sync(ctx, (int)I686_EXIT_UNDEF) == 0) {
+                    continue;
+                }
+            }
             diag("unimplemented opcode", ctx, insn.op);
             return I686_EXIT_UNDEF;
         }
@@ -728,7 +805,16 @@ int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
         return I686_EXIT_UNDEF;
     }
     ea = x86_ea_compute(ctx, insn);
-    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, 8U);
+    i686_seg_check_data(ctx, x86_ea_seg(insn), ea, 8U, 1u);
+    /* R7-17: the destination write cycle happens on either outcome —
+     * probe host writability before any load/flag/register commit so a
+     * mismatching compare against read-only memory faults.  The
+     * same-value store is invisible on writable memory. */
+    if (!i686_span_mapped_writable(ctx, ea, 8U)) {
+        uint8_t *pb = (uint8_t *)i686_guest_ptr(ctx, ea);
+        uint8_t b0 = pb[0];
+        pb[0] = b0;
+    }
     q = (uint64_t *)i686_guest_ptr(ctx, ea);
     alo = ctx->gpr[I686_REG_EAX];
     ahi = ctx->gpr[I686_REG_EDX];

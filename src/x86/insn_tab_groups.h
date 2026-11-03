@@ -139,9 +139,10 @@ static const i686_group_t i686_group_tab[] = {
       { { 6u, 0u, 0u }, { 0u, 0u, 0u }, { 6u, 0u, 0u }, { 6u, 0u, 0u },
         { 6u, 0u, 0u }, { 5u, 0u, 0u }, { 6u, 0u, 0u }, { 5u, 0u, 0u } },
       0x00u },
-    /* x87 DA: mod=3 FCOM/FUCOM/FCOMP ST(i) (RC7b T4b); DA E9 FUCOMPP; FIADD-class m32 declined */
+    /* x87 DA: mod=3 FCMOVcc ST(i) (R7-27; /0=B,/1=E,/2=BE,/3=U); DA E9
+     * FUCOMPP; FIADD-class m32 declined in the handler */
     { 0u, 0xDAu,
-      { I686_OP_FCOM_STi, I686_OP_FUCOM_STi, I686_OP_FCOMP_STi, I686_OP_INVALID,
+      { I686_OP_FCMOV_STi, I686_OP_FCMOV_STi, I686_OP_FCMOV_STi, I686_OP_FCMOV_STi,
         I686_OP_INVALID, I686_OP_FUCOMPP, I686_OP_INVALID, I686_OP_INVALID },
       { { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u },
         { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u }, { 0u, 0u, 0u } },

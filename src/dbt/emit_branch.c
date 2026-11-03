@@ -618,11 +618,10 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
         return 0;
 
     case I686_OP_HLT:
-        if (!l3c_pc_of(e, insn, &pc)) {
-            return -1;
-        }
-        l3c_exit_const(e, I686_EXIT_HLT, 0U, pc + (uint32_t)insn->len);
-        return 0;
+        /* R7-23: CPL=3 HLT is #GP(0); decline to the interpreter so the
+         * privilege check applies uniformly (DBT has no CPL state). */
+        (void)pc;
+        return -1;
 
     case I686_OP_UD2:
         if (!l3c_pc_of(e, insn, &pc)) {
@@ -642,9 +641,13 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
         return 0;
 
     case I686_OP_NOP:
-    case I686_OP_WAIT:
         (void)insn;
         return 0; /* block continues; translate.c advances pc */
+
+    case I686_OP_WAIT:
+        /* R7-30: WAIT checks pending x87 exceptions (#MF), which
+         * emitted code cannot see — decline to the interpreter. */
+        return -1; /* D2 interpret-one */
 
     case I686_OP_LOOPNZ_Jb:
     case I686_OP_LOOPZ_Jb:

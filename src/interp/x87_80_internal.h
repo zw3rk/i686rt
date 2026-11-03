@@ -12,8 +12,8 @@
 
 #include <string.h>
 
-extern unsigned i686_x87_80_rc;
-extern unsigned i686_x87_80_pc;
+extern _Thread_local unsigned i686_x87_80_rc; /* R7-32: TLS */
+extern _Thread_local unsigned i686_x87_80_pc;
 #define g_rc i686_x87_80_rc
 #define g_pc i686_x87_80_pc
 
@@ -488,7 +488,16 @@ static inline unsigned round_pack80(xf_t *r, bool sign, u2 m, int32_t exp, bool 
     }
 
     sig = rnd_sig(m, sticky, eff, sign, &inexact);
-    if (eff >= 1 && sig == (((uint64_t)1) << eff)) {
+    if (eff >= 64) {
+        /* R7-25: full-width precision has no (1ULL << 64) to
+         * compare against (undefined shift).  The increment
+         * inside rnd_sig wraps UINT64_MAX to zero instead, so a
+         * zero result IS the carry: renormalize to 2^63. */
+        if (sig == 0u) {
+            sig = 1ULL << 63;
+            exp++;
+        }
+    } else if (eff >= 1 && sig == (((uint64_t)1) << eff)) {
         sig >>= 1;
         exp++;
     }

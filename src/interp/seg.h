@@ -107,6 +107,12 @@ int i686_seg_load(i686_ctx_t *ctx, unsigned reg, uint16_t sel);
  * 32-bit code descriptor (the ELF process initial state). */
 bool i686_seg_flat_cs(const i686_ctx_t *ctx);
 
+/* R7-43: instruction-specific alignment check (#GP(0) via the seg
+ * fault path when (linear & (align-1)) != 0; align is a power of two,
+ * 16 for the aligned SIMD/FP-state moves). */
+void i686_seg_check_align(i686_ctx_t *ctx, uint32_t linear,
+                          unsigned align);
+
 /* --- h_seg.c far transfers (L7a) ---------------------------------------
 
    All return I686_SEG_* or I686_SEG_OK; on OK the handlers advance

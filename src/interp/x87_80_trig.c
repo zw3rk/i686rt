@@ -336,8 +336,11 @@ static unsigned fsincos_common(uint8_t out[10], const uint8_t av[10],
         return X_IE;
     }
     if (a.cls == X_NUM && a.exp >= 63) {
+        /* R7-38: outside the reduction range: C2 (incomplete),
+         * operand unchanged, no exception (not #IA). */
         memcpy(out, av, 10);
-        return X_IE;
+        *stack_fault = true;
+        return 0;
     }
     if (xf_is_den(&a)) flags |= X_DE;
     if (a.cls == X_ZERO) {
@@ -409,9 +412,12 @@ unsigned x87_80_fptan(uint8_t out_tan[10], uint8_t out_one[10],
         return X_IE;
     }
     if (a.cls == X_NUM && a.exp >= 63) {
+        /* R7-38: outside the reduction range: C2 (incomplete),
+         * operand unchanged, no exception (not #IA). */
         memcpy(out_tan, av, 10);
         x87_80_one(out_one);
-        return X_IE;
+        *stack_fault = true;
+        return 0;
     }
     if (xf_is_den(&a)) flags |= X_DE;
     x87_80_one(out_one);
@@ -462,7 +468,13 @@ unsigned x87_80_fpatan(uint8_t out[10], const uint8_t av[10], const uint8_t bv[1
         bool yi = y.cls == X_INF, xi = x.cls == X_INF;
 
         if (yi && xi) {
-            flags |= round_pack80(&r, y.sign, t3pi4.m, t3pi4.e, true, 64u);
+            /* R7-46: atan2(+-inf,+-inf) is +-pi/4 for x>0 but
+             * +-3*pi/4 for x<0 (each with the sign of y). */
+            if (x.sign) {
+                flags |= round_pack80(&r, y.sign, t3pi4.m, t3pi4.e, true, 64u);
+            } else {
+                flags |= round_pack80(&r, y.sign, pi4.m, pi4.e, true, 64u);
+            }
             xf_encode(&r, out);
             return flags;
         }

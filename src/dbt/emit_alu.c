@@ -594,7 +594,13 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
      * bit shifted out, OF only when cnt == 1 (SHL: CF^MSB(res), SHR:
      * MSB(operand), SAR: 0).  Skipped when the pre-scan proved a later
      * full writer overwrites the flags first (JONLY producers are never
-     * skipped themselves, so this arm is normally untaken). */
+     * skipped themselves, so this arm is normally untaken).
+     *
+     * R7-15: the faultable store commits before flags publish — a
+     * faulting store leaves the pre-instruction flags intact for the
+     * retry (the store touches only w21/SCR_RES, so the flag scratch
+     * registers below stay live across it). */
+    emit_store_rm(e, insn, SCR_RES, width);
     if (e->skip_lazy == 0U) {
         a64_emit_ldr_imm_w(b, SCR_T0, 19U, 36U);
         a64_emit_movz_w(b, SCR_T1, 0x08D5U, 0U); /* CF|PF|AF|ZF|SF|OF */
@@ -649,7 +655,6 @@ static int emit_shift_imm(i686_emit_ctx_t *e, const x86_insn_t *insn,
         e->flags_src = I686_FLAGS_DEAD;
     }
 
-    emit_store_rm(e, insn, SCR_RES, width);
     e->insn_count++;
     return 0;
 }

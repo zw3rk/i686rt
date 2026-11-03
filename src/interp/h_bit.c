@@ -23,6 +23,9 @@
 
 extern void i686_split_lock_acquire(void);
 extern void i686_split_lock_release(void);
+extern uint8_t x86_ea_seg(const x86_insn_t *insn);
+extern void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                                unsigned bytes, unsigned write);
 
 /* Operand size in bits: 66 selects 16-bit operands in flat 32-bit code. */
 static unsigned opnd_width(const x86_insn_t *insn)
@@ -101,6 +104,9 @@ static int bt_common(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mode,
             index = (unsigned)(raw_index & (width - 1U));
         }
         byte_off = (uint32_t)(index >> 3); /* 0..width/8-1 */
+        /* R7-9: bit-test RMW honors segment limits with access kind. */
+        i686_seg_check_data(ctx, x86_ea_seg(insn), ea + byte_off, 1u,
+                            (mode != (unsigned)BT_TEST) ? 1u : 0u);
         p = (uint8_t *)i686_guest_ptr(ctx, ea + byte_off);
         bitpos = index & 7U;
 

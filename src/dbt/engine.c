@@ -640,8 +640,12 @@ dispatch:
         dbt_sync_thread_cache(ctx);
         dbt_graveyard_drain();
         {
-            extern bool i686_seg_flat_cs(const i686_ctx_t *ctx);
-            if (!i686_seg_flat_cs(ctx) || ctx->v86 != 0U) {
+            /* R7-9: every segment assumption baked into emitted code is
+             * gated here (CS flatness, GDT-only data, live stack/data
+             * selectors, 32-bit stack); the interpreter enforces the
+             * rest until emitted checks exist. */
+            extern bool i686_seg_dbt_eligible(const i686_ctx_t *ctx);
+            if (!i686_seg_dbt_eligible(ctx) || ctx->v86 != 0U) {
                 i686_fault_disarm();
                 return i686_interp_run(ctx);
             }
@@ -714,7 +718,11 @@ dispatch:
                 }
                 continue;
             }
-            if (ir == I686_EXIT_FAULT || ir == I686_EXIT_TRAP) {
+            /* R7-22: the stepped UNDEF joins FAULT/TRAP on the
+             * single delivery path (step leaves eip at the
+             * faulting insn, or past it for traps). */
+            if (ir == I686_EXIT_FAULT || ir == I686_EXIT_TRAP ||
+                ir == I686_EXIT_UNDEF) {
                 extern int i686_deliver_sync(i686_ctx_t *, int);
                 extern void i686_diag_fault(i686_ctx_t *);
                 if (i686_deliver_sync(ctx, ir) == 0) {
@@ -728,7 +736,20 @@ dispatch:
             return ir;
         }
         case I686_EXIT_TRAP:
-        case I686_EXIT_FAULT:
+        case I686_EXIT_FAULT: {
+            /* R7-22: direct DBT traps/faults deliver guest
+             * signals (SIGTRAP/SIGSEGV/...); exit_dest carries
+             * the fault-vs-trap EIP (at vs past the insn). */
+            extern int i686_deliver_sync(i686_ctx_t *, int);
+            extern void i686_diag_fault(i686_ctx_t *);
+            ctx->eip = ctx->exit_dest;
+            if (i686_deliver_sync(ctx, r) == 0) {
+                goto dispatch;
+            }
+            i686_diag_fault(ctx);
+            i686_fault_disarm();
+            return r;
+        }
         case I686_EXIT_HLT:
             i686_fault_disarm();
             return r;

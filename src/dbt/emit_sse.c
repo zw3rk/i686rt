@@ -26,7 +26,7 @@
  *     via emit-time-constant TBL index vectors
  *   PADDD/PADDQ/PSUBD/PSUBQ/PMULLW/PMULUDQ, PXOR/POR/PAND/PANDN (66)
  *   ANDPS/ANDNPS/ORPS/XORPS (+66 = *PD)
- *   ADD/SUB/MUL/DIV PS/PD/SS/SD (FADD/FSUB/FMUL/FDIV .4S/.2D/scalar)
+ *   (R7-51: ADD/SUB/MUL/DIV PS/PD/SS/SD declined to D2; see below)
  *   CMPPS/SS/PD/SD imm8 predicates 0..7 (eq/lt/le/unord/neq/nlt/nle/
  *     ord via FCMEQ/FCMGT/FCMGE + AND/MVN; NaN = x86 unord semantics)
  *   MOVMSKPS/PD lives in emit_sse2.c (with PMOVMSKB)
@@ -40,9 +40,11 @@
  * Declined (return -1 -> D2 interpret-one, per the card): the MMX
  * (unprefixed) integer forms, MOVDDUP/MOVSLDUP/MOVSHDUP, F2 0F 5B
  * (CVTPD2DQ), CMPPS-family predicates imm8 > 7, x86-rejected encodings,
- * LOCK-prefixed anything, and FXSAVE/FXRSTOR/XSAVE (ride the D2
- * interpreter). See the shared header and emit_sse2.c for the rows
- * owned there. Known v1 deviations (MXCSR rounding/FTZ/DAZ, CVTT*
+ * LOCK-prefixed anything, FXSAVE/FXRSTOR/XSAVE (ride the D2
+ * interpreter), and — R7-51 — ADD/SUB/MUL/DIV PS/PD/SS/SD plus the
+ * CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ row (guest rounding/status/result
+ * semantics unmet). See the shared header and emit_sse2.c for the rows
+ * owned there. Remaining known v1 deviations (CVTTPS2PI/CVTTPD2PI
  * saturation, TSO plain Q stores, MMX tag rules) are documented in
  * emit_sse_shared.h and unchanged.
  */
@@ -50,32 +52,6 @@
 #include <stdint.h>
 
 #include "dbt/emit_sse_shared.h"
-
-/* FP arithmetic bases, op order add/sub/mul/div mirrors the table. */
-static const uint32_t sse_fp_vec_s[4] = {
-    0x4E20D400U, /* FADD V.4S */
-    0x4EA0D400U, /* FSUB V.4S */
-    0x6E20DC00U, /* FMUL V.4S */
-    0x6E20FC00U, /* FDIV V.4S */
-};
-static const uint32_t sse_fp_sca_s[4] = {
-    0x1E202800U, /* FADD S */
-    0x1E203800U, /* FSUB S */
-    0x1E200800U, /* FMUL S */
-    0x1E201800U, /* FDIV S */
-};
-static const uint32_t sse_fp_vec_d[4] = {
-    0x4E60D400U, /* FADD V.2D */
-    0x4EE0D400U, /* FSUB V.2D */
-    0x6E60DC00U, /* FMUL V.2D */
-    0x6E60FC00U, /* FDIV V.2D */
-};
-static const uint32_t sse_fp_sca_d[4] = {
-    0x1E602800U, /* FADD D */
-    0x1E603800U, /* FSUB D */
-    0x1E600800U, /* FMUL D */
-    0x1E601800U, /* FDIV D */
-};
 
 /* ---- per-family emitters -------------------------------------------- */
 
@@ -311,10 +287,10 @@ static int sse_emit_punpck(i686_emit_ctx_t *e, const x86_insn_t *insn,
         sse_zip2_8h(b, 0U, 0U, 1U);
         break;
     case 5U:
-        /* PUNPCKHDQ: {d1,s1,d3,s3} — the HIGH dword of each 64-bit
-         * half, i.e. lanes 1 and 3; composed with INS. */
-        sse_ins_s_elt(b, 2U, 0U, 0U, 1U);
-        sse_ins_s_elt(b, 2U, 1U, 1U, 1U);
+        /* R7-49 PUNPCKHDQ: {d2,s2,d3,s3} — the HIGH two dwords of the
+         * 128-bit operand (lanes 2 and 3); composed with INS. */
+        sse_ins_s_elt(b, 2U, 0U, 0U, 2U);
+        sse_ins_s_elt(b, 2U, 1U, 1U, 2U);
         sse_ins_s_elt(b, 2U, 2U, 0U, 3U);
         sse_ins_s_elt(b, 2U, 3U, 1U, 3U);
         sse_mov_v_v(b, 0U, 2U);
@@ -476,7 +452,9 @@ static int sse_emit_pmuludq(i686_emit_ctx_t *e, const x86_insn_t *insn)
 }
 
 /* PXOR/POR/PAND/PANDN (66) + ANDPS/ANDNPS/ORPS/XORPS (+66 = *PD).
- * kind: 0 xor, 1 or, 2 and, 3 andn (dest = ~dest & src). */
+ * kind: 0 xor, 1 or, 2 and, 3 andn (dest = ~dest & src).
+ * XMM-only: the MMX (unprefixed PAND/PANDN/POR/PXOR) forms are
+ * declined at dispatch (R7-48) and never reach here. */
 static int sse_emit_plogic(i686_emit_ctx_t *e, const x86_insn_t *insn,
                            unsigned kind)
 {
@@ -503,69 +481,22 @@ static int sse_emit_plogic(i686_emit_ctx_t *e, const x86_insn_t *insn,
 }
 
 /* ADD/SUB/MUL/DIV PS/PD/SS/SD (kind: 0 add, 1 sub, 2 mul, 3 div).
- * Scalar lane reads copy only lane 0; only lane 0 of the source is
- * consumed by the scalar paths below.
  *
- * FTZ/DAZ guard: NEON runs with the host FPCR (round-to-nearest, no
- * flush), so when the guest MXCSR has flush-to-zero (bit 15) or
- * denormals-are-zero (bit 6) set the op takes the D2 interpret-one path
- * (the interpreter honors FTZ/DAZ flushing and UE/PE/DE accumulation
- * exactly).  CBZ preserves host NZCV, so pending lazy flags survive. */
+ * R7-51: declined to the D2 interpret-one path.  The retired NEON
+ * fast path ran under host FPCR (round-to-nearest, no flush) with
+ * only an FTZ/DAZ guard: guest rounding modes, unmasked traps, and
+ * guest exception-status accumulation (IE/ZE/OE/UE/PE/DE, e.g. masked
+ * DIVSS-by-zero's ZE) never matched, and invalid results carried the
+ * A64 default-NaN payload (0x7FC00000) instead of the x86 indefinite
+ * QNaN (0xFFC00000/0xFFF8...).  Re-enable only with guest
+ * rounding/status/result semantics proven against the interpreter. */
 static int sse_emit_fparith(i686_emit_ctx_t *e, const x86_insn_t *insn,
                             unsigned kind)
 {
-    a64_buf_t *b = &e->buf;
-    size_t to_neon;
-
-    a64_emit_ldr_imm_w(b, SSE_W8, A64_XCTX, 0x198U); /* ctx->mxcsr */
-    a64_emit_movz_w(b, SSE_W9, 0x8040U, 0U);         /* FTZ|DAZ */
-    a64_emit_and_reg_w(b, false, SSE_W8, SSE_W8, SSE_W9, A64_SHIFT_LSL, 0U);
-    to_neon = a64_emit_cbz_w_placeholder(b, false, SSE_W8);
-    i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
-    a64_patch_cbz_w(b, to_neon, b->count);
-    /* The guard exit closed the block; reopen it so the NEON fast path
-     * stays inline and translation continues past this insn (a mid-block
-     * conditional RET is sound: the engine dispatches on any exit). */
-    e->block_open = true;
-
-    sse_q_ldr(e, 0U, insn->modrm_reg & 7U);
-    if (insn->pfx_rep == 0U && insn->pfx_opsize == 0U) { /* PS */
-        if (insn->modrm_mod == 3U) {
-            sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
-        } else {
-            sse_guest_addr(e, insn);
-            sse_ldr_q(b, 1U, SSE_ADDR, 0U);
-        }
-        sse_fp_vec(b, sse_fp_vec_s[kind], 0U, 0U, 1U);
-    } else if (insn->pfx_rep == 0U) { /* PD */
-        if (insn->modrm_mod == 3U) {
-            sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
-        } else {
-            sse_guest_addr(e, insn);
-            sse_ldr_q(b, 1U, SSE_ADDR, 0U);
-        }
-        sse_fp_vec(b, sse_fp_vec_d[kind], 0U, 0U, 1U);
-    } else if (insn->pfx_rep == 1U) { /* SS: result lane only */
-        if (insn->modrm_mod == 3U) {
-            sse_s_ldr(e, 1U, insn->modrm_rm & 7U);
-        } else {
-            sse_guest_addr(e, insn);
-            sse_ldr_s(b, 1U, SSE_ADDR, 0U);
-        }
-        sse_fp_sca(b, sse_fp_sca_s[kind], 2U, 0U, 1U);
-        sse_ins_s_elt(b, 0U, 0U, 2U, 0U);
-    } else { /* SD */
-        if (insn->modrm_mod == 3U) {
-            sse_d_ldr(e, 1U, insn->modrm_rm & 7U);
-        } else {
-            sse_guest_addr(e, insn);
-            sse_ldr_d(b, 1U, SSE_ADDR, 0U);
-        }
-        sse_fp_sca(b, sse_fp_sca_d[kind], 2U, 0U, 1U);
-        sse_ins_d_elt(b, 0U, 0U, 2U, 0U);
-    }
-    sse_q_str(e, insn->modrm_reg & 7U, 0U);
-    return 0;
+    (void)e;
+    (void)insn;
+    (void)kind;
+    return -1;
 }
 
 /* le core: v2 = (dest < src) | (dest == src).  A64 FCMEQ/FCMGT are
@@ -775,12 +706,26 @@ int i686_emit_sse(i686_emit_ctx_t *e, const x86_insn_t *insn)
     case I686_OP_PMULUDQ:
         return sse_emit_pmuludq(e, insn);
     case I686_OP_PAND:
+        /* R7-48: unprefixed form is MMX (mm bank, 8-byte mem); the
+         * XMM-only plogic emitter must not see it. */
+        if (insn->pfx_opsize == 0U) {
+            return -1;
+        }
         return sse_emit_plogic(e, insn, 2U);
     case I686_OP_PANDN:
+        if (insn->pfx_opsize == 0U) {
+            return -1;
+        }
         return sse_emit_plogic(e, insn, 3U);
     case I686_OP_POR:
+        if (insn->pfx_opsize == 0U) {
+            return -1;
+        }
         return sse_emit_plogic(e, insn, 1U);
     case I686_OP_PXOR:
+        if (insn->pfx_opsize == 0U) {
+            return -1;
+        }
         return sse_emit_plogic(e, insn, 0U);
     case I686_OP_ANDPS:
         return sse_emit_plogic(e, insn, 2U);

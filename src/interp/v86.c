@@ -218,14 +218,19 @@ cannot_handle:
 /* ------------------------------------------------------------------ */
 
 /* 16-bit ModRM EA: returns 0 with (seg, off) filled, -1 for mod == 3
- * (register form: caller decodes the reg fields), faults (VM86_SIGNAL)
- * for the unsupported 32-bit-addressing case.  seg_default: SS for the
- * bp-based forms ([bp+si], [bp+di], [bp+disp]), DS otherwise. */
+ * (register form: caller decodes the reg fields), or a positive
+ * VM86_* fault code (callers must propagate it, not treat it as the
+ * register form).  seg_default: SS for the bp-based forms ([bp+si],
+ * [bp+di], [bp+disp]), DS otherwise ([disp16] included).  A 0x67
+ * address-size prefix makes any memory operand fault like an unknown
+ * opcode (register forms stay legal). */
 static long modrm_ea(i686_ctx_t *ctx, i686_v86state_t *vs, uint16_t ov_seg,
-                     int has_ov, uint8_t modrm, uint16_t *seg, uint16_t *off)
+                     int has_ov, int addr32, uint8_t modrm, uint16_t *seg,
+                     uint16_t *off)
 {
     static const uint8_t rm16_base[8] = {
-        3, 3, 5, 5, 6, 6, 5, 3 /* bx, bx, bp, bp, si, di, bp, bx */
+        /* R7-53: [di] is DI (7), not SI. */
+        3, 3, 5, 5, 6, 7, 5, 3 /* bx, bx, bp, bp, si, di, bp, bx */
     };
     static const uint8_t rm16_idx[8] = {
         6, 7, 6, 7, 0xFF, 0xFF, 0xFF, 0xFF /* si, di, si, di, -, -, -, - */
@@ -236,6 +241,11 @@ static long modrm_ea(i686_ctx_t *ctx, i686_v86state_t *vs, uint16_t ov_seg,
 
     if (mod == 3U) {
         return -1;
+    }
+    if (addr32 != 0) {
+        /* R7-53: 32-bit addressing is not implemented for the
+         * executed subset: fault before consuming displacement. */
+        return v86_fault_sigill(ctx);
     }
     if (mod == 0U && rm == 6U) {
         /* [disp16]: direct 16-bit displacement, NO base register. */
@@ -255,7 +265,9 @@ static long modrm_ea(i686_ctx_t *ctx, i686_v86state_t *vs, uint16_t ov_seg,
     if (has_ov) {
         *seg = ov_seg;
     } else {
-        *seg = ((rm == 2U || rm == 3U || rm == 6U) && mod != 0U)
+        /* R7-53: mod == 0 [bp+si]/[bp+di] default to SS; only the
+         * baseless [disp16] (rm == 6, mod == 0) defaults to DS. */
+        *seg = (rm == 2U || rm == 3U || (rm == 6U && mod != 0U))
                    ? seg_get(ctx, I686_SEG_SS)
                    : seg_get(ctx, I686_SEG_DS);
     }
@@ -275,20 +287,32 @@ static long v86_step(i686_ctx_t *ctx, i686_v86state_t *vs, i686_vm86_enter_t *ks
 {
     uint32_t orig_flags = i686_flags_read(ctx);
     uint32_t data32 = 0;
+    uint32_t addr32 = 0;
     uint16_t ov_seg = 0;
     int has_ov = 0;
     uint8_t op;
     int pref_done = 0;
+    unsigned npref = 0;
 
-    /* Prefix stream (kernel handle_vm86_fault scan, vm86_32.c:569-583). */
+    /* Prefix stream (kernel handle_vm86_fault scan, vm86_32.c:569-583).
+     * R7-54: bounded by the 15-byte x86 instruction-length limit — an
+     * all-prefix segment wraps IP at 16 bits and would otherwise spin
+     * inside one v86_step() forever.  Overlong encodings #GP on real
+     * hardware; in the vm86 freeze that surfaces as guest SIGSEGV. */
     do {
+        if (npref >= 15U) {
+            return v86_fault_sig(ctx, 11); /* SIGSEGV (#GP overlong) */
+        }
         op = fetch8(ctx, vs);
+        npref++;
         switch (op) {
         case 0x66: /* 32-bit operand size */
             data32 = 1;
             break;
         case 0x67: /* 32-bit address size: skipped for the fault-class
-                    * ops below; the executed subset rejects it */
+                    * ops below (R7-53: recorded — the executed subset
+                    * faults memory operands using it) */
+            addr32 = 1;
             break;
         case 0x2e: /* CS */
             ov_seg = seg_get(ctx, I686_SEG_CS); has_ov = 1;
@@ -402,7 +426,12 @@ static long v86_step(i686_ctx_t *ctx, i686_v86state_t *vs, i686_vm86_enter_t *ks
     case 0x8a: { /* mov r8, r/m8 */
         uint8_t modrm = fetch8(ctx, vs);
         uint16_t seg, off;
-        if (modrm_ea(ctx, vs, ov_seg, has_ov, modrm, &seg, &off) != 0) {
+        long ea_rc =
+            modrm_ea(ctx, vs, ov_seg, has_ov, (int)addr32, modrm, &seg, &off);
+        if (ea_rc > 0) {
+            return ea_rc; /* R7-53: 0x67-addressed memory fault */
+        }
+        if (ea_rc != 0) {
             /* register form: 0x88 rm<-reg, 0x8a reg<-rm */
             if (op == 0x88U) {
                 r8_set(ctx, modrm & 7U, r8_get(ctx, (modrm >> 3) & 7U));
@@ -423,7 +452,12 @@ static long v86_step(i686_ctx_t *ctx, i686_v86state_t *vs, i686_vm86_enter_t *ks
     case 0x8b: { /* mov r16, r/m16 */
         uint8_t modrm = fetch8(ctx, vs);
         uint16_t seg, off;
-        if (modrm_ea(ctx, vs, ov_seg, has_ov, modrm, &seg, &off) != 0) {
+        long ea_rc =
+            modrm_ea(ctx, vs, ov_seg, has_ov, (int)addr32, modrm, &seg, &off);
+        if (ea_rc > 0) {
+            return ea_rc; /* R7-53: 0x67-addressed memory fault */
+        }
+        if (ea_rc != 0) {
             /* register form: 0x89 rm<-reg, 0x8b reg<-rm */
             unsigned dst = (op == 0x89U) ? (modrm & 7U) : ((modrm >> 3) & 7U);
             unsigned src = (op == 0x89U) ? ((modrm >> 3) & 7U) : (modrm & 7U);
@@ -454,17 +488,21 @@ static long v86_step(i686_ctx_t *ctx, i686_v86state_t *vs, i686_vm86_enter_t *ks
     case 0xc7: { /* mov r/m16, imm16 (0x66: imm32) */
         uint8_t modrm = fetch8(ctx, vs);
         uint16_t seg, off;
-        long is_mem = modrm_ea(ctx, vs, ov_seg, has_ov, modrm, &seg, &off);
+        long ea_rc =
+            modrm_ea(ctx, vs, ov_seg, has_ov, (int)addr32, modrm, &seg, &off);
+        if (ea_rc > 0) {
+            return ea_rc; /* R7-53: 0x67-addressed memory fault */
+        }
         if (op == 0xc6U) {
             uint8_t imm = fetch8(ctx, vs);
-            if (is_mem != 0) {
+            if (ea_rc != 0) {
                 r8_set(ctx, modrm & 7U, imm);
             } else {
                 wr8(ctx, vs, v86_lin(seg, off), imm);
             }
         } else {
             uint32_t imm = (data32 != 0U) ? fetch32(ctx, vs) : fetch16(ctx, vs);
-            if (is_mem != 0) {
+            if (ea_rc != 0) {
                 if (data32 != 0U) {
                     r32_set(ctx, modrm & 7U, imm);
                 } else {
@@ -624,6 +662,8 @@ long i686_v86_enter(i686_ctx_t *ctx, i686_vm86_enter_t *ks)
     ctx->gpr[I686_REG_EDI] = ks->regs.edi;
     ctx->gpr[I686_REG_EBP] = ks->regs.ebp;
     ctx->gpr[I686_REG_EAX] = ks->regs.eax;
+    /* R7-52: install the supplied ESP (pushes/pops use ss:sp). */
+    ctx->gpr[I686_REG_ESP] = ks->regs.esp;
     ctx->eip = ks->regs.eip & 0xFFFFU;
     seg_set(ctx, I686_SEG_CS, ks->regs.cs);
     seg_set(ctx, I686_SEG_SS, ks->regs.ss);

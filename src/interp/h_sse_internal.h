@@ -14,6 +14,7 @@
 #include "interp/flags.h"
 #include "interp/interp.h"
 #include "interp/sse.h"
+#include "interp/x87.h"
 
 #define MXCSR_IE  0x0001u /* invalid operation                         */
 #define MXCSR_DE  0x0002u /* denormal operand                          */
@@ -111,16 +112,52 @@ static inline uint64_t f64_quiet(uint64_t b)
     return b | 0x0008000000000000ull;
 }
 
-static inline int sse_done(i686_ctx_t *ctx, const x86_insn_t *insn)
+/* Plain completion (no mask test): state-management handlers that
+ * never raise (LDMXCSR/STMXCSR/EMMS) complete through here so a
+ * restored image with set+unmasked flags does not fault on the
+ * restore itself. */
+static inline int sse_done_nocheck(i686_ctx_t *ctx,
+                                   const x86_insn_t *insn)
 {
     ctx->eip += insn->len;
     return I686_INTERP_CONTINUE;
 }
 
+static inline int sse_done(i686_ctx_t *ctx, const x86_insn_t *insn)
+{
+    /* R7-30: an unmasked SIMD exception faults (#XM, EIP stays at
+     * the insn) instead of completing silently.  MXCSR masks ride
+     * bits 7..12, status bits 0..5.  Pending-style: any computing
+     * handler that left unmasked status faults here, so a guest
+     * must clear/mask to make progress. */
+    if ((ctx->mxcsr & ~(ctx->mxcsr >> 7) & 0x3fU) != 0U) {
+        extern void i686_fault_sig_record(int sig);
+
+        ctx->exit_arg = 19U; /* #XM trapno */
+        i686_fault_sig_record(8); /* SIGFPE */
+        return I686_EXIT_FAULT;
+    }
+    return sse_done_nocheck(ctx, insn);
+}
+
+/* R7-4: default segment from the decoded base register (matches
+ * decode.c ea_default_seg); R7-5: 16-bit offsets wrap mod 64K before
+ * the segment base is added. */
+static inline uint8_t sse_ea_seg(const x86_insn_t *insn)
+{
+    if (insn->pfx_seg != I686_NONE) {
+        return insn->pfx_seg;
+    }
+    if (insn->ea_base == I686_REG_EBP || insn->ea_base == I686_REG_ESP) {
+        return I686_SEG_SS;
+    }
+    return I686_SEG_DS;
+}
+
 static inline uint32_t sse_ea(const i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint32_t ea = insn->ea_disp;
-    uint8_t seg;
+    uint8_t seg = sse_ea_seg(insn);
 
     if (insn->ea_base != I686_NONE) {
         ea += ctx->gpr[insn->ea_base & 7U];
@@ -128,14 +165,8 @@ static inline uint32_t sse_ea(const i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->ea_index != I686_NONE) {
         ea += ctx->gpr[insn->ea_index & 7U] << insn->ea_scale;
     }
-    if (insn->pfx_seg != I686_NONE) {
-        seg = insn->pfx_seg;
-    } else if (insn->modrm_mod != 0U &&
-               (insn->ea_base == I686_REG_EBP || insn->ea_base == I686_REG_ESP ||
-                (insn->pfx_addrsize != 0U && insn->ea_base == I686_REG_EBP))) {
-        seg = I686_SEG_SS;
-    } else {
-        seg = I686_SEG_DS;
+    if (insn->pfx_addrsize != 0U) {
+        ea &= 0xFFFFU;
     }
     if (seg < I686_SEG_COUNT) {
         ea += ctx->seg_base[seg];
@@ -143,16 +174,39 @@ static inline uint32_t sse_ea(const i686_ctx_t *ctx, const x86_insn_t *insn)
     return ea;
 }
 
+void i686_seg_check_data(i686_ctx_t *ctx, uint8_t seg, uint32_t linear,
+                         unsigned bytes, unsigned write);
+void i686_seg_check_align(i686_ctx_t *ctx, uint32_t linear,
+                          unsigned align);
+
+/* R7-43: aligned 128-bit moves fault #GP(0) on misaligned memory
+ * operands before any load/store or register side effect.  Register
+ * operands never fault. */
+static inline void sse_align16(const i686_ctx_t *ctx,
+                               const x86_insn_t *insn)
+{
+    if (insn->modrm_mod != 3U) {
+        i686_seg_check_align((i686_ctx_t *)ctx, sse_ea(ctx, insn),
+                             16u);
+    }
+}
+
 static inline void sse_ld(const i686_ctx_t *ctx, const x86_insn_t *insn,
                           void *out, unsigned n)
 {
-    memcpy(out, i686_guest_ptr(ctx, sse_ea(ctx, insn)), n);
+    uint32_t ea = sse_ea(ctx, insn);
+    /* R7-9: SIMD loads honor segment limits like every other access. */
+    i686_seg_check_data((i686_ctx_t *)ctx, sse_ea_seg(insn), ea, n, 0u);
+    memcpy(out, i686_guest_ptr(ctx, ea), n);
 }
 
 static inline void sse_st(i686_ctx_t *ctx, const x86_insn_t *insn,
                           const void *in, unsigned n)
 {
-    memcpy(i686_guest_ptr(ctx, sse_ea(ctx, insn)), in, n);
+    uint32_t ea = sse_ea(ctx, insn);
+    /* R7-9: SIMD stores honor segment limits like every other access. */
+    i686_seg_check_data((i686_ctx_t *)ctx, sse_ea_seg(insn), ea, n, 1u);
+    memcpy(i686_guest_ptr(ctx, ea), in, n);
 }
 
 static inline void src128(const i686_ctx_t *ctx, const x86_insn_t *insn,
@@ -189,16 +243,24 @@ static inline void set_lane64(uint8_t *v, unsigned i, uint64_t b)
     memcpy(v + 8U * i, &b, 8);
 }
 
+/* R7-41: MMX registers alias the x87 stack — MM(i) is the
+ * physical slot (TOP+i)&7, like every x87 access — not physical i,
+ * which is only correct while TOP is zero. */
+static inline unsigned mm_phys(const i686_ctx_t *ctx, unsigned r)
+{
+    return ((unsigned)x87_top(ctx) + r) & 7U;
+}
+
 static inline uint64_t mm_rd(const i686_ctx_t *ctx, unsigned r)
 {
     uint64_t v;
-    memcpy(&v, ctx->x87_st[r & 7U], 8);
+    memcpy(&v, ctx->x87_st[mm_phys(ctx, r)], 8);
     return v;
 }
 
 static inline void mm_wr(i686_ctx_t *ctx, unsigned r, uint64_t v)
 {
-    memcpy(ctx->x87_st[r & 7U], &v, 8);
+    memcpy(ctx->x87_st[mm_phys(ctx, r)], &v, 8);
 }
 
 static inline void int_vec_dst_fetch(i686_ctx_t *ctx, const x86_insn_t *insn,

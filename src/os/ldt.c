@@ -202,24 +202,32 @@ long i686_sys_modify_ldt(i686_ctx_t *ctx, int func, uint32_t ua, uint32_t bc)
         for (i = 0u; i < n; i += 8u) {
             const i686_desc_t *d;
             uint8_t raw[8];
-            uint32_t g_flags;
 
             if (ctx->ldt == NULL) {
                 memset(raw, 0, sizeof(raw)); /* no LDT yet: all zero */
             } else {
+                /* R7-14: raw encoding is architectural — the S bit rides
+                 * the access byte, G is bit 7 of byte 6 (not 0x8000
+                 * truncated into a u8), and a page-granular limit
+                 * encodes back to its 20-bit form (inverse of the
+                 * desc_from_user_desc granularity conversion). */
+                uint32_t enc_limit;
                 st = (i686_segstate_t *)ctx->ldt;
                 d = &st->ldt[i / 8u];
-                g_flags = (d->flags & I686_DESC_G) != 0u ? 0x8000u : 0u;
-                raw[0] = (uint8_t)(d->limit & 0xFFu);
-                raw[1] = (uint8_t)((d->limit >> 8) & 0xFFu);
+                enc_limit = ((d->flags & I686_DESC_G) != 0u)
+                                ? (d->limit >> 12)
+                                : d->limit;
+                raw[0] = (uint8_t)(enc_limit & 0xFFu);
+                raw[1] = (uint8_t)((enc_limit >> 8) & 0xFFu);
                 raw[2] = (uint8_t)(d->base & 0xFFu);
                 raw[3] = (uint8_t)((d->base >> 8) & 0xFFu);
                 raw[4] = (uint8_t)((d->base >> 16) & 0xFFu);
-                raw[5] = (uint8_t)((d->type & 0x0Fu) | (d->dpl << 5) |
+                raw[5] = (uint8_t)((d->type & 0x1Fu) | (d->dpl << 5) |
                                    ((d->flags & I686_DESC_PRESENT) ? 0x80u : 0u));
-                raw[6] = (uint8_t)(((d->limit >> 16) & 0x0Fu) |
+                raw[6] = (uint8_t)(((enc_limit >> 16) & 0x0Fu) |
                                    ((d->flags & I686_DESC_USEABLE) ? 0x10u : 0u) |
-                                   (d->d_bit != 0u ? 0x40u : 0u) | g_flags);
+                                   (d->d_bit != 0u ? 0x40u : 0u) |
+                                   ((d->flags & I686_DESC_G) != 0u ? 0x80u : 0u));
                 raw[7] = (uint8_t)((d->base >> 24) & 0xFFu);
             }
             if (i686_copy_to_guest(ctx, ua + i, raw, sizeof(raw)) != 0) {

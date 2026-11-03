@@ -449,7 +449,16 @@ static unsigned to_int_core(const xf_t *f, uint64_t limit, uint64_t *ival,
     }
     xf_norm_num(f, &m, &e);
     if (e <= -1) {
-        bool up = (g_rc == 2u && !f->sign) || (g_rc == 1u && f->sign);
+        /* R7-33: nearest-even on [0.5, 1) (e == -1): exact one-half
+         * is even (0); anything above rounds to 1.  The old code
+         * rounded every such value to zero (0.75 -> 0). */
+        bool up;
+
+        if (g_rc == 0u && e == -1) {
+            up = (m != 0x8000000000000000ULL);
+        } else {
+            up = (g_rc == 2u && !f->sign) || (g_rc == 1u && f->sign);
+        }
         *ival = up ? 1u : 0u;
         return flags | X_PE;
     }
@@ -531,9 +540,12 @@ unsigned x87_80_to_i64(const uint8_t in[10], int64_t *out)
     return flags;
 }
 
+/* R7-24: the sign lands at `signbit` (bit 63 for binary64, bit 31
+ * for binary32) so narrowing callers keep negative signs. */
 static unsigned to_ieee_bits(const xf_t *f, unsigned p, int emax, int emin,
                              int bias, int fracbits, uint64_t inf_bits,
-                             uint64_t max_bits, uint64_t *bits)
+                             uint64_t max_bits, uint64_t signbit,
+                             uint64_t *bits)
 {
     uint64_t m, sig;
     int32_t e;
@@ -553,7 +565,7 @@ static unsigned to_ieee_bits(const xf_t *f, unsigned p, int emax, int emin,
             bool up = (g_rc == 1u && f->sign) || (g_rc == 2u && !f->sign);
 
             *bits = up ? 1u : 0u;
-            if (f->sign) *bits |= 0x8000000000000000ULL;
+            if (f->sign) *bits |= signbit;
             return flags | X_UE | X_PE;
         }
         sig = rnd_sig(m128, false, eff, f->sign, &inexact);
@@ -568,7 +580,7 @@ static unsigned to_ieee_bits(const xf_t *f, unsigned p, int emax, int emin,
                           (g_rc == 1u && f->sign);
             flags |= X_OE | X_PE;
             *bits = to_inf ? inf_bits : max_bits;
-            if (f->sign) *bits |= 0x8000000000000000ULL;
+            if (f->sign) *bits |= signbit;
             return flags;
         }
         if (exp >= emin) {
@@ -579,7 +591,7 @@ static unsigned to_ieee_bits(const xf_t *f, unsigned p, int emax, int emin,
             uint64_t frac = sh >= 64 ? 0 : (sig << sh);
             *bits = frac;
         }
-        if (f->sign) *bits |= 0x8000000000000000ULL;
+        if (f->sign) *bits |= signbit;
     }
     return flags;
 }
@@ -610,7 +622,8 @@ unsigned x87_80_to_f64(const uint8_t in[10], double *out)
         return 0;
     }
     flags = to_ieee_bits(&f, 53u, 1023, -1022, 1023, 52,
-                         0x7FF0000000000000ULL, 0x7FEFFFFFFFFFFFFFULL, &bits);
+                         0x7FF0000000000000ULL, 0x7FEFFFFFFFFFFFFFULL,
+                         0x8000000000000000ULL, &bits);
     memcpy(out, &bits, 8);
     return flags;
 }
@@ -643,7 +656,8 @@ unsigned x87_80_to_f32(const uint8_t in[10], float *out)
         return 0;
     }
     flags = to_ieee_bits(&f, 24u, 127, -126, 127, 23,
-                         0x7F800000ULL, 0x7F7FFFFFULL, &bits);
+                         0x7F800000ULL, 0x7F7FFFFFULL,
+                         0x80000000ULL, &bits);
     b32 = (uint32_t)bits;
     memcpy(out, &b32, 4);
     return flags;

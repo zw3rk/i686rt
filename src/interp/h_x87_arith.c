@@ -32,6 +32,10 @@ static int arith_d8dc(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind,
             k = K_DIV;
         }
     }
+    /* R7-31: stack sources validated before any read. */
+    if (x87_src(ctx, 0) || (reg && x87_src(ctx, insn->modrm_rm))) {
+        return I686_EXIT_FAULT;
+    }
     if (!ctx->x87_80) {
         double a;
         double b;
@@ -51,6 +55,10 @@ static int arith_d8dc(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind,
             b = (mbytes == 4) ? (double)ld_f32(ctx, va) : ld_f64(ctx, va);
         }
         r = dcalc(ctx, k, a, b);
+        /* R7-30: an unmasked raise inhibits the store below. */
+        if (x87_exc_raise(ctx, 0U) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         x87_set_f64(ctx, dst, r);
     } else {
         uint8_t sa[10];
@@ -76,8 +84,11 @@ static int arith_d8dc(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind,
             }
         }
         exc = x80calc(ctx, k, r, sa, sb);
+        /* R7-30: an unmasked raise inhibits the store below. */
+        if (x87_exc_raise(ctx, exc) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         x87_set_ext80(ctx, dst, r);
-        x87_set_exc(ctx, exc);
     }
     return done(ctx, insn);
 }
@@ -87,11 +98,19 @@ static int arith_de(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind)
     if (insn->modrm_mod != 3U) {
         return undef_form(ctx, insn); /* FIADD/FIMUL/FISUB/FIDIV declined */
     }
+    /* R7-31: stack sources validated before any read. */
+    if (x87_src(ctx, insn->modrm_rm) || x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
     if (!ctx->x87_80) {
         double a = x87_get_f64(ctx, insn->modrm_rm);
         double b = x87_get_f64(ctx, 0);
         double r = dcalc(ctx, kind, a, b);
 
+        /* R7-30: an unmasked raise inhibits the store/pop below. */
+        if (x87_exc_raise(ctx, 0U) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         x87_set_f64(ctx, insn->modrm_rm, r);
     } else {
         uint8_t sa[10];
@@ -102,8 +121,11 @@ static int arith_de(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned kind)
         x87_get_ext80(ctx, insn->modrm_rm, sa);
         x87_get_ext80(ctx, 0, sb);
         exc = x80calc(ctx, kind, r, sa, sb);
+        /* R7-30: an unmasked raise inhibits the store/pop below. */
+        if (x87_exc_raise(ctx, exc) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         x87_set_ext80(ctx, insn->modrm_rm, r);
-        x87_set_exc(ctx, exc);
     }
     x87_pop(ctx);
     return done(ctx, insn);
@@ -113,6 +135,12 @@ static int do_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mbytes,
                    int pop)
 {
     int un;
+
+    /* R7-31: stack sources validated before any read. */
+    if (x87_src(ctx, 0) ||
+        (insn->modrm_mod == 3U && x87_src(ctx, insn->modrm_rm))) {
+        return I686_EXIT_FAULT;
+    }
 
     if (!ctx->x87_80) {
         double a = x87_get_f64(ctx, 0);
@@ -125,7 +153,10 @@ static int do_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mbytes,
             b = (mbytes == 4) ? (double)ld_f32(ctx, va) : ld_f64(ctx, va);
         }
         un = cc_of_cmp(a, b, ctx);
-        exc_ie_cmp(ctx, a, b, un, false);
+        /* R7-30: an unmasked raise inhibits the pop below. */
+        if (exc_ie_cmp(ctx, a, b, un, false) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
     } else {
         uint8_t sa[10];
         uint8_t sb[10];
@@ -147,7 +178,10 @@ static int do_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, unsigned mbytes,
         x87_80_fcom(sa, sb, false, &c3, &c2, &c0);
         set_cc(ctx, c0, 0, c2, c3);
         if (c0 && c2 && c3) {
-            x87_set_exc(ctx, SW_IE);
+            /* R7-30: an unmasked raise inhibits the pop below. */
+            if (x87_exc_raise(ctx, SW_IE) != I686_INTERP_CONTINUE) {
+                return I686_EXIT_FAULT;
+            }
         }
     }
     if (pop) {
@@ -281,12 +315,19 @@ static int do_da_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
     if (insn->modrm_mod != 3U) {
         return undef_form(ctx, insn);
     }
+    /* R7-31: stack sources validated before any read. */
+    if (x87_src(ctx, 0) || x87_src(ctx, insn->modrm_rm)) {
+        return I686_EXIT_FAULT;
+    }
     if (!ctx->x87_80) {
         double a = x87_get_f64(ctx, 0);
         double b = x87_get_f64(ctx, insn->modrm_rm);
 
         un = cc_of_cmp(a, b, ctx);
-        exc_ie_cmp(ctx, a, b, un, true);
+        /* R7-30: an unmasked raise inhibits the pop below. */
+        if (exc_ie_cmp(ctx, a, b, un, true) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
     } else {
         uint8_t sa[10];
         uint8_t sb[10];
@@ -300,7 +341,10 @@ static int do_da_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
         set_cc(ctx, c0, 0, c2, c3);
         if ((c0 && c2 && c3) &&
             (x87_80_is_snan(sa) || x87_80_is_snan(sb))) {
-            x87_set_exc(ctx, SW_IE);
+            /* R7-30: an unmasked raise inhibits the pop below. */
+            if (x87_exc_raise(ctx, SW_IE) != I686_INTERP_CONTINUE) {
+                return I686_EXIT_FAULT;
+            }
         }
     }
     if (pop != 0) {
@@ -309,19 +353,46 @@ static int do_da_fcom(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
     return done(ctx, insn);
 }
 
-static int h_fcom_sti(i686_ctx_t *ctx, const x86_insn_t *insn)
+/* R7-27: DA /0-/3 mod=3 are FCMOVcc ST(0),ST(i) (B/E/BE/U from
+ * the /field: CF/ZF/CF|ZF/PF), not compares — no comparison, no
+ * stack pop.  Memory forms stay the declined FIADD class (#UD). */
+static int h_fcmov_sti(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
-    return do_da_fcom(ctx, insn, 0);
-}
+    uint32_t fl;
+    bool take;
+    unsigned p0;
+    unsigned p1;
+    unsigned stag;
 
-static int h_fucom_sti(i686_ctx_t *ctx, const x86_insn_t *insn)
-{
-    return do_da_fcom(ctx, insn, 0);
-}
-
-static int h_fcomp_sti(i686_ctx_t *ctx, const x86_insn_t *insn)
-{
-    return do_da_fcom(ctx, insn, 1);
+    if (insn->modrm_mod != 3U) {
+        return undef_form(ctx, insn);
+    }
+    fl = i686_flags_read(ctx);
+    switch (insn->modrm_reg) {
+    case 0U: take = (fl & I686_EF_CF) != 0U; break; /* B */
+    case 1U: take = (fl & I686_EF_ZF) != 0U; break; /* E */
+    case 2U: take = (fl & (I686_EF_CF | I686_EF_ZF)) != 0U; break; /* BE */
+    case 3U: take = (fl & I686_EF_PF) != 0U; break; /* U */
+    default: return undef_form(ctx, insn);
+    }
+    if (!take) {
+        return done(ctx, insn);
+    }
+    p0 = (unsigned)x87_top(ctx);
+    p1 = (p0 + insn->modrm_rm) & 7U;
+    stag = ((unsigned)ctx->ftag >> (p1 * 2U)) & 3U;
+    if (stag == 3U) {
+        /* Stack-fault response: an empty source is invalid but
+         * moves nothing (R7-30: faults when IE is unmasked). */
+        if (x87_exc_raise(ctx, SW_IE) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
+        return done(ctx, insn);
+    }
+    memcpy(&ctx->x87_st[p0][0], &ctx->x87_st[p1][0], 16);
+    ctx->ftag = (uint16_t)((ctx->ftag & ~(3U << (p0 * 2U))) |
+                           (stag << (p0 * 2U)));
+    return done(ctx, insn);
 }
 
 static int h_fucompp(i686_ctx_t *ctx, const x86_insn_t *insn)
@@ -348,6 +419,10 @@ static int h_fild_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     v = (uint32_t)mem_rd(ctx, x86_ea_compute(ctx, insn), 4);
     push_int(ctx, (int64_t)(int32_t)v);
+    /* R7-31: overflow with unmasked IE faults (EIP stays). */
+    if (x87_es_fault(ctx) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     return done(ctx, insn);
 }
 
@@ -356,7 +431,14 @@ static int h_fist_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    st_int(ctx, x86_ea_compute(ctx, insn), 4);
+    /* R7-31: ST(0) validated before the store reads it. */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_int(ctx, x86_ea_compute(ctx, insn), 4) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     return done(ctx, insn);
 }
 
@@ -375,7 +457,14 @@ static int h_fisttp_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    st_int_trunc(ctx, x86_ea_compute(ctx, insn), 4);
+    /* R7-31: ST(0) validated before the store reads it. */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_int_trunc(ctx, x86_ea_compute(ctx, insn), 4) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     x87_pop(ctx);
     return done(ctx, insn);
 }
@@ -385,7 +474,14 @@ static int h_fisttp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    st_int_trunc(ctx, x86_ea_compute(ctx, insn), 8);
+    /* R7-31: ST(0) validated before the store reads it. */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_int_trunc(ctx, x86_ea_compute(ctx, insn), 8) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     x87_pop(ctx);
     return done(ctx, insn);
 }
@@ -395,7 +491,14 @@ static int h_fisttp_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    st_int_trunc(ctx, x86_ea_compute(ctx, insn), 2);
+    /* R7-31: ST(0) validated before the store reads it. */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_int_trunc(ctx, x86_ea_compute(ctx, insn), 2) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     x87_pop(ctx);
     return done(ctx, insn);
 }
@@ -434,7 +537,10 @@ static int h_fld_m80(i686_ctx_t *ctx, const x86_insn_t *insn)
         for (unsigned i = 0; i < 10; i++) {
             b[i] = (uint8_t)mem_rd(ctx, va + i, 1);
         }
-        x87_push(ctx);
+        /* R7-31: overflow faults with TOP unchanged. */
+        if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
         x87_set_ext80(ctx, 0, b);
     }
     return done(ctx, insn);
@@ -453,6 +559,10 @@ static int h_fstp_m80(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
+    /* R7-31: ST(0) validated before the store reads it. */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
     st_m80(ctx, x86_ea_compute(ctx, insn));
     x87_pop(ctx);
     return done(ctx, insn);
@@ -467,6 +577,10 @@ static int h_fild_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     v = (uint32_t)mem_rd(ctx, x86_ea_compute(ctx, insn), 2);
     push_int(ctx, (int64_t)(int16_t)v);
+    /* R7-31: overflow with unmasked IE faults (EIP stays). */
+    if (x87_es_fault(ctx) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     return done(ctx, insn);
 }
 
@@ -475,7 +589,14 @@ static int h_fist_m16(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    st_int(ctx, x86_ea_compute(ctx, insn), 2);
+    /* R7-31: ST(0) validated before the store reads it. */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_int(ctx, x86_ea_compute(ctx, insn), 2) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     return done(ctx, insn);
 }
 
@@ -510,6 +631,10 @@ static int h_fild_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
         memcpy(&s, &v, 8);
         push_int(ctx, s);
     }
+    /* R7-31: overflow with unmasked IE faults (EIP stays). */
+    if (x87_es_fault(ctx) != I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT;
+    }
     return done(ctx, insn);
 }
 
@@ -526,7 +651,14 @@ static int h_fistp_m64(i686_ctx_t *ctx, const x86_insn_t *insn)
     if (insn->modrm_mod == 3U) {
         return undef_form(ctx, insn);
     }
-    st_int(ctx, x86_ea_compute(ctx, insn), 8);
+    /* R7-31: ST(0) validated before the store reads it. */
+    if (x87_src(ctx, 0)) {
+        return I686_EXIT_FAULT;
+    }
+    if (st_int(ctx, x86_ea_compute(ctx, insn), 8) !=
+        I686_INTERP_CONTINUE) {
+        return I686_EXIT_FAULT; /* R7-30: store inhibited */
+    }
     x87_pop(ctx);
     return done(ctx, insn);
 }
@@ -537,6 +669,11 @@ static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
     unsigned lt;
     unsigned eq;
 
+    /* R7-31: stack sources validated before any read. */
+    if (x87_src(ctx, 0) || x87_src(ctx, insn->modrm_rm)) {
+        return I686_EXIT_FAULT;
+    }
+
     if (!ctx->x87_80) {
         double a = x87_get_f64(ctx, 0);
         double b = x87_get_f64(ctx, insn->modrm_rm);
@@ -544,6 +681,13 @@ static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
         un = (isnan(a) || isnan(b)) ? 1U : 0U;
         lt = !un && a < b ? 1U : 0U;
         eq = !un && a == b ? 1U : 0U;
+        /* R7-36: FUCOMI signals only on signaling NaNs (a quiet
+         * unordered result sets flags without IE).  R7-30: an
+         * unmasked raise inhibits the pop below. */
+        if (exc_ie_cmp(ctx, a, b, (int)un, true) !=
+            I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
     } else {
         uint8_t sa[10];
         uint8_t sb[10];
@@ -557,9 +701,11 @@ static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
         un = (c0 && c2 && c3) ? 1U : 0U;
         lt = !un && c0 ? 1U : 0U;
         eq = !un && c3 ? 1U : 0U;
-    }
-    if (un) {
-        x87_set_exc(ctx, SW_IE);
+        /* R7-36/R7-30: as above, via the saved operand images. */
+        if (un && (x87_80_is_snan(sa) || x87_80_is_snan(sb)) &&
+            x87_exc_raise(ctx, SW_IE) != I686_INTERP_CONTINUE) {
+            return I686_EXIT_FAULT;
+        }
     }
     i686_flags_materialize(ctx);
     ctx->eflags &= ~(uint32_t)(I686_EF_ZF | I686_EF_PF | I686_EF_CF |
@@ -580,53 +726,51 @@ static int do_fcomi(i686_ctx_t *ctx, const x86_insn_t *insn, int pop)
 void i686_interp_x87_init_arith(void)
 {
     /* D8 (m32 / ST(i)) */
-    i686_interp_register(I686_OP_FADD_m32, h_fadd_m32);
-    i686_interp_register(I686_OP_FMUL_m32, h_fmul_m32);
-    i686_interp_register(I686_OP_FCOM_m32, h_fcom_m32);
-    i686_interp_register(I686_OP_FCOMP_m32, h_fcomp_m32);
-    i686_interp_register(I686_OP_FSUB_m32, h_fsub_m32);
-    i686_interp_register(I686_OP_FSUBR_m32, h_fsubr_m32);
-    i686_interp_register(I686_OP_FDIV_m32, h_fdiv_m32);
-    i686_interp_register(I686_OP_FDIVR_m32, h_fdivr_m32);
+    fp_reg(I686_OP_FADD_m32, h_fadd_m32);
+    fp_reg(I686_OP_FMUL_m32, h_fmul_m32);
+    fp_reg(I686_OP_FCOM_m32, h_fcom_m32);
+    fp_reg(I686_OP_FCOMP_m32, h_fcomp_m32);
+    fp_reg(I686_OP_FSUB_m32, h_fsub_m32);
+    fp_reg(I686_OP_FSUBR_m32, h_fsubr_m32);
+    fp_reg(I686_OP_FDIV_m32, h_fdiv_m32);
+    fp_reg(I686_OP_FDIVR_m32, h_fdivr_m32);
     /* DC (m64 / ST(i),ST(0)) */
-    i686_interp_register(I686_OP_FADD_m64, h_fadd_m64);
-    i686_interp_register(I686_OP_FMUL_m64, h_fmul_m64);
-    i686_interp_register(I686_OP_FCOM_m64, h_fcom_m64);
-    i686_interp_register(I686_OP_FCOMP_m64, h_fcomp_m64);
-    i686_interp_register(I686_OP_FSUB_m64, h_fsub_m64);
-    i686_interp_register(I686_OP_FSUBR_m64, h_fsubr_m64);
-    i686_interp_register(I686_OP_FDIV_m64, h_fdiv_m64);
-    i686_interp_register(I686_OP_FDIVR_m64, h_fdivr_m64);
+    fp_reg(I686_OP_FADD_m64, h_fadd_m64);
+    fp_reg(I686_OP_FMUL_m64, h_fmul_m64);
+    fp_reg(I686_OP_FCOM_m64, h_fcom_m64);
+    fp_reg(I686_OP_FCOMP_m64, h_fcomp_m64);
+    fp_reg(I686_OP_FSUB_m64, h_fsub_m64);
+    fp_reg(I686_OP_FSUBR_m64, h_fsubr_m64);
+    fp_reg(I686_OP_FDIV_m64, h_fdiv_m64);
+    fp_reg(I686_OP_FDIVR_m64, h_fdivr_m64);
     /* DE (pop) */
-    i686_interp_register(I686_OP_FADDP, h_faddp);
-    i686_interp_register(I686_OP_FMULP, h_fmulp);
-    i686_interp_register(I686_OP_FSUBRP, h_fsubrp);
-    i686_interp_register(I686_OP_FSUBP, h_fsubp);
-    i686_interp_register(I686_OP_FDIVRP, h_fdivrp);
-    i686_interp_register(I686_OP_FDIVP, h_fdivp);
+    fp_reg(I686_OP_FADDP, h_faddp);
+    fp_reg(I686_OP_FMULP, h_fmulp);
+    fp_reg(I686_OP_FSUBRP, h_fsubrp);
+    fp_reg(I686_OP_FSUBP, h_fsubp);
+    fp_reg(I686_OP_FDIVRP, h_fdivrp);
+    fp_reg(I686_OP_FDIVP, h_fdivp);
     /* DB */
-    i686_interp_register(I686_OP_FILD_m32, h_fild_m32);
-    i686_interp_register(I686_OP_FIST_m32, h_fist_m32);
-    i686_interp_register(I686_OP_FISTP_m32, h_fistp_m32);
-    i686_interp_register(I686_OP_FNINIT, h_fninit);
-    i686_interp_register(I686_OP_FLD_m80, h_fld_m80);
-    i686_interp_register(I686_OP_FCOMI, h_fcomi);
-    i686_interp_register(I686_OP_FSTP_m80, h_fstp_m80);
+    fp_reg(I686_OP_FILD_m32, h_fild_m32);
+    fp_reg(I686_OP_FIST_m32, h_fist_m32);
+    fp_reg(I686_OP_FISTP_m32, h_fistp_m32);
+    fp_reg(I686_OP_FNINIT, h_fninit);
+    fp_reg(I686_OP_FLD_m80, h_fld_m80);
+    fp_reg(I686_OP_FCOMI, h_fcomi);
+    fp_reg(I686_OP_FSTP_m80, h_fstp_m80);
     /* DA */
-    i686_interp_register(I686_OP_FUCOMPP, h_fucompp);
-    i686_interp_register(I686_OP_FCOM_STi, h_fcom_sti);
-    i686_interp_register(I686_OP_FUCOM_STi, h_fucom_sti);
-    i686_interp_register(I686_OP_FCOMP_STi, h_fcomp_sti);
+    fp_reg(I686_OP_FUCOMPP, h_fucompp);
+    fp_reg(I686_OP_FCMOV_STi, h_fcmov_sti);
     /* DF */
-    i686_interp_register(I686_OP_FILD_m16, h_fild_m16);
-    i686_interp_register(I686_OP_FIST_m16, h_fist_m16);
-    i686_interp_register(I686_OP_FISTP_m16, h_fistp_m16);
-    i686_interp_register(I686_OP_FNSTSW_AX, h_fnstsw_ax);
-    i686_interp_register(I686_OP_FILD_m64, h_fild_m64);
-    i686_interp_register(I686_OP_FCOMIP, h_fcomip);
-    i686_interp_register(I686_OP_FISTP_m64, h_fistp_m64);
+    fp_reg(I686_OP_FILD_m16, h_fild_m16);
+    fp_reg(I686_OP_FIST_m16, h_fist_m16);
+    fp_reg(I686_OP_FISTP_m16, h_fistp_m16);
+    fp_reg(I686_OP_FNSTSW_AX, h_fnstsw_ax);
+    fp_reg(I686_OP_FILD_m64, h_fild_m64);
+    fp_reg(I686_OP_FCOMIP, h_fcomip);
+    fp_reg(I686_OP_FISTP_m64, h_fistp_m64);
     /* FISTTP (SSE3, RC7b T4b) */
-    i686_interp_register(I686_OP_FISTTP_m32, h_fisttp_m32);
-    i686_interp_register(I686_OP_FISTTP_m64, h_fisttp_m64);
-    i686_interp_register(I686_OP_FISTTP_m16, h_fisttp_m16);
+    fp_reg(I686_OP_FISTTP_m32, h_fisttp_m32);
+    fp_reg(I686_OP_FISTTP_m64, h_fisttp_m64);
+    fp_reg(I686_OP_FISTTP_m16, h_fisttp_m16);
 }

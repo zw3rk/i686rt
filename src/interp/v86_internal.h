@@ -48,7 +48,9 @@ static inline uint16_t r16_get(const i686_ctx_t *ctx, unsigned r)
 
 static inline void r16_set(i686_ctx_t *ctx, unsigned r, uint16_t v)
 {
-    ctx->gpr[r & 7U] = v; /* 16-bit writes zero-extend (386 semantics) */
+    /* R7-52: 16-bit real-mode writes preserve the upper half (only a
+     * 32-bit operand size replaces the full register). */
+    ctx->gpr[r & 7U] = (ctx->gpr[r & 7U] & ~0xFFFFU) | v;
 }
 
 static inline uint32_t r32_get(const i686_ctx_t *ctx, unsigned r)
