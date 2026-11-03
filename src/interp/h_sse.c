@@ -272,6 +272,7 @@ static uint64_t sse_f64_op(i686_ctx_t *ctx, uint64_t a, uint64_t b, fop_kind k)
             long double exact = 0.0L;
             long double rr = (long double)r;
             double stepped = r;
+            bool has_exact = true;
             switch (k) {
             case FOP_ADD: exact = (long double)da + (long double)db; break;
             case FOP_SUB: exact = (long double)da - (long double)db; break;
@@ -281,9 +282,9 @@ static uint64_t sse_f64_op(i686_ctx_t *ctx, uint64_t a, uint64_t b, fop_kind k)
                     exact = (long double)da / (long double)db;
                 }
                 break;
-            default: break;
+            default: has_exact = false; break;
             }
-            if (rr != exact) {
+            if (has_exact && rr != exact) {
                 if (rc == 1U && rr > exact) {
                     stepped = nextafter(r, -INFINITY);
                 } else if (rc == 2U && rr < exact) {

@@ -19,7 +19,8 @@
  *     + XTN), CVTPS2PD (FCVTL), CVTPD2PS (FCVTN + zero upper),
  *     CVTSS2SD/CVTSD2SS (FCVT), CVTDQ2PS (SCVTF), CVTPS2DQ (FCVTNS),
  *     CVTTPS2DQ (FCVTZS)
- *   LDMXCSR/STMXCSR (0F AE /2 /3, m32, reserved bits masked on load),
+ *   LDMXCSR/STMXCSR (0F AE /2 /3, m32; LDMXCSR bails to the
+ *     interpreter to enforce #GP on reserved bits),
  *     SFENCE lives in emit_sse.c
  *   MOVDQA/MOVDQU (66/F3 0F 6F load / 0F 7F store as plain Q moves),
  *     MOVQ2DQ (66/F3/F2 0F D6), MOVNTDQ (66 0F E7 as plain Q store),

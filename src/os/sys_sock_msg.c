@@ -716,6 +716,8 @@ int64_t i686_sock_recvmmsg(i686_ctx_t *ctx, uint32_t fd, uint32_t vec_va,
             }
             if (rem_s < 0) {
                 fl |= (uint32_t)MSG_DONTWAIT;
+            } else if (rem_s > (int64_t)(INT_MAX / 1000)) {
+                rem_ms = (int64_t)INT_MAX;
             } else {
                 rem_ms = rem_s * 1000LL + rem_ns / 1000000LL;
                 if (rem_ms > (int64_t)INT_MAX) {
@@ -734,11 +736,7 @@ int64_t i686_sock_recvmmsg(i686_ctx_t *ctx, uint32_t fd, uint32_t vec_va,
                     last = -(int64_t)e;
                     break;
                 }
-                if (prc == 0) {
-                    fl |= (uint32_t)MSG_DONTWAIT;
-                } else {
-                    fl |= (uint32_t)MSG_DONTWAIT;
-                }
+                fl |= (uint32_t)MSG_DONTWAIT;
             }
         }
         r = i686_sock_recvmsg(ctx, fd, va, fl);
