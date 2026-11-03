@@ -461,7 +461,25 @@ static int h_pop_ev(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     unsigned w = opsz(insn);
 
-    x86_rm_write(ctx, insn, w, pop_val(ctx, w));
+    if (insn->modrm_mod == 3U) {
+        x86_reg_write(ctx, insn->modrm_rm, w, pop_val(ctx, w));
+    } else {
+        unsigned bytes = w / 8U;
+        uint32_t orig_esp = ctx->gpr[I686_REG_ESP];
+        uint32_t esp = stack_get_sp(ctx);
+        uint32_t next = (ctx->ss_b != 0u) ? (esp + bytes) : ((esp + bytes) & 0xFFFFu);
+        uint32_t linear = ctx->seg_base[I686_SEG_SS] + esp;
+        uint32_t v, ea;
+
+        i686_seg_check_data(ctx, I686_SEG_SS, linear, bytes, 0u);
+        v = mem_read(ctx, linear, bytes);
+        stack_set_sp(ctx, next);
+        ea = x86_ea_compute(ctx, insn);
+        ctx->gpr[I686_REG_ESP] = orig_esp;
+        i686_seg_check_data(ctx, seg_used(insn, I686_SEG_DS), ea, bytes, 1u);
+        mem_write(ctx, ea, bytes, v);
+        stack_set_sp(ctx, next);
+    }
     return interp_done(ctx, insn);
 }
 

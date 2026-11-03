@@ -378,6 +378,49 @@ static int s_trace;
  * so long-loop guests stay feasible under differential tracing. */
 static int s_trace_no_t;
 
+void i686_trace_insn(const i686_ctx_t *ctx, const x86_insn_t *insn,
+                     const uint8_t *bytes);
+void i686_trace_insn(const i686_ctx_t *ctx, const x86_insn_t *insn,
+                     const uint8_t *bytes)
+{
+    uint32_t b;
+    char tl[80];
+    int tn;
+    if (!s_trace || s_trace_no_t || ctx->engine == I686_ENGINE_DBT) {
+        return;
+    }
+    tn = snprintf(tl, sizeof tl, "T %d %08x op=%u len=%u b=",
+                  (int)getpid(), ctx->eip, (unsigned)insn->op, insn->len);
+    for (b = 0U; b < insn->len && b < 8U && tn < (int)sizeof tl - 3; b++) {
+        uint8_t v = (bytes != NULL)
+                        ? bytes[b]
+                        : *(const volatile uint8_t *)i686_guest_ptr(
+                              ctx, ctx->eip + b);
+        tn += snprintf(tl + tn, sizeof tl - (size_t)tn, "%02x", v);
+    }
+    snprintf(tl + tn, sizeof tl - (size_t)tn, " esp=%08x\n",
+             ctx->gpr[I686_REG_ESP]);
+    (void)write(2, tl, strlen(tl));
+}
+
+void i686_trace_syscall(const i686_ctx_t *ctx, long nr, long rv);
+void i686_trace_syscall(const i686_ctx_t *ctx, long nr, long rv)
+{
+    if (!s_trace) {
+        return;
+    }
+    if (nr == 4 || nr == 3) {
+        (void)fprintf(stderr, "S %ld(%u,%08x,%u) -> %ld\n", nr,
+                      ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                      ctx->gpr[I686_REG_EDX], rv);
+    } else if (nr == 5 || nr == 195 || nr == 196 || nr == 383 || nr == 11) {
+        (void)fprintf(stderr, "S %ld(%08x) -> %ld\n", nr,
+                      ctx->gpr[I686_REG_EBX], rv);
+    } else {
+        (void)fprintf(stderr, "S %ld -> %ld\n", nr, rv);
+    }
+}
+
 void i686_interp_init_all(void)
 {
     static int s_done;
@@ -486,6 +529,7 @@ int i686_interp_step(i686_ctx_t *ctx)
     case I686_EXIT_SYSCALL: {
         long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
         long rv = i686_handle_syscall(ctx);
+        i686_trace_syscall(ctx, nr, rv);
         if (i686_syscall_is_exit(nr)) {
             ctx->exit_reason = I686_EXIT_SYSCALL;
             ctx->exit_arg = (uint32_t)rv;
@@ -574,8 +618,7 @@ int i686_interp_run(i686_ctx_t *ctx)
             extern int i686_spurious_allow(i686_ctx_t *, uint32_t);
             uint32_t rga = (uint32_t)(fa - ctx->guest_base);
             if (rga != (uint32_t)s_last_remap_ga &&
-                i686_fault_region_prot(ctx, rga, NULL, NULL) != 0 &&
-                i686_spurious_allow(ctx, rga) != 0) {
+                i686_fault_region_prot(ctx, rga, NULL, NULL) != 0) {
                 ctx->exit_reason = I686_EXIT_NONE;
                 if (i686_spurious_emulate(ctx, rga) == 0) {
                     if (ctx->exit_reason == I686_EXIT_SYSCALL) {
@@ -586,6 +629,7 @@ int i686_interp_run(i686_ctx_t *ctx)
                 }
                 if ((ctx->vm_regime != I686_VM_REGIME_A2 ||
                      ctx->vm_host_page <= 4096u) &&
+                    i686_spurious_allow(ctx, rga) != 0 &&
                     i686_vm32_widen_prot(ctx, rga & ~0xFFFU,
                                          (rga & ~0xFFFU) + 0x1000U) == 0) {
                     s_last_remap_ga = (uint64_t)rga;
@@ -700,24 +744,7 @@ run_loop:
             diag("unimplemented opcode", ctx, insn.op);
             return I686_EXIT_UNDEF;
         }
-        if (s_trace && !s_trace_no_t) {
-            uint32_t b;
-            char tl[80];
-            int tn = 0;
-
-            tn = snprintf(tl, sizeof tl, "T %d %08x op=%u len=%u b=",
-                          (int)getpid(), ctx->eip, (unsigned)insn.op,
-                          insn.len);
-            for (b = 0U; b < insn.len && b < 8U && tn < (int)sizeof tl - 3;
-                 b++) {
-                const volatile uint8_t *p =
-                    (const volatile uint8_t *)i686_guest_ptr(ctx, ctx->eip + b);
-                tn += snprintf(tl + tn, sizeof tl - (size_t)tn, "%02x", *p);
-            }
-            snprintf(tl + tn, sizeof tl - (size_t)tn, " esp=%08x\n",
-                     ctx->gpr[I686_REG_ESP]);
-            (void)write(2, tl, strlen(tl));
-        }
+        i686_trace_insn(ctx, &insn, NULL);
         r = fn(ctx, &insn);
         i686_vm32_exec_leave();
         ctx->blocks_executed++;
@@ -734,23 +761,7 @@ run_loop:
         case I686_EXIT_SYSCALL: {
             long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
             long rv = i686_handle_syscall(ctx);
-            if (s_trace) {
-                if (nr == 4 || nr == 3) {
-                    (void)fprintf(stderr, "S %ld(%u,%08x,%u) -> %ld\n", nr,
-                                  ctx->gpr[I686_REG_EBX],
-                                  ctx->gpr[I686_REG_ECX],
-                                  ctx->gpr[I686_REG_EDX], rv);
-                } else if (nr == 5 || nr == 195 || nr == 196 || nr == 383 ||
-                           nr == 11) {
-                    /* Raw arg only: fetching the string can fault on
-                     * garbage pointers until Phase 4 installs the
-                     * fault-to-EFAULT machinery. */
-                    (void)fprintf(stderr, "S %ld(%08x) -> %ld\n", nr,
-                                  ctx->gpr[I686_REG_EBX], rv);
-                } else {
-                    (void)fprintf(stderr, "S %ld -> %ld\n", nr, rv);
-                }
-            }
+            i686_trace_syscall(ctx, nr, rv);
             if (i686_syscall_is_exit(nr)) {
                 ctx->exit_reason = I686_EXIT_SYSCALL;
                 ctx->exit_arg = (uint32_t)rv; /* process exit status */
@@ -797,11 +808,9 @@ run_loop:
 /* CMPXCHG8B m64 (0F C7 /1): compare EDX:EAX with [EA]; on match ZF=1
  * and [EA] <- ECX:EBX, else ZF=0 and EDX:EAX <- [EA].  All other flags
  * are untouched (SDM).  mod=3 and reg != /1 are #UD.  The memory form
- * is implicitly locked: an aligned 8-byte __atomic_compare_exchange on
- * the HVA; unaligned EAs pre-validate both 4-byte spans before taking
- * the lane split lock (RC-U3 P1: the lock must never strand on fault),
- * and the locked region is byte-wise so no host alignment fault can
- * fire inside it.  The run-loop fault path releases a stranded lock. */
+ * is implicitly locked: aligned 8-byte __atomic_compare_exchange on
+ * HVA; unaligned EAs pre-validate both 4-byte spans before taking the
+ * lane split lock (RC-U3 P1: never strand on fault). */
 int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
 {
     uint32_t ea, alo, ahi;
@@ -813,10 +822,8 @@ int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
     }
     ea = x86_ea_compute(ctx, insn);
     i686_seg_check_data(ctx, x86_ea_seg(insn), ea, 8U, 1u);
-    /* R7-17: the destination write cycle happens on either outcome —
-     * probe host writability before any load/flag/register commit so a
-     * mismatching compare against read-only memory faults.  The
-     * same-value store is invisible on writable memory. */
+    /* R7-17: probe host writability before any load/flag/register commit
+     * so a mismatching compare against read-only memory faults. */
     if (!i686_span_mapped_writable(ctx, ea, 8U)) {
         uint8_t *pb = (uint8_t *)i686_guest_ptr(ctx, ea);
         uint8_t b0 = pb[0];
@@ -829,12 +836,8 @@ int h_CMPXCHG8B(i686_ctx_t *ctx, const x86_insn_t *insn)
         uint64_t expected;
         uint64_t desired;
         bool ok;
-        /* RC-U3-r2 P1 #5: the aligned word-CAS also serializes under the
-         * lane split lock, so overlapping aligned and unaligned LOCK
-         * RMWs are mutually atomic (the hardware CAS stays atomic
-         * against DBT CASAL peers; the lock orders interpreter peers).
-         * A fault inside still releases the lock in the run-loop
-         * catch above. */
+        /* RC-U3-r2 P1 #5: aligned word-CAS also serializes under the
+         * lane split lock so aligned/unaligned LOCK RMWs are atomic. */
         i686_split_lock_acquire();
         expected = ((uint64_t)ahi << 32) | (uint64_t)alo;
         desired = ((uint64_t)ctx->gpr[I686_REG_ECX] << 32) |

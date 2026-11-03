@@ -3,21 +3,6 @@
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
- * On Regime A2 hosts (H > 4096, e.g. 16 KiB macOS Apple Silicon or 16K/64K
- * Linux), each host page covering guest memory carries the intersection (AND)
- * of its 4 KiB sub-page protections via i686_vm32_widen_prot. When a guest
- * instruction accesses a 4 KiB sub-page that shares a host page with a more
- * restricted neighbour sub-page (such as PROT_NONE or PROT_READ), the host
- * MMU faults.
- *
- * i686_spurious_allow and i686_spurious_emulate validate that every 4 KiB
- * sub-page spanned by the instruction fetch and by all memory accesses of the
- * faulting instruction holds the required guest permissions in both the region
- * table and the per-4 KiB i686_vm_file mirror. Legitimate accesses are
- * single-stepped under i686_vm32_subpage_lock() while temporarily opening the
- * covering host page(s) to i686_vm32_union_prot, and immediately re-widened
- * before returning. No host page is ever left permanently open.
  */
 
 #include <setjmp.h>
@@ -40,7 +25,24 @@ extern uint64_t i686_fault_addr(void);
 #ifndef I686RT_NO_DBT
 extern void i686_dbt_invalidate_range(i686_ctx_t *ctx, uint32_t start,
                                       uint32_t end);
+extern int i686_dbt_smc_page_marked(uint32_t guest_page);
 #endif
+
+static int host_cover_satisfies(uint32_t start, uint32_t end, uint8_t need)
+{
+    uint32_t gva;
+    for (gva = start; gva < end; gva += 0x1000u) {
+        if ((i686_vm_file_prot(gva) & need) != need) {
+            return 0;
+        }
+#ifndef I686RT_NO_DBT
+        if ((need & 0x02u) != 0u && i686_dbt_smc_page_marked(gva)) {
+            return 0;
+        }
+#endif
+    }
+    return 1;
+}
 
 typedef struct {
     uint32_t va;
@@ -142,7 +144,10 @@ static int safe_decode_eip(i686_ctx_t *ctx, x86_insn_t *out,
         !i686_subpage_range_ok(ctx, (fetch_va & ~0xFFFu) + 0x1000u, 1u, 0x01u)) {
         max_len = 0x1000u - (fetch_va & 0xFFFu);
     }
-    if (ctx->vm_regime == I686_VM_REGIME_A2 && hps > 4096u) {
+    if (ctx->vm_regime == I686_VM_REGIME_A2 && hps > 4096u &&
+        !host_cover_satisfies(fetch_va & ~(hps - 1u),
+                              ((fetch_va + max_len - 1u) & ~(hps - 1u)) + hps,
+                              0x01u)) {
         uint32_t p0 = fetch_va & ~(hps - 1u);
         uint32_t p1 = (fetch_va + max_len - 1u) & ~(hps - 1u);
         sigjmp_buf *outer = i686_fault_save();
@@ -627,7 +632,8 @@ static int open_acc_covers(i686_ctx_t *ctx, const subpage_access_t *acc,
     for (i = 0u; i < acc->count; i++) {
         uint32_t start = acc->spans[i].va & ~(hps - 1u);
         uint32_t end = ((acc->spans[i].va + acc->spans[i].len - 1u) & ~(hps - 1u)) + hps;
-        if (i686_vm32_union_prot(ctx, start, end) != 0) {
+        if (!host_cover_satisfies(start, end, acc->spans[i].need) &&
+            i686_vm32_union_prot(ctx, start, end) != 0) {
             return -1;
         }
     }
@@ -641,7 +647,9 @@ static void widen_acc_covers(i686_ctx_t *ctx, const subpage_access_t *acc,
     for (i = 0u; i < acc->count; i++) {
         uint32_t start = acc->spans[i].va & ~(hps - 1u);
         uint32_t end = ((acc->spans[i].va + acc->spans[i].len - 1u) & ~(hps - 1u)) + hps;
-        (void)i686_vm32_widen_prot(ctx, start, end);
+        if (!host_cover_satisfies(start, end, acc->spans[i].need)) {
+            (void)i686_vm32_widen_prot(ctx, start, end);
+        }
     }
 }
 
@@ -826,12 +834,14 @@ int i686_spurious_emulate(i686_ctx_t *ctx, uint32_t ga)
         (insn.op == I686_OP_INT_Ib && (uint8_t)insn.imm == 0x80u)) {
         extern long i686_handle_syscall(i686_ctx_t *);
         extern int i686_syscall_is_exit(long);
+        extern void i686_trace_syscall(const i686_ctx_t *, long, long);
         long nr = (long)(int32_t)ctx->gpr[I686_REG_EAX];
         long rv;
         ctx->eip += insn.len;
         ctx->exit_arg = 0x80u;
         ctx->blocks_executed++;
         rv = i686_handle_syscall(ctx);
+        i686_trace_syscall(ctx, nr, rv);
         if (i686_syscall_is_exit(nr)) {
             ctx->exit_reason = I686_EXIT_SYSCALL;
             ctx->exit_arg = (uint32_t)rv;

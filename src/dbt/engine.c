@@ -75,6 +75,12 @@ static __thread struct {
 static __thread size_t s_graveyard_n;
 
 static __thread uint64_t s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
+static __thread volatile sig_atomic_t s_in_dbt_step;
+static __thread uint32_t s_step_esp;
+static __thread uint32_t s_step_ebp;
+static __thread uint32_t s_step_eip;
+static __thread uint32_t s_step_eflags;
+static __thread uint32_t s_step_lazy[6];
 
 void dbt_graveyard_push(uint8_t *code, size_t cap)
 {
@@ -594,7 +600,21 @@ int i686_dbt_run(i686_ctx_t *ctx)
         } else {
             ctx->fault_addr = (uint32_t)fa;
         }
-        i686_dbt_recover_fault(ctx, i686_fault_host_pc());
+        if (s_in_dbt_step != 0) {
+            s_in_dbt_step = 0;
+            ctx->gpr[I686_REG_ESP] = s_step_esp;
+            ctx->gpr[I686_REG_EBP] = s_step_ebp;
+            ctx->eip = s_step_eip;
+            ctx->eflags = s_step_eflags;
+            ctx->lazy_op = s_step_lazy[0];
+            ctx->lazy_res = s_step_lazy[1];
+            ctx->lazy_src1 = s_step_lazy[2];
+            ctx->lazy_src2 = s_step_lazy[3];
+            ctx->lazy_cf_in = s_step_lazy[4];
+            ctx->lazy_width = s_step_lazy[5];
+        } else {
+            i686_dbt_recover_fault(ctx, i686_fault_host_pc());
+        }
         if (fa >= ctx->guest_base &&
             fa < ctx->guest_base + 0x100000000ULL) {
             extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
@@ -602,8 +622,7 @@ int i686_dbt_run(i686_ctx_t *ctx)
             extern int i686_spurious_allow(i686_ctx_t *, uint32_t);
             uint32_t rga = (uint32_t)(fa - ctx->guest_base);
             if (rga != (uint32_t)s_last_remap_ga &&
-                i686_fault_region_prot(ctx, rga, NULL, NULL) != 0 &&
-                i686_spurious_allow(ctx, rga) != 0) {
+                i686_fault_region_prot(ctx, rga, NULL, NULL) != 0) {
                 ctx->exit_reason = I686_EXIT_NONE;
                 if (i686_spurious_emulate(ctx, rga) == 0) {
                     if (ctx->exit_reason == I686_EXIT_SYSCALL) {
@@ -614,6 +633,7 @@ int i686_dbt_run(i686_ctx_t *ctx)
                 }
                 if ((ctx->vm_regime != I686_VM_REGIME_A2 ||
                      ctx->vm_host_page <= 4096u) &&
+                    i686_spurious_allow(ctx, rga) != 0 &&
                     i686_vm32_widen_prot(ctx, rga & ~0xFFFU,
                                          (rga & ~0xFFFU) + 0x1000U) == 0) {
                     s_last_remap_ga = (uint64_t)rga;
@@ -699,7 +719,19 @@ dispatch:
             extern int i686_interp_step(i686_ctx_t *ctx);
             int ir;
             ctx->eip = ctx->exit_dest;
+            s_step_esp = ctx->gpr[I686_REG_ESP];
+            s_step_ebp = ctx->gpr[I686_REG_EBP];
+            s_step_eip = ctx->eip;
+            s_step_eflags = ctx->eflags;
+            s_step_lazy[0] = ctx->lazy_op;
+            s_step_lazy[1] = ctx->lazy_res;
+            s_step_lazy[2] = ctx->lazy_src1;
+            s_step_lazy[3] = ctx->lazy_src2;
+            s_step_lazy[4] = ctx->lazy_cf_in;
+            s_step_lazy[5] = ctx->lazy_width;
+            s_in_dbt_step = 1;
             ir = i686_interp_step(ctx);
+            s_in_dbt_step = 0;
             if (ir == I686_INTERP_CONTINUE) {
                 continue;
             }

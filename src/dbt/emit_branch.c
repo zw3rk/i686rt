@@ -324,7 +324,13 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
                 a64_emit_mov_w(b, L3C_W10, rm);
             }
         } else { /* memory form: ldr w10, [x20, w21 uxtw] */
+            dbt_mem_site_t site;
+            uint32_t seq_ld;
+            if (!l3c_pc_of(e, insn, &pc)) {
+                return -1;
+            }
             l3c_ea_w21(e, insn);
+            seq_ld = (uint32_t)((uint64_t)b->count * 4u);
             if (insn->pfx_opsize != 0U) {
                 a64_emit_guest_ldrh_w(b, L3C_W10, L3C_EA);
             } else {
@@ -333,6 +339,20 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
             if (e->tso) {
                 a64_emit(b, 0xD50339BFU); /* dmb ishld */
             }
+            memset(&site, 0, sizeof(site));
+            site.seq_start_offset = (uint16_t)seq_ld;
+            site.host_insn_offset = (uint16_t)seq_ld;
+            site.cont_insn_offset = (uint16_t)((uint64_t)b->count * 4u);
+            site.guest_pc_delta =
+                (pc >= e->guest_eip && pc - e->guest_eip <= 0xFFF0U)
+                    ? (uint16_t)(pc - e->guest_eip)
+                    : I686_SITE_PC_UNKNOWN;
+            site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                             ((uint32_t)insn->pfx_lock << 16);
+            site.npc_mode = (uint8_t)I686_NPC_DYNAMIC_CTX;
+            site.val_or_dst_reg = (uint8_t)L3C_W10;
+            site.addr_base_reg = 21U; /* EA */
+            (void)i686_aot_note_stack_site(&site);
         }
         l3c_exit_dest_w10(e, I686_EXIT_BRANCH, 0U);
         return 0;
