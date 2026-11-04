@@ -481,22 +481,122 @@ static int sse_emit_plogic(i686_emit_ctx_t *e, const x86_insn_t *insn,
 }
 
 /* ADD/SUB/MUL/DIV PS/PD/SS/SD (kind: 0 add, 1 sub, 2 mul, 3 div).
- *
- * R7-51: declined to the D2 interpret-one path.  The retired NEON
- * fast path ran under host FPCR (round-to-nearest, no flush) with
- * only an FTZ/DAZ guard: guest rounding modes, unmasked traps, and
- * guest exception-status accumulation (IE/ZE/OE/UE/PE/DE, e.g. masked
- * DIVSS-by-zero's ZE) never matched, and invalid results carried the
- * A64 default-NaN payload (0x7FC00000) instead of the x86 indefinite
- * QNaN (0xFFC00000/0xFFF8...).  Re-enable only with guest
- * rounding/status/result semantics proven against the interpreter. */
+ * Fast path requires default MXCSR control bits (RC=RN, FTZ=0, DAZ=0,
+ * all 6 exceptions masked), host FPCR=0, finite normal/zero active
+ * lanes, and FPSR.IOC=0; any exceptional case branches to the D2
+ * interpret-one exit before touching ctx->xmm or ctx->mxcsr. */
 static int sse_emit_fparith(i686_emit_ctx_t *e, const x86_insn_t *insn,
                             unsigned kind)
 {
-    (void)e;
-    (void)insn;
-    (void)kind;
-    return -1;
+    static const uint32_t fp_vec_s[4] = {
+        0x4E20D400U, 0x4EA0D400U, 0x6E20DC00U, 0x6E20FC00U
+    };
+    static const uint32_t fp_sca_s[4] = {
+        0x1E202800U, 0x1E203800U, 0x1E200800U, 0x1E201800U
+    };
+    static const uint32_t fp_vec_d[4] = {
+        0x4E60D400U, 0x4EE0D400U, 0x6E60DC00U, 0x6E60FC00U
+    };
+    static const uint32_t fp_sca_d[4] = {
+        0x1E602800U, 0x1E603800U, 0x1E600800U, 0x1E601800U
+    };
+    a64_buf_t *b = &e->buf;
+    unsigned dbl = (insn->pfx_rep == 1U)
+                       ? 0U
+                       : (insn->pfx_rep == 2U || insn->pfx_opsize != 0U ? 1U : 0U);
+    unsigned vec = (insn->pfx_rep == 0U) ? 1U : 0U;
+    size_t br_mx, br_in, br_pe1, br_out, br_fast, br_done;
+
+    a64_emit_ldr_imm_w(b, SSE_W8, A64_XCTX, 0x198U);
+    a64_emit(b, 0x53063D09U); /* ubfx w9, w8, #6, #10 */
+    a64_emit_sub_imm_w(b, false, SSE_W9, SSE_W9, 0x7EU, 0U);
+    br_mx = a64_emit_cbz_w_placeholder(b, true, SSE_W9);
+
+    if (vec != 0U) {
+        sse_q_ldr(e, 0U, insn->modrm_reg & 7U);
+    } else if (dbl != 0U) {
+        sse_d_ldr(e, 0U, insn->modrm_reg & 7U);
+    } else {
+        sse_s_ldr(e, 0U, insn->modrm_reg & 7U);
+    }
+    if (insn->modrm_mod == 3U) {
+        if (vec != 0U) {
+            sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
+        } else if (dbl != 0U) {
+            sse_d_ldr(e, 1U, insn->modrm_rm & 7U);
+        } else {
+            sse_s_ldr(e, 1U, insn->modrm_rm & 7U);
+        }
+    } else {
+        sse_guest_addr(e, insn);
+        if (vec != 0U) {
+            sse_ldr_q(b, 1U, SSE_ADDR, 0U);
+        } else if (dbl != 0U) {
+            sse_ldr_d(b, 1U, SSE_ADDR, 0U);
+        } else {
+            sse_ldr_s(b, 1U, SSE_ADDR, 0U);
+        }
+    }
+
+    a64_emit(b, 0x6F000404U); /* mvni.4s v4, #0 (-1) */
+    if (dbl != 0U) {
+        sse_bad_f64(b, 2U, 0U, 0);
+        sse_bad_f64(b, 3U, 1U, 0);
+    } else {
+        sse_bad_f32(b, 2U, 0U, 0);
+        sse_bad_f32(b, 3U, 1U, 0);
+    }
+    sse_orr_16b(b, 3U, 2U, 3U);
+    if (vec != 0U) {
+        a64_emit(b, 0x6EB0A863U); /* umaxv.4s s3, v3 */
+    }
+    sse_fmov_w_from_s(b, SSE_W9, 3U);
+    br_in = a64_emit_cbz_w_placeholder(b, true, SSE_W9);
+
+    a64_emit_ubfm_w(b, SSE_W10, SSE_W8, 5U, 5U);
+    br_pe1 = a64_emit_cbz_w_placeholder(b, true, SSE_W10);
+    a64_emit(b, 0xD51B443FU); /* msr fpsr, xzr */
+    a64_patch_cbz_w(b, br_pe1, b->count);
+
+    if (vec != 0U) {
+        sse_fp_vec(b, dbl != 0U ? fp_vec_d[kind] : fp_vec_s[kind], 2U, 0U, 1U);
+    } else {
+        sse_fp_sca(b, dbl != 0U ? fp_sca_d[kind] : fp_sca_s[kind], 2U, 0U, 1U);
+    }
+    if (dbl != 0U) {
+        sse_bad_f64(b, 3U, 2U, kind >= 2U ? 1 : 0);
+    } else {
+        sse_bad_f32(b, 3U, 2U, kind >= 2U ? 1 : 0);
+    }
+    if (vec != 0U) {
+        a64_emit(b, 0x6EB0A863U); /* umaxv.4s s3, v3 */
+    }
+    sse_fmov_w_from_s(b, SSE_W9, 3U);
+    br_out = a64_emit_cbz_w_placeholder(b, true, SSE_W9);
+
+    br_fast = a64_emit_cbz_w_placeholder(b, true, SSE_W10);
+    a64_emit(b, 0xD53B4429U); /* mrs x9, fpsr */
+    a64_emit_ubfm_w(b, SSE_W9, SSE_W9, 4U, 4U);
+    a64_emit_orr_reg_w(b, SSE_W8, SSE_W8, SSE_W9, A64_SHIFT_LSL, 5U);
+    a64_emit_str_imm_w(b, SSE_W8, A64_XCTX, 0x198U);
+    a64_patch_cbz_w(b, br_fast, b->count);
+
+    if (vec != 0U) {
+        sse_q_str(e, insn->modrm_reg & 7U, 2U);
+    } else if (dbl != 0U) {
+        sse_d_str(e, insn->modrm_reg & 7U, 2U);
+    } else {
+        sse_s_str(e, insn->modrm_reg & 7U, 2U);
+    }
+    br_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+
+    a64_patch_cbz_w(b, br_mx, b->count);
+    a64_patch_cbz_w(b, br_in, b->count);
+    a64_patch_cbz_w(b, br_out, b->count);
+    i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+    a64_patch_b_cond(b, br_done, b->count);
+    e->block_open = true;
+    return 0;
 }
 
 /* le core: v2 = (dest < src) | (dest == src).  A64 FCMEQ/FCMGT are

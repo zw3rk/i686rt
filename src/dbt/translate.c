@@ -150,49 +150,60 @@ static int tr_page_readable(const i686_ctx_t *ctx, uint32_t va)
     return 0;
 }
 
+static int tr_is_static_rolror(unsigned op)
+{
+    switch (op) {
+    case I686_OP_ROL_Eb1:
+    case I686_OP_ROL_Ev1:
+    case I686_OP_ROR_Eb1:
+    case I686_OP_ROR_Ev1:
+    case I686_OP_ROL_EbIb:
+    case I686_OP_ROL_EvIb:
+    case I686_OP_ROR_EbIb:
+    case I686_OP_ROR_EvIb:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static unsigned tr_classify(const x86_insn_t *insn)
 {
     unsigned op = insn->op;
     int regonly = tr_is_regonly(insn);
 
+    if (insn->pfx_lock != 0U) {
+        return TRC_BARRIER;
+    }
     if (op == (unsigned)I686_OP_LEA_GvM) {
         return TRC_TRANSPARENT;
     }
-    /* Any memory-accessing instruction can fault (SIGSEGV/SIGBUS) and
-     * materialize EFLAGS into the signal frame before block exit, so
-     * memory instructions are always flag barriers (I686-5). */
-    if (regonly == 0) {
-        return TRC_BARRIER;
-    }
 
-    /* Fused full writers (register-only, no LOCK): skippable, valid j. */
-    if (insn->pfx_lock == 0U &&
-        (tr_is_fused9(op) != 0 ||
-         op == (unsigned)I686_OP_NEG_Eb || op == (unsigned)I686_OP_NEG_Ev)) {
+    /* Fused full writers (no LOCK): skippable, valid j. */
+    if (tr_is_fused9(op) != 0 ||
+        op == (unsigned)I686_OP_NEG_Eb || op == (unsigned)I686_OP_NEG_Ev) {
         return TRC_PARTICIPANT;
     }
     /* Eager full writers with a static nonzero count (no LOCK): valid j,
      * never skipped (their stores always run). */
-    if (insn->pfx_lock == 0U) {
-        switch (op) {
-        case I686_OP_SHL_Eb1: case I686_OP_SHL_Ev1:
-        case I686_OP_SHR_Eb1: case I686_OP_SHR_Ev1:
-        case I686_OP_SAR_Eb1: case I686_OP_SAR_Ev1:
+    switch (op) {
+    case I686_OP_SHL_Eb1: case I686_OP_SHL_Ev1:
+    case I686_OP_SHR_Eb1: case I686_OP_SHR_Ev1:
+    case I686_OP_SAR_Eb1: case I686_OP_SAR_Ev1:
+        return TRC_JONLY;
+    case I686_OP_SHL_EbIb: case I686_OP_SHL_EvIb:
+    case I686_OP_SHR_EbIb: case I686_OP_SHR_EvIb:
+    case I686_OP_SAR_EbIb: case I686_OP_SAR_EvIb:
+        if (((insn->imm & 0xFFU) & 31U) != 0U) {
             return TRC_JONLY;
-        case I686_OP_SHL_EbIb: case I686_OP_SHL_EvIb:
-        case I686_OP_SHR_EbIb: case I686_OP_SHR_EvIb:
-        case I686_OP_SAR_EbIb: case I686_OP_SAR_EvIb:
-            if (((insn->imm & 0xFFU) & 31U) != 0U) {
-                return TRC_JONLY;
-            }
-            return TRC_TRANSPARENT; /* static no-op */
-        case I686_OP_IMUL_GvEv:
-        case I686_OP_IMUL_GvEvIz:
-        case I686_OP_IMUL_GvEvIb:
-            return TRC_JONLY;
-        default:
-            break;
         }
+        return TRC_TRANSPARENT; /* static no-op */
+    case I686_OP_IMUL_GvEv:
+    case I686_OP_IMUL_GvEvIz:
+    case I686_OP_IMUL_GvEvIb:
+        return TRC_JONLY;
+    default:
+        break;
     }
     /* Static no-op rotates/shifts: no write, no flags, never decline. */
     switch (op) {
@@ -202,27 +213,20 @@ static unsigned tr_classify(const x86_insn_t *insn)
         if (((insn->imm & 0xFFU) & 31U) == 0U) {
             return TRC_TRANSPARENT;
         }
-        if (insn->pfx_lock == 0U) {
-            return TRC_PARTIAL;
-        }
-        break;
+        return TRC_PARTIAL;
     case I686_OP_ROL_Eb1: case I686_OP_ROL_Ev1:
     case I686_OP_ROR_Eb1: case I686_OP_ROR_Ev1:
     case I686_OP_ROL_EbCL: case I686_OP_ROL_EvCL:
     case I686_OP_ROR_EbCL: case I686_OP_ROR_EvCL:
     case I686_OP_INC_Eb: case I686_OP_INC_Ev:
     case I686_OP_DEC_Eb: case I686_OP_DEC_Ev:
-        if (insn->pfx_lock == 0U) {
-            return TRC_PARTIAL;
-        }
-        break;
+        return TRC_PARTIAL;
     default:
         break;
     }
-    /* Flag-transparent register-only ops. */
+    /* Flag-transparent ops. */
     switch (op) {
     case I686_OP_NOP:
-    case I686_OP_WAIT:
     case I686_OP_BSWAP_Gv:
     case I686_OP_NOT_Eb:
     case I686_OP_NOT_Ev:
@@ -232,9 +236,13 @@ static unsigned tr_classify(const x86_insn_t *insn)
     case I686_OP_MOV_GbIb: case I686_OP_MOV_GvIv:
     case I686_OP_MOVZX_GvEb: case I686_OP_MOVZX_GvEw:
     case I686_OP_MOVSX_GvEb: case I686_OP_MOVSX_GvEw:
+        return TRC_TRANSPARENT;
     case I686_OP_XCHG_EbGb: case I686_OP_XCHG_EvGv:
     case I686_OP_XCHG_eAXGv:
-        return TRC_TRANSPARENT;
+        if (regonly != 0) {
+            return TRC_TRANSPARENT;
+        }
+        break;
     default:
         break;
     }
@@ -301,19 +309,45 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
         skip[i] = 0U;
     }
     {
-        unsigned char seen_j = 0;
+        unsigned char seen_reg_j = 0U;
+        unsigned char seen_mem_j = 0U;
         for (i = m; i-- > 0U;) {
+            int regonly = (insns[i].op == I686_OP_LEA_GvM)
+                              ? 1
+                              : tr_is_regonly(&insns[i]);
             if (cls[i] == (unsigned char)TRC_BARRIER) {
-                seen_j = 0;
+                seen_reg_j = 0U;
+                seen_mem_j = 0U;
                 continue;
             }
             if ((cls[i] == (unsigned char)TRC_PARTICIPANT ||
-                 cls[i] == (unsigned char)TRC_PARTIAL) && seen_j != 0) {
+                 cls[i] == (unsigned char)TRC_PARTIAL) &&
+                seen_reg_j != 0U) {
                 skip[i] = 1U;
+            } else if ((cls[i] == (unsigned char)TRC_PARTICIPANT ||
+                        tr_is_static_rolror(insns[i].op) != 0) &&
+                       seen_mem_j != 0U) {
+                skip[i] = 2U;
             }
             if (cls[i] == (unsigned char)TRC_PARTICIPANT ||
                 cls[i] == (unsigned char)TRC_JONLY) {
-                seen_j = 1;
+                seen_reg_j = (regonly != 0) ? 1U : 0U;
+                if (insns[i].op == I686_OP_IMUL_GvEv ||
+                    insns[i].op == I686_OP_IMUL_GvEvIz ||
+                    insns[i].op == I686_OP_IMUL_GvEvIb) {
+                    seen_mem_j = 0U;
+                } else {
+                    seen_mem_j = 1U;
+                }
+            } else {
+                if (cls[i] == (unsigned char)TRC_PARTIAL &&
+                    tr_is_static_rolror(insns[i].op) == 0 &&
+                    seen_reg_j == 0U) {
+                    seen_mem_j = 0U;
+                }
+                if (regonly == 0) {
+                    seen_reg_j = 0U;
+                }
             }
         }
     }

@@ -348,18 +348,71 @@ static int sse_emit_cvt_5a(i686_emit_ctx_t *e, const x86_insn_t *insn)
 }
 
 /* CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ (0F 5B).
- *
- * R7-51: declined to the D2 interpret-one path.  The retired NEON
- * forms used A64 saturating conversions (NaN/overflow yield
- * 0x7FFFFFFF/0x0 instead of the x86 integer indefinite 0x80000000),
- * CVTPS2DQ hardcoded nearest rounding instead of MXCSR RC, and none
- * accumulated guest IE/PE status.  Re-enable only with guest
- * rounding/status/result semantics proven against the interpreter. */
+ * Fast path requires default MXCSR control bits (RC=RN, FTZ=0, DAZ=0,
+ * all 6 exceptions masked) and host FPCR=0; float->int forms also
+ * require finite normal/zero source lanes and FPSR.IOC=0 (no overflow).
+ * Any exceptional lane branches to the D2 interpret-one exit before
+ * touching ctx->xmm or ctx->mxcsr. */
 static int sse_emit_cvt_5b(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
-    (void)e;
-    (void)insn;
-    return -1;
+    a64_buf_t *b = &e->buf;
+    int is_f2i = (insn->pfx_rep == 1U || insn->pfx_opsize != 0U);
+    size_t br_mx, br_in = 0U, br_ioc = 0U, br_done;
+
+    if (insn->pfx_rep == 2U ||
+        (insn->pfx_rep != 0U && insn->pfx_opsize != 0U)) {
+        return -1;
+    }
+
+    a64_emit_ldr_imm_w(b, SSE_W8, A64_XCTX, 0x198U);
+    a64_emit(b, 0x53063D09U); /* ubfx w9, w8, #6, #10 */
+    a64_emit_sub_imm_w(b, false, SSE_W9, SSE_W9, 0x7EU, 0U);
+    br_mx = a64_emit_cbz_w_placeholder(b, true, SSE_W9);
+
+    if (insn->modrm_mod == 3U) {
+        sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
+    } else {
+        sse_guest_addr(e, insn);
+        sse_ldr_q(b, 1U, SSE_ADDR, 0U);
+    }
+
+    if (is_f2i != 0) {
+        a64_emit(b, 0x6F000404U); /* mvni.4s v4, #0 (-1) */
+        sse_bad_f32(b, 3U, 1U, 0);
+        a64_emit(b, 0x6EB0A863U); /* umaxv.4s s3, v3 */
+        sse_fmov_w_from_s(b, SSE_W9, 3U);
+        br_in = a64_emit_cbz_w_placeholder(b, true, SSE_W9);
+    }
+
+    a64_emit(b, 0xD51B443FU); /* msr fpsr, xzr */
+    if (insn->pfx_rep == 1U) {
+        sse_fcvtzs_4s(b, 2U, 1U); /* CVTTPS2DQ */
+    } else if (insn->pfx_opsize != 0U) {
+        sse_fcvtns_4s(b, 2U, 1U); /* CVTPS2DQ */
+    } else {
+        sse_scvtf_4s(b, 2U, 1U);  /* CVTDQ2PS */
+    }
+    a64_emit(b, 0xD53B4429U); /* mrs x9, fpsr */
+    if (is_f2i != 0) {
+        a64_emit_ubfm_w(b, SSE_W10, SSE_W9, 0U, 0U);
+        br_ioc = a64_emit_cbz_w_placeholder(b, true, SSE_W10);
+    }
+
+    a64_emit(b, 0x531F112AU); /* ubfiz w10, w9, #1, #5 */
+    a64_emit_orr_reg_w(b, SSE_W8, SSE_W8, SSE_W10, A64_SHIFT_LSL, 0U);
+    a64_emit_str_imm_w(b, SSE_W8, A64_XCTX, 0x198U);
+    sse_q_str(e, insn->modrm_reg & 7U, 2U);
+    br_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+
+    a64_patch_cbz_w(b, br_mx, b->count);
+    if (is_f2i != 0) {
+        a64_patch_cbz_w(b, br_in, b->count);
+        a64_patch_cbz_w(b, br_ioc, b->count);
+    }
+    i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+    a64_patch_b_cond(b, br_done, b->count);
+    e->block_open = true;
+    return 0;
 }
 
 /* LDMXCSR/STMXCSR (0F AE /2 /3, m32). */

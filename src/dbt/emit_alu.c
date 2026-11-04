@@ -241,14 +241,23 @@ static void emit_lazy(i686_emit_ctx_t *e, uint32_t fop, unsigned res,
 {
     a64_buf_t *b = &e->buf;
 
-    if (e->skip_lazy != 0U) {
+    if (e->skip_lazy == 1U) {
         return; /* Lane P3 pre-scan proved this store dead. */
     }
+    if (e->skip_lazy == 2U) {
+        /* Fault-safe compact lazy descriptor across non-flag-reading memory
+         * instructions: pack width in lazy_op[15:8] and skip lazy_cf_in /
+         * lazy_width (and lazy_src1/src2 for LOGIC). */
+        a64_emit_movz_w(b, SCR_T0, (uint16_t)(fop | (width << 8)), 0U);
+        a64_emit(b, 0x29098260U | ((res & 31U) << 10) | (SCR_T0 & 31U));
+        if (fop != I686_FOP_LOGIC) {
+            a64_emit(b, 0x290A8260U | ((s2 & 31U) << 10) | (s1 & 31U));
+        }
+        return;
+    }
     a64_emit_movz_w(b, SCR_T0, (uint16_t)fop, 0U);
-    a64_emit_str_imm_w(b, SCR_T0, 19U, 76U);  /* lazy_op   */
-    a64_emit_str_imm_w(b, res, 19U, 80U);     /* lazy_res  */
-    a64_emit_str_imm_w(b, s1, 19U, 84U);      /* lazy_src1 */
-    a64_emit_str_imm_w(b, s2, 19U, 88U);      /* lazy_src2 */
+    a64_emit(b, 0x29098260U | ((res & 31U) << 10) | (SCR_T0 & 31U));
+    a64_emit(b, 0x290A8260U | ((s2 & 31U) << 10) | (s1 & 31U));
     a64_emit_str_imm_w(b, 31U, 19U, 92U);     /* lazy_cf_in = 0 (WZR) */
     a64_emit_movz_w(b, SCR_T0, (uint16_t)width, 0U);
     a64_emit_str_imm_w(b, SCR_T0, 19U, 104U); /* lazy_width */
@@ -450,7 +459,8 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
     if (is_neg != 0) {
         /* subs res, wzr, a: C = (0 >= a) i.e. !x86-CF(a != 0); V set iff
          * a == width-signed-min == x86 OF for NEG. */
-        a64_emit_sub_reg_w(b, true, SCR_RES, 31U, SCR_A, A64_SHIFT_LSL, 0U);
+        a64_emit_sub_reg_w(b, e->skip_lazy == 0U, SCR_RES, 31U, SCR_A,
+                           A64_SHIFT_LSL, 0U);
         if (sh != 0U) {
             emit_lsr_imm_w(b, SCR_A, SCR_A, sh);
             emit_lsr_imm_w(b, SCR_RES, SCR_RES, sh);
@@ -458,7 +468,8 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
         emit_store_rm(e, insn, SCR_RES, width);
         emit_lazy(e, I686_FOP_NEG, SCR_RES, SCR_A, 31U, width);
         /* SUBS wzr-derived image is live in NZCV (natural polarity). */
-        e->flags_src = I686_FLAGS_NZCV;
+        e->flags_src =
+            (e->skip_lazy != 0U) ? I686_FLAGS_DEAD : I686_FLAGS_NZCV;
     } else {
         a64_emit_orn_reg_w(b, SCR_RES, 31U, SCR_A, A64_SHIFT_LSL, 0U); /* mvn */
         if (sh != 0U) {

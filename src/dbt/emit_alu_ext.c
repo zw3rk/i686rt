@@ -381,10 +381,40 @@ int xalu_rolror(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_ror,
                        width == 8U ? 0xFFU : 0xFFFFU);
     }
     xalu_store_rm(e, insn, XALU_RES, width);
-    if (e->skip_lazy != 0U) {
+    if (e->skip_lazy == 1U) {
         if (have_done != 0) {
             xalu_patch_cbz_x(b, to_done, b->count);
         }
+        e->flags_src = I686_FLAGS_DEAD;
+        e->insn_count++;
+        return 0;
+    }
+    if (e->skip_lazy == 2U) {
+        /* Fault-safe CF/OF override in lazy_op[19:16] for static-count
+         * rotates across non-flag-reading memory instructions. */
+        a64_emit_ldr_imm_w(b, wE, 19U, 76U);
+        if (is_ror == 0) {
+            a64_emit_ubfm_w(b, XALU_T1, XALU_RES, 0U, 0U);
+        } else {
+            a64_emit_ubfm_w(b, XALU_T1, XALU_RES, msb, msb);
+        }
+        xalu_bfi_w(b, wE, XALU_T1, 18U, 1U);
+        if ((count & 31U) == 1U) {
+            a64_emit_ubfm_w(b, XALU_T2, XALU_RES, msb, msb);
+            if (is_ror == 0) {
+                a64_emit_eor_reg_w(b, XALU_T2, XALU_T2, XALU_T1,
+                                   A64_SHIFT_LSL, 0U);
+            } else {
+                a64_emit_ubfm_w(b, XALU_T1, XALU_RES, msb - 1U, msb - 1U);
+                a64_emit_eor_reg_w(b, XALU_T2, XALU_T2, XALU_T1,
+                                   A64_SHIFT_LSL, 0U);
+            }
+            xalu_bfi_w(b, wE, XALU_T2, 19U, 1U);
+            a64_emit(b, 0x3210056BU); /* orr w11, w11, #0x30000 */
+        } else {
+            a64_emit(b, 0x3210016BU); /* orr w11, w11, #0x10000 */
+        }
+        a64_emit_str_imm_w(b, wE, 19U, 76U);
         e->flags_src = I686_FLAGS_DEAD;
         e->insn_count++;
         return 0;

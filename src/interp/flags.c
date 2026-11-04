@@ -56,23 +56,29 @@ static void set_szp(i686_ctx_t *ctx, uint32_t res, unsigned width)
 
 void i686_flags_materialize(i686_ctx_t *ctx)
 {
+    uint32_t op_full = ctx->lazy_op;
+    uint32_t base_op = op_full & 0xFFU;
+    uint32_t w_enc = (op_full >> 8) & 0xFFU;
+    uint32_t w_raw = (w_enc != 0U) ? w_enc : ctx->lazy_width;
     uint32_t res = ctx->lazy_res;
     uint32_t s1 = ctx->lazy_src1;
     uint32_t s2 = ctx->lazy_src2;
-    unsigned w = ctx->lazy_width == 8U || ctx->lazy_width == 16U ||
-                 ctx->lazy_width == 32U ? ctx->lazy_width : 32U;
+    unsigned w = w_raw == 8U || w_raw == 16U || w_raw == 32U ? w_raw : 32U;
     uint32_t m = width_mask(w);
     unsigned msb = width_msb(w);
     uint32_t sign = 1U << msb;
     uint64_t wide;
 
-    switch (ctx->lazy_op) {
-    case I686_FOP_NONE:
+    if (op_full == I686_FOP_NONE) {
         return;
+    }
+    switch (base_op) {
+    case I686_FOP_NONE:
+        break;
     case I686_FOP_ADD:
     case I686_FOP_ADC:
         wide = (uint64_t)s1 + (uint64_t)s2 +
-               (uint64_t)(ctx->lazy_op == I686_FOP_ADC ? (ctx->lazy_cf_in & 1U) : 0U);
+               (uint64_t)(base_op == I686_FOP_ADC ? (ctx->lazy_cf_in & 1U) : 0U);
         res = (uint32_t)wide & m;
         ctx->eflags &= ~(I686_EF_ARITH_MASK | I686_EF_AF);
         if (wide > (uint64_t)m) {
@@ -89,7 +95,7 @@ void i686_flags_materialize(i686_ctx_t *ctx)
     case I686_FOP_SUB:
     case I686_FOP_SBB:
         wide = (uint64_t)s2 +
-               (uint64_t)(ctx->lazy_op == I686_FOP_SBB ? (ctx->lazy_cf_in & 1U) : 0U);
+               (uint64_t)(base_op == I686_FOP_SBB ? (ctx->lazy_cf_in & 1U) : 0U);
         res = (uint32_t)(s1 - (uint32_t)wide) & m;
         ctx->eflags &= ~(I686_EF_ARITH_MASK | I686_EF_AF);
         if ((uint64_t)s1 < wide) {
@@ -142,6 +148,14 @@ void i686_flags_materialize(i686_ctx_t *ctx)
         break;
     default:
         break;
+    }
+    if ((op_full & 0x10000U) != 0U) {
+        ctx->eflags = (ctx->eflags & ~I686_EF_CF) |
+                      (((op_full >> 18) & 1U) ? I686_EF_CF : 0U);
+    }
+    if ((op_full & 0x20000U) != 0U) {
+        ctx->eflags = (ctx->eflags & ~I686_EF_OF) |
+                      (((op_full >> 19) & 1U) ? I686_EF_OF : 0U);
     }
     ctx->lazy_op = I686_FOP_NONE;
 }

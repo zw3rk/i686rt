@@ -29,18 +29,17 @@
  * Every raw A64 word below was verified against a reference assembly
  * listing; shared encoders come from src/rt32/rt32_a64_emit.h.
  *
- * Known v1 deviations (Phase H per SPEC D10/sse.h, documented): MXCSR
- * rounding is not mapped into FPCR (default NEON rounding); FTZ/DAZ
- * arithmetic and out-of-range scalar CVTTSS2SI/CVTTSD2SI take the D2
- * interpret-one path instead (exact flags and 0x80000000), while
+ * Known v1 deviations (Phase H per SPEC D10/sse.h, documented):
+ * non-default MXCSR control bits (rounding, FTZ, DAZ, unmasked traps),
+ * NaN/Inf/denormal FP arithmetic/convert inputs, invalid FP operations,
+ * and out-of-range scalar CVTTSS2SI/CVTTSD2SI take the D2 interpret-one
+ * path (exact flags, NaN payloads, and 0x80000000), while
  * CVTTPS2PI/CVTTPD2PI NaN/overflow still produce NEON saturation
- * instead of x86's integer indefinite 0x80000000.  (R7-51: the
- * ADD/SUB/MUL/DIV PS/PD/SS/SD and CVTDQ2PS/CVTPS2DQ/CVTTPS2DQ NEON
- * paths are declined to D2 until guest rounding/status/result
- * semantics match.)  SSE guest memory loads/stores
- * emit dmb ishld / dmb ish barriers in TSO mode.  MMX-writing insns
- * set the x87 tag word to valid (0x0000) and EMMS sets it empty
- * (0xFFFF); fstat.TOP and the x87_st payload otherwise stay untouched.
+ * instead of x86's integer indefinite 0x80000000.  SSE guest memory
+ * loads/stores emit dmb ishld / dmb ish barriers in TSO mode.
+ * MMX-writing insns set the x87 tag word to valid (0x0000) and EMMS
+ * sets it empty (0xFFFF); fstat.TOP and the x87_st payload otherwise
+ * stay untouched.
  */
 
 #ifndef I686RT_DBT_EMIT_SSE_SHARED_H
@@ -348,8 +347,7 @@ static inline void sse_umov_s(a64_buf_t *b, unsigned wd, unsigned vn,
 }
 
 /* FP arithmetic bases (op order add/sub/mul/div mirrors the dispatch
- * table). Retained for the R7-51 re-enable; no current user while the
- * ADD/SUB/MUL/DIV PS/PD/SS/SD row is declined to D2. */
+ * table) and NaN/Inf/denormal lane filters (v4 holds all-ones -1). */
 static inline void sse_fp_vec(a64_buf_t *b, uint32_t base, unsigned vd,
                               unsigned vn, unsigned vm)
 {
@@ -360,6 +358,38 @@ static inline void sse_fp_sca(a64_buf_t *b, uint32_t base, unsigned vd,
                               unsigned vn, unsigned vm)
 {
     a64_emit(b, base | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+static inline void sse_bad_f32(a64_buf_t *b, unsigned vd, unsigned vn,
+                               int zero_bad)
+{
+    a64_emit(b, 0x4F215400U | ((vn & 31U) << 5) | (vd & 31U)); /* shl.4s #1 */
+    if (zero_bad != 0) {
+        a64_emit(b, 0x4F280400U | ((vd & 31U) << 5) | (vd & 31U));
+        a64_emit(b, 0x6EA48400U | ((vd & 31U) << 5) | (vd & 31U));
+        a64_emit(b, 0x6F3E0400U | ((vd & 31U) << 5) | (vd & 31U));
+    } else {
+        a64_emit(b, 0x4EA0B800U | ((vd & 31U) << 5) | (vd & 31U));
+        sse_add_4s(b, vd, vd, 4U);
+        a64_emit(b, 0x6F280400U | ((vd & 31U) << 5) | (vd & 31U));
+    }
+    a64_emit(b, 0x4EA09800U | ((vd & 31U) << 5) | (vd & 31U)); /* cmeq #0   */
+}
+
+static inline void sse_bad_f64(a64_buf_t *b, unsigned vd, unsigned vn,
+                               int zero_bad)
+{
+    a64_emit(b, 0x4F415400U | ((vn & 31U) << 5) | (vd & 31U)); /* shl.2d #1 */
+    if (zero_bad != 0) {
+        a64_emit(b, 0x4F4B0400U | ((vd & 31U) << 5) | (vd & 31U));
+        a64_emit(b, 0x6EE48400U | ((vd & 31U) << 5) | (vd & 31U));
+        a64_emit(b, 0x6F7E0400U | ((vd & 31U) << 5) | (vd & 31U));
+    } else {
+        a64_emit(b, 0x4EE0B800U | ((vd & 31U) << 5) | (vd & 31U));
+        sse_add_2d(b, vd, vd, 4U);
+        a64_emit(b, 0x6F4B0400U | ((vd & 31U) << 5) | (vd & 31U));
+    }
+    a64_emit(b, 0x4EE09800U | ((vd & 31U) << 5) | (vd & 31U)); /* cmeq #0   */
 }
 
 /* Compares (all-ones/all-zeros masks; NaN comparisons are false, which
