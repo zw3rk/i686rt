@@ -372,7 +372,7 @@ static inline uint32_t i686_make_key(uint32_t eip)
 
 static inline uint32_t i686_ibtc_hash(uint32_t eip)
 {
-    return (eip >> 2U) & (I686_IBTC_SIZE - 1U);
+    return eip & (I686_IBTC_SIZE - 1U);
 }
 
 /*

@@ -352,7 +352,7 @@ static int run_guest(i686_ctx_t *ctx)
 
 int main(int argc, char **argv)
 {
-    i686_ctx_t ctx;
+    _Alignas(64) i686_ctx_t ctx;
     int path_idx;
     int st;
 

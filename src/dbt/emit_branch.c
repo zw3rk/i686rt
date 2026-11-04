@@ -125,7 +125,7 @@ static bool l3c_pc_of(i686_emit_ctx_t *e, const x86_insn_t *insn,
     uint32_t pc = e->guest_eip;
     unsigned guard = 0U;
 
-    while (guard++ < 64U) { /* I686_DBT_MAX_INSNS bound */
+    while (guard++ < 256U) { /* I686_DBT_MAX_INSNS bound */
         x86_insn_t walk;
         if (x86_decode(e->ctx, pc, &walk) != 0) {
             return false;
@@ -145,10 +145,6 @@ static void l3c_exit_seq(i686_emit_ctx_t *e)
 {
     a64_buf_t *b = &e->buf;
 
-    a64_emit_str_imm_w(b, L3C_W8, A64_XCTX, 120U); /* exit_reason */
-    a64_emit_str_imm_w(b, L3C_W9, A64_XCTX, 124U); /* exit_arg   */
-    a64_emit_str_imm_w(b, L3C_W10, A64_XCTX, 132U); /* exit_dest  */
-    a64_emit_str_imm_w(b, L3C_W10, A64_XCTX, 32U);  /* eip := resume */
     a64_emit_ret(b);
     e->block_open = false;
 }
@@ -163,6 +159,32 @@ static void l3c_exit_const(i686_emit_ctx_t *e, uint32_t reason, uint32_t arg,
     a64_emit_mov_imm32(b, L3C_W9, arg);
     a64_emit_mov_imm32(b, L3C_W10, dest);
     l3c_exit_seq(e);
+}
+
+static void l3c_self_loop_or_exit(i686_emit_ctx_t *e, uint32_t target)
+{
+    a64_buf_t *b = &e->buf;
+
+    if (target == e->guest_eip) {
+        /* [0] cbz x26, .Lbail (+8 words) */
+        a64_emit(b, 0xB400001AU | (8U << 5));
+        /* [1] ldr w8, [x26] (g_dbt_cache_epoch) */
+        a64_emit_ldr_imm_w(b, L3C_W8, 26U, 0U);
+        /* [2] ldr w9, [x19, #484] (cached epoch in pad_lock2) */
+        a64_emit_ldr_imm_w(b, L3C_W9, A64_XCTX, 484U);
+        /* [3] cmp w8, w9 */
+        a64_emit_sub_reg_w(b, true, 31U, L3C_W8, L3C_W9, A64_SHIFT_LSL, 0U);
+        /* [4] b.ne .Lbail (+4 words) */
+        a64_emit(b, 0x54000001U | (4U << 5));
+        /* [5] add x25, x25, #1 (ibtc_hits delta) */
+        a64_emit(b, 0x91000739U);
+        /* [6] subs x24, x24, #1 (block budget) */
+        a64_emit(b, 0xF1000718U);
+        /* [7] b.ne word 0 (offset = -(int32_t)b->count) */
+        a64_emit(b, 0x54000001U |
+                        ((((uint32_t)(-(int32_t)b->count)) & 0x7FFFFU) << 5));
+    }
+    l3c_exit_const(e, I686_EXIT_BRANCH, 0U, target);
 }
 
 /* Exit whose dest is a runtime value already sitting in w10. */
@@ -190,6 +212,9 @@ static void l3c_flags_to_nzcv(i686_emit_ctx_t *e)
      * GPRs park in ctx->gpr[0..7] across the AAPCS call. */
     {
         extern void i686_dbt_flags_sync(i686_ctx_t *);
+        size_t to_done;
+        a64_emit_ldr_imm_w(b, L3C_W8, A64_XCTX, 76U); /* lazy_op */
+        to_done = a64_emit_cbz_w_placeholder(b, false, L3C_W8);
         a64_emit_str_imm_w(b, 0U, A64_XCTX, 0U);
         a64_emit_str_imm_w(b, 1U, A64_XCTX, 4U);
         a64_emit_str_imm_w(b, 2U, A64_XCTX, 8U);
@@ -232,6 +257,7 @@ static void l3c_flags_to_nzcv(i686_emit_ctx_t *e)
         a64_emit_ldr_imm_w(b, 5U, A64_XCTX, 20U);
         a64_emit_ldr_imm_w(b, 6U, A64_XCTX, 24U);
         a64_emit_ldr_imm_w(b, 7U, A64_XCTX, 28U);
+        a64_patch_cbz_w(b, to_done, b->count);
     }
 
     /* Rebuild NZCV from ctx->eflags (shared C6a helper; identical word
@@ -307,9 +333,8 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
         if (!l3c_pc_of(e, insn, &pc)) {
             return -1;
         }
-        l3c_exit_const(e, I686_EXIT_BRANCH, 0U,
-                       l3c_trunc_ip(pc + insn->len + l3c_sext_rel(insn),
-                                    insn));
+        l3c_self_loop_or_exit(
+            e, l3c_trunc_ip(pc + insn->len + l3c_sext_rel(insn), insn));
         return 0;
 
     case I686_OP_JMP_Ev: {
@@ -376,8 +401,8 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
         patch = a64_emit_b_cond_placeholder(b, (unsigned)a64c);
         l3c_exit_const(e, I686_EXIT_BRANCH, 0U, next);
         a64_patch_b_cond(b, patch, b->count);
-        l3c_exit_const(e, I686_EXIT_BRANCH, 0U,
-                       l3c_trunc_ip(next + l3c_sext_rel(insn), insn));
+        l3c_self_loop_or_exit(
+            e, l3c_trunc_ip(next + l3c_sext_rel(insn), insn));
         return 0;
     }
 

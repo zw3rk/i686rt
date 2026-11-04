@@ -241,7 +241,7 @@ static void emit_lazy(i686_emit_ctx_t *e, uint32_t fop, unsigned res,
 {
     a64_buf_t *b = &e->buf;
 
-    if (e->skip_lazy == 1U) {
+    if (e->skip_lazy == 1U || e->skip_lazy == 3U) {
         return; /* Lane P3 pre-scan proved this store dead. */
     }
     if (e->skip_lazy == 2U) {
@@ -366,36 +366,42 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
         emit_lsl_imm_w(b, SCR_B, SCR_B, sh);
     }
 
-    if (kind == ALUK_ADD) {
-        a64_emit_add_reg_w(b, e->skip_lazy == 0U, SCR_RES, SCR_A, SCR_B,
-                           A64_SHIFT_LSL, 0U);
-        if (e->skip_lazy == 0U) {
-            /* Invert C so NZCV holds C = !CF (natural SUBS polarity). */
-            a64_emit_mrs_nzcv(b, SCR_T0);
-            a64_emit_movz_w(b, SCR_T1, 0x2000U, 1U);
-            a64_emit_eor_reg_w(b, SCR_T0, SCR_T0, SCR_T1, A64_SHIFT_LSL, 0U);
-            a64_emit_msr_nzcv(b, SCR_T0);
-        }
-    } else if (kind == ALUK_SUB) {
-        a64_emit_sub_reg_w(b, e->skip_lazy == 0U, SCR_RES, SCR_A, SCR_B,
-                           A64_SHIFT_LSL, 0U);
-    } else if (kind == ALUK_CMP) {
-        if (e->skip_lazy == 0U) {
-            a64_emit_sub_reg_w(b, true, SCR_RES, SCR_A, SCR_B,
+    {
+        bool emit_nzcv = (e->skip_lazy == 0U || e->skip_lazy == 3U);
+        if (kind == ALUK_ADD) {
+            a64_emit_add_reg_w(b, emit_nzcv, SCR_RES, SCR_A, SCR_B,
                                A64_SHIFT_LSL, 0U);
-        }
-    } else {
-        if (kind == ALUK_AND || kind == ALUK_TEST) {
-            a64_emit_and_reg_w(b, false, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL,
-                               0U);
-        } else if (kind == ALUK_OR) {
-            a64_emit_orr_reg_w(b, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
-        } else { /* ALUK_XOR */
-            a64_emit_eor_reg_w(b, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL, 0U);
-        }
-        if (e->skip_lazy == 0U) {
-            /* x86 logic flags: CF = OF = 0 (so SUBS C = !CF = 1), N/Z from result. */
-            a64_emit_sub_imm_w(b, true, 31U, SCR_RES, 0U, 0U);
+            if (emit_nzcv) {
+                /* Invert C so NZCV holds C = !CF (natural SUBS polarity). */
+                a64_emit_mrs_nzcv(b, SCR_T0);
+                a64_emit_movz_w(b, SCR_T1, 0x2000U, 1U);
+                a64_emit_eor_reg_w(b, SCR_T0, SCR_T0, SCR_T1, A64_SHIFT_LSL,
+                                   0U);
+                a64_emit_msr_nzcv(b, SCR_T0);
+            }
+        } else if (kind == ALUK_SUB) {
+            a64_emit_sub_reg_w(b, emit_nzcv, SCR_RES, SCR_A, SCR_B,
+                               A64_SHIFT_LSL, 0U);
+        } else if (kind == ALUK_CMP) {
+            if (emit_nzcv) {
+                a64_emit_sub_reg_w(b, true, SCR_RES, SCR_A, SCR_B,
+                                   A64_SHIFT_LSL, 0U);
+            }
+        } else {
+            if (kind == ALUK_AND || kind == ALUK_TEST) {
+                a64_emit_and_reg_w(b, false, SCR_RES, SCR_A, SCR_B,
+                                   A64_SHIFT_LSL, 0U);
+            } else if (kind == ALUK_OR) {
+                a64_emit_orr_reg_w(b, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL,
+                                   0U);
+            } else { /* ALUK_XOR */
+                a64_emit_eor_reg_w(b, SCR_RES, SCR_A, SCR_B, A64_SHIFT_LSL,
+                                   0U);
+            }
+            if (emit_nzcv) {
+                /* x86 logic flags: CF = OF = 0 (so SUBS C = !CF = 1), N/Z from result. */
+                a64_emit_sub_imm_w(b, true, 31U, SCR_RES, 0U, 0U);
+            }
         }
     }
 
@@ -426,7 +432,7 @@ static int emit_binop(i686_emit_ctx_t *e, const x86_insn_t *insn,
      * same-block consumer may fuse on it directly (emit.h seam).
      * A skipped producer emits no NZCV image, so downgrade (DEAD is
      * always correct): the overwriting j re-establishes the proof. */
-    if (e->skip_lazy != 0U) {
+    if (e->skip_lazy == 1U || e->skip_lazy == 2U) {
         e->flags_src = I686_FLAGS_DEAD;
     } else {
         e->flags_src = I686_FLAGS_NZCV;
@@ -459,8 +465,8 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
     if (is_neg != 0) {
         /* subs res, wzr, a: C = (0 >= a) i.e. !x86-CF(a != 0); V set iff
          * a == width-signed-min == x86 OF for NEG. */
-        a64_emit_sub_reg_w(b, e->skip_lazy == 0U, SCR_RES, 31U, SCR_A,
-                           A64_SHIFT_LSL, 0U);
+        a64_emit_sub_reg_w(b, e->skip_lazy == 0U || e->skip_lazy == 3U,
+                           SCR_RES, 31U, SCR_A, A64_SHIFT_LSL, 0U);
         if (sh != 0U) {
             emit_lsr_imm_w(b, SCR_A, SCR_A, sh);
             emit_lsr_imm_w(b, SCR_RES, SCR_RES, sh);
@@ -468,8 +474,9 @@ static int emit_negnot(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_neg)
         emit_store_rm(e, insn, SCR_RES, width);
         emit_lazy(e, I686_FOP_NEG, SCR_RES, SCR_A, 31U, width);
         /* SUBS wzr-derived image is live in NZCV (natural polarity). */
-        e->flags_src =
-            (e->skip_lazy != 0U) ? I686_FLAGS_DEAD : I686_FLAGS_NZCV;
+        e->flags_src = (e->skip_lazy == 1U || e->skip_lazy == 2U)
+                           ? I686_FLAGS_DEAD
+                           : I686_FLAGS_NZCV;
     } else {
         a64_emit_orn_reg_w(b, SCR_RES, 31U, SCR_A, A64_SHIFT_LSL, 0U); /* mvn */
         if (sh != 0U) {
@@ -516,6 +523,17 @@ static int emit_imul(i686_emit_ctx_t *e, const x86_insn_t *insn)
             a64_emit_sbfm_w(b, SCR_T2, SCR_T2, 0U, width - 1U);
         }
         a64_emit_smaddl_x(b, SCR_T0, SCR_B, SCR_T2, 31U); /* x11 = b*imm */
+    }
+
+    if (e->skip_lazy == 1U) {
+        if (width == 32U) {
+            a64_emit_mov_w(b, i686_w(insn->modrm_reg), SCR_T0);
+        } else {
+            emit_bfi_w(b, i686_w(insn->modrm_reg), SCR_T0, 0U, width);
+        }
+        e->flags_src = I686_FLAGS_DEAD;
+        e->insn_count++;
+        return 0;
     }
 
     /* Overflow: 64-bit product != sign-extension of its low width bits. */

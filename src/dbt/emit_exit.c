@@ -76,16 +76,9 @@ void i686_emit_exit(i686_emit_ctx_t *e, uint32_t reason, uint32_t arg,
 {
     a64_buf_t *b = &e->buf;
 
-    /* w0..w7 -> ctx->gpr[0..7] (offsets 0..28, ABI-locked). */
-    emit_stp_w(b, 0U, 1U, 19U, 0U);
-    emit_stp_w(b, 2U, 3U, 19U, 2U);
-    emit_stp_w(b, 4U, 5U, 19U, 4U);
-    emit_stp_w(b, 6U, 7U, 19U, 6U);
-
     a64_emit_movz_w(b, 8U, (uint16_t)reason, 0U);
-    a64_emit_str_imm_w(b, 8U, 19U, 120U);  /* ctx->exit_reason */
     a64_emit_mov_imm32(b, 9U, arg);        /* full 32-bit: may be a guest EIP */
-    a64_emit_str_imm_w(b, 9U, 19U, 124U);  /* ctx->exit_arg  */
+    emit_stp_w(b, 8U, 9U, 19U, 30U);       /* ctx->exit_reason, exit_arg @ 120 */
     a64_emit_mov_imm32(b, 10U, dest);
     a64_emit_str_imm_w(b, 10U, 19U, 132U); /* ctx->exit_dest */
     if (reason == I686_EXIT_BRANCH) {

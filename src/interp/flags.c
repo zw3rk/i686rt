@@ -149,13 +149,35 @@ void i686_flags_materialize(i686_ctx_t *ctx)
     default:
         break;
     }
-    if ((op_full & 0x10000U) != 0U) {
-        ctx->eflags = (ctx->eflags & ~I686_EF_CF) |
-                      (((op_full >> 18) & 1U) ? I686_EF_CF : 0U);
-    }
-    if ((op_full & 0x20000U) != 0U) {
-        ctx->eflags = (ctx->eflags & ~I686_EF_OF) |
-                      (((op_full >> 19) & 1U) ? I686_EF_OF : 0U);
+    {
+        uint32_t cf_ov = (op_full >> 16) & 0xFFU;
+        uint32_t hi_ov = (op_full >> 24) & 0xFFU;
+        if ((cf_ov & 2U) != 0U) {
+            ctx->eflags = (ctx->eflags & ~I686_EF_CF) |
+                          ((cf_ov & 1U) != 0U ? I686_EF_CF : 0U);
+        }
+        if ((hi_ov & 12U) != 0U) {
+            unsigned iw = ((hi_ov & 3U) == 0U)
+                              ? 8U
+                              : (((hi_ov & 3U) == 1U) ? 16U : 32U);
+            uint32_t im = width_mask(iw);
+            uint32_t isign = 1U << width_msb(iw);
+            uint32_t ires = ctx->lazy_cf_in & im;
+            uint32_t is1 =
+                ((hi_ov & 8U) != 0U ? (ires + 1U) : (ires - 1U)) & im;
+            ctx->eflags &= ~(I686_EF_ZF | I686_EF_SF | I686_EF_PF |
+                             I686_EF_OF | I686_EF_AF);
+            if (((hi_ov & 8U) != 0U ? is1 : ires) == isign) {
+                ctx->eflags |= I686_EF_OF;
+            }
+            if ((((is1 ^ 1U ^ ires) >> 4) & 1U) != 0U) {
+                ctx->eflags |= I686_EF_AF;
+            }
+            set_szp(ctx, ires, iw);
+        } else if ((hi_ov & 2U) != 0U) {
+            ctx->eflags = (ctx->eflags & ~I686_EF_OF) |
+                          ((hi_ov & 1U) != 0U ? I686_EF_OF : 0U);
+        }
     }
     ctx->lazy_op = I686_FOP_NONE;
 }

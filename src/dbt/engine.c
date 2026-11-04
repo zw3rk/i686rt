@@ -304,6 +304,7 @@ static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
         }
     }
     base = g_dbt_ht[h].eip;
+    ctx->eip = base;
     start = g_dbt_site_start[h];
     end = g_dbt_site_end[h];
     if (end <= start || g_dbt_site_eip[h] != base) {

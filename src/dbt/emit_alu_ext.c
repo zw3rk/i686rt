@@ -232,23 +232,56 @@ int xalu_incdec(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_inc)
     /* CF (and every other flag) must be current before the RMW:
      * materialize unless already EFLAGS (or proven dead by pre-scan). */
     if (e->skip_lazy == 0U) {
-        xalu_sync_eflags(e);
+        if (e->flags_src == I686_FLAGS_NZCV) {
+            xalu_cset_w(b, XALU_T4, A64_COND_CC); /* CF = !NZCV.C */
+        } else {
+            xalu_sync_eflags(e);
+        }
     }
     /* A = operand (width-masked).  0x40+r synthesize mod=3 with the
      * register in modrm_rm; FE/FF share these ids for mod=3. */
     xalu_load_rm(e, insn, XALU_A, width);
-    if (is_inc != 0) {
-        a64_emit_add_imm_w(b, false, XALU_RES, XALU_A, 1U, 0U);
-    } else {
-        a64_emit_sub_imm_w(b, false, XALU_RES, XALU_A, 1U, 0U);
+    {
+        int need_flags = (e->skip_lazy == 0U || e->skip_lazy >= 4U);
+        if (is_inc != 0) {
+            a64_emit_add_imm_w(b, width == 32U && need_flags != 0, XALU_RES,
+                               XALU_A, 1U, 0U);
+        } else {
+            a64_emit_sub_imm_w(b, width == 32U && need_flags != 0, XALU_RES,
+                               XALU_A, 1U, 0U);
+        }
+        if (width == 32U && (e->skip_lazy == 0U || e->skip_lazy == 4U)) {
+            a64_emit_mrs_nzcv(b, XALU_T3);
+        }
     }
     if (width != 32U) {
         xalu_and_imm_w(b, XALU_RES, XALU_RES,
                        width == 8U ? 0xFFU : 0xFFFFU);
     }
     xalu_store_rm(e, insn, XALU_RES, width);
-    if (e->skip_lazy != 0U) {
+    if (e->skip_lazy == 1U) {
         e->flags_src = I686_FLAGS_DEAD;
+        e->insn_count++;
+        return 0;
+    }
+    if (e->skip_lazy == 2U) {
+        unsigned code = (is_inc != 0 ? 4U : 8U) +
+                        (width == 8U ? 0U : (width == 16U ? 1U : 2U));
+        a64_emit_str_imm_w(b, XALU_RES, 19U, 92U); /* lazy_cf_in = res */
+        a64_emit_movz_w(b, XALU_T0, (uint16_t)code, 0U);
+        a64_emit(b, 0x39013E60U | (XALU_T0 & 31U)); /* strb wT0, [x19, #79] */
+        e->flags_src = I686_FLAGS_DEAD;
+        e->insn_count++;
+        return 0;
+    }
+    if (e->skip_lazy == 5U) {
+        unsigned fop = (is_inc != 0) ? I686_FOP_INC : I686_FOP_DEC;
+        a64_emit_movz_w(b, XALU_T0, (uint16_t)(fop | (32U << 8)), 0U);
+        a64_emit(b, 0x79009A60U | (XALU_T0 & 31U)); /* strh wT0, [x19, #76] */
+        a64_emit(b, 0x39013E7FU);                   /* strb wzr, [x19, #79] */
+        a64_emit(b, 0x290A0260U | ((XALU_A & 31U) << 10) |
+                     (XALU_RES & 31U));             /* stp wRES, wA, [x19, #80] */
+        e->flags_src = I686_FLAGS_NZCV;
         e->insn_count++;
         return 0;
     }
@@ -256,33 +289,40 @@ int xalu_incdec(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_inc)
     /* Eager flags, bit-identical to flags.c i686_flags_inc/dec:
      * everything but CF is rewritten; CF is preserved. */
     a64_emit_ldr_imm_w(b, wE, 19U, 36U);
-    a64_emit_movz_w(b, XALU_T1, 0x08D4U, 0U); /* ZF|SF|PF|OF|AF (no CF) */
-    a64_emit_bic_reg_w(b, false, wE, wE, XALU_T1, A64_SHIFT_LSL, 0U);
-    /* OF: INC iff res == SMIN-width (0x80/0x8000/0x80000000);
-     * DEC iff src == SMIN-width. */
-    if (is_inc != 0) {
-        a64_emit_mov_imm32(b, XALU_T1,
-                           width == 8U ? 0x80U
-                                       : (width == 16U ? 0x8000U
-                                                       : 0x80000000U));
-        a64_emit_sub_reg_w(b, true, 31U, XALU_RES, XALU_T1,
-                           A64_SHIFT_LSL, 0U);
+    if (e->flags_src == I686_FLAGS_NZCV || e->skip_lazy == 4U) {
+        if (e->skip_lazy == 4U) {
+            a64_emit(b, 0x39413A60U | (XALU_T4 & 31U)); /* ldrb wT4, [x19, #78] */
+        }
+        a64_emit_movz_w(b, XALU_T1, 0x08D5U, 0U); /* CF|PF|AF|ZF|SF|OF */
+        a64_emit_bic_reg_w(b, false, wE, wE, XALU_T1, A64_SHIFT_LSL, 0U);
+        xalu_bfi_w(b, wE, XALU_T4, 0U, 1U);
     } else {
-        a64_emit_mov_imm32(b, XALU_T1,
-                           width == 8U ? 0x80U
-                                       : (width == 16U ? 0x8000U
-                                                       : 0x80000000U));
-        a64_emit_sub_reg_w(b, true, 31U, XALU_A, XALU_T1,
-                           A64_SHIFT_LSL, 0U);
+        a64_emit_movz_w(b, XALU_T1, 0x08D4U, 0U); /* ZF|SF|PF|OF|AF (no CF) */
+        a64_emit_bic_reg_w(b, false, wE, wE, XALU_T1, A64_SHIFT_LSL, 0U);
     }
-    xalu_cset_w(b, XALU_T2, A64_COND_EQ);
-    xalu_bfi_w(b, wE, XALU_T2, 11U, 1U);
+    if (width == 32U) {
+        a64_emit_ubfm_w(b, XALU_T2, XALU_T3, 28U, 28U); /* V -> OF */
+        xalu_bfi_w(b, wE, XALU_T2, 11U, 1U);
+    } else {
+        /* OF: INC iff res == SMIN-width (0x80/0x8000); DEC iff src == SMIN. */
+        a64_emit_mov_imm32(b, XALU_T1, width == 8U ? 0x80U : 0x8000U);
+        a64_emit_sub_reg_w(b, true, 31U, is_inc != 0 ? XALU_RES : XALU_A,
+                           XALU_T1, A64_SHIFT_LSL, 0U);
+        xalu_cset_w(b, XALU_T2, A64_COND_EQ);
+        xalu_bfi_w(b, wE, XALU_T2, 11U, 1U);
+    }
     /* AF = bit 4 of (src ^ 1 ^ res). */
     a64_emit_eor_reg_w(b, XALU_T1, XALU_A, XALU_RES, A64_SHIFT_LSL, 0U);
     a64_emit_ubfm_w(b, XALU_T1, XALU_T1, 4U, 4U);
     xalu_bfi_w(b, wE, XALU_T1, 4U, 1U);
     xalu_fold_zsp(e, XALU_RES, width - 1U, wE);
     xalu_commit_eflags(e, wE);
+    if (width == 32U) {
+        xalu_eor_imm1_w(b, XALU_T1, wE);
+        xalu_bfi_w(b, XALU_T3, XALU_T1, 29U, 1U); /* C = !CF */
+        a64_emit_msr_nzcv(b, XALU_T3);
+        e->flags_src = I686_FLAGS_NZCV;
+    }
 
     e->insn_count++;
     return 0;
@@ -390,16 +430,13 @@ int xalu_rolror(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_ror,
         return 0;
     }
     if (e->skip_lazy == 2U) {
-        /* Fault-safe CF/OF override in lazy_op[19:16] for static-count
+        /* Fault-safe CF/OF override in lazy_op[31:16] for static-count
          * rotates across non-flag-reading memory instructions. */
-        a64_emit_ldr_imm_w(b, wE, 19U, 76U);
-        if (is_ror == 0) {
-            a64_emit_ubfm_w(b, XALU_T1, XALU_RES, 0U, 0U);
-        } else {
-            a64_emit_ubfm_w(b, XALU_T1, XALU_RES, msb, msb);
-        }
-        xalu_bfi_w(b, wE, XALU_T1, 18U, 1U);
         if ((count & 31U) == 1U) {
+            a64_emit_movz_w(b, wE, 0x0202U, 0U);
+            a64_emit_ubfm_w(b, XALU_T1, XALU_RES, is_ror == 0 ? 0U : msb,
+                            is_ror == 0 ? 0U : msb);
+            xalu_bfi_w(b, wE, XALU_T1, 0U, 1U);
             a64_emit_ubfm_w(b, XALU_T2, XALU_RES, msb, msb);
             if (is_ror == 0) {
                 a64_emit_eor_reg_w(b, XALU_T2, XALU_T2, XALU_T1,
@@ -409,12 +446,18 @@ int xalu_rolror(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_ror,
                 a64_emit_eor_reg_w(b, XALU_T2, XALU_T2, XALU_T1,
                                    A64_SHIFT_LSL, 0U);
             }
-            xalu_bfi_w(b, wE, XALU_T2, 19U, 1U);
-            a64_emit(b, 0x3210056BU); /* orr w11, w11, #0x30000 */
+            xalu_bfi_w(b, wE, XALU_T2, 8U, 1U);
+            a64_emit(b, 0x79009E60U | (wE & 31U)); /* strh wE, [x19, #78] */
         } else {
-            a64_emit(b, 0x3210016BU); /* orr w11, w11, #0x10000 */
+            a64_emit_movz_w(b, wE, 2U, 0U);
+            if (is_ror == 0) {
+                xalu_bfi_w(b, wE, XALU_RES, 0U, 1U);
+            } else {
+                a64_emit_ubfm_w(b, XALU_T1, XALU_RES, msb, msb);
+                xalu_bfi_w(b, wE, XALU_T1, 0U, 1U);
+            }
+            a64_emit(b, 0x39013A60U | (wE & 31U)); /* strb wE, [x19, #78] */
         }
-        a64_emit_str_imm_w(b, wE, 19U, 76U);
         e->flags_src = I686_FLAGS_DEAD;
         e->insn_count++;
         return 0;
@@ -469,6 +512,65 @@ int xalu_rolror(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_ror,
         xalu_patch_cbz_x(b, to_done, b->count);
     }
 
+    e->insn_count++;
+    return 0;
+}
+
+static int xalu_bt_reg(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                       unsigned mode, int from_reg)
+{
+    a64_buf_t *b = &e->buf;
+    unsigned width = insn->pfx_opsize != 0U ? 16U : 32U;
+
+    if (insn->modrm_mod != 3U) {
+        return -1;
+    }
+    if (e->skip_lazy == 0U) {
+        xalu_sync_eflags(e);
+    }
+    xalu_load_reg(b, XALU_A, insn->modrm_rm, width);
+    if (from_reg != 0) {
+        xalu_load_reg(b, XALU_B, insn->modrm_reg, 32U);
+        a64_emit_ubfm_w(b, XALU_B, XALU_B, 0U, width == 16U ? 3U : 4U);
+        a64_emit_shift_reg_w(b, XALU_T1, XALU_A, XALU_B, A64_SHIFT_LSR);
+        a64_emit_ubfm_w(b, XALU_T1, XALU_T1, 0U, 0U);
+    } else {
+        unsigned idx = insn->imm & (width - 1U);
+        a64_emit_ubfm_w(b, XALU_T1, XALU_A, idx, idx);
+    }
+    if (mode != 0U) {
+        if (from_reg != 0) {
+            a64_emit_movz_w(b, XALU_T2, 1U, 0U);
+            a64_emit_shift_reg_w(b, XALU_T2, XALU_T2, XALU_B, A64_SHIFT_LSL);
+        } else {
+            a64_emit_mov_imm32(b, XALU_T2, 1U << (insn->imm & (width - 1U)));
+        }
+        if (mode == 1U) {
+            a64_emit_orr_reg_w(b, XALU_RES, XALU_A, XALU_T2, A64_SHIFT_LSL, 0U);
+        } else if (mode == 2U) {
+            a64_emit_bic_reg_w(b, false, XALU_RES, XALU_A, XALU_T2,
+                               A64_SHIFT_LSL, 0U);
+        } else {
+            a64_emit_eor_reg_w(b, XALU_RES, XALU_A, XALU_T2, A64_SHIFT_LSL, 0U);
+        }
+        xalu_store_reg(b, XALU_RES, insn->modrm_rm, width);
+    }
+    if (e->skip_lazy == 1U) {
+        e->flags_src = I686_FLAGS_DEAD;
+        e->insn_count++;
+        return 0;
+    }
+    if (e->skip_lazy == 2U) {
+        a64_emit_movz_w(b, XALU_T0, 2U, 0U);
+        xalu_bfi_w(b, XALU_T0, XALU_T1, 0U, 1U);
+        a64_emit(b, 0x39013A60U | (XALU_T0 & 31U)); /* strb wT0, [x19, #78] */
+        e->flags_src = I686_FLAGS_DEAD;
+        e->insn_count++;
+        return 0;
+    }
+    a64_emit_ldr_imm_w(b, XALU_T0, 19U, 36U);
+    xalu_bfi_w(b, XALU_T0, XALU_T1, 0U, 1U);
+    xalu_commit_eflags(e, XALU_T0);
     e->insn_count++;
     return 0;
 }
@@ -552,6 +654,15 @@ int i686_emit_alu_ext(i686_emit_ctx_t *e, const x86_insn_t *insn)
         return xalu_shxd(e, insn, 1, insn->imm & 0xFFU, 0);
     case I686_OP_SHRD_EvCL:
         return xalu_shxd(e, insn, 1, 0U, 1);
+
+    case I686_OP_BT_EvGv:  return xalu_bt_reg(e, insn, 0U, 1);
+    case I686_OP_BTS_EvGv: return xalu_bt_reg(e, insn, 1U, 1);
+    case I686_OP_BTR_EvGv: return xalu_bt_reg(e, insn, 2U, 1);
+    case I686_OP_BTC_EvGv: return xalu_bt_reg(e, insn, 3U, 1);
+    case I686_OP_BT_EvIb:  return xalu_bt_reg(e, insn, 0U, 0);
+    case I686_OP_BTS_EvIb: return xalu_bt_reg(e, insn, 1U, 0);
+    case I686_OP_BTR_EvIb: return xalu_bt_reg(e, insn, 2U, 0);
+    case I686_OP_BTC_EvIb: return xalu_bt_reg(e, insn, 3U, 0);
 
     default:
         return -1;

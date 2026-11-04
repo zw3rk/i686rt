@@ -564,9 +564,35 @@ static int sse_emit_fparith(i686_emit_ctx_t *e, const x86_insn_t *insn,
         sse_fp_sca(b, dbl != 0U ? fp_sca_d[kind] : fp_sca_s[kind], 2U, 0U, 1U);
     }
     if (dbl != 0U) {
-        sse_bad_f64(b, 3U, 2U, kind >= 2U ? 1 : 0);
+        sse_bad_f64(b, 3U, 2U, 0);
+        if (kind >= 2U) {
+            a64_emit(b, 0x4F415400U | (2U << 5) | 4U); /* shl.2d v4, v2, #1 */
+            a64_emit(b, 0x4EE09800U | (4U << 5) | 4U); /* cmeq.2d v4, v4, #0 */
+            a64_emit(b, 0x4F415400U | (0U << 5) | 5U); /* shl.2d v5, v0, #1 */
+            a64_emit(b, 0x4EE09800U | (5U << 5) | 5U); /* cmeq.2d v5, v5, #0 */
+            sse_bic_16b(b, 4U, 4U, 5U);
+            if (kind == 2U) {
+                a64_emit(b, 0x4F415400U | (1U << 5) | 5U); /* shl.2d v5, v1, #1 */
+                a64_emit(b, 0x4EE09800U | (5U << 5) | 5U); /* cmeq.2d v5, v5, #0 */
+                sse_bic_16b(b, 4U, 4U, 5U);
+            }
+            sse_orr_16b(b, 3U, 3U, 4U);
+        }
     } else {
-        sse_bad_f32(b, 3U, 2U, kind >= 2U ? 1 : 0);
+        sse_bad_f32(b, 3U, 2U, 0);
+        if (kind >= 2U) {
+            a64_emit(b, 0x4F215400U | (2U << 5) | 4U); /* shl.4s v4, v2, #1 */
+            a64_emit(b, 0x4EA09800U | (4U << 5) | 4U); /* cmeq.4s v4, v4, #0 */
+            a64_emit(b, 0x4F215400U | (0U << 5) | 5U); /* shl.4s v5, v0, #1 */
+            a64_emit(b, 0x4EA09800U | (5U << 5) | 5U); /* cmeq.4s v5, v5, #0 */
+            sse_bic_16b(b, 4U, 4U, 5U);
+            if (kind == 2U) {
+                a64_emit(b, 0x4F215400U | (1U << 5) | 5U); /* shl.4s v5, v1, #1 */
+                a64_emit(b, 0x4EA09800U | (5U << 5) | 5U); /* cmeq.4s v5, v5, #0 */
+                sse_bic_16b(b, 4U, 4U, 5U);
+            }
+            sse_orr_16b(b, 3U, 3U, 4U);
+        }
     }
     if (vec != 0U) {
         a64_emit(b, 0x6EB0A863U); /* umaxv.4s s3, v3 */

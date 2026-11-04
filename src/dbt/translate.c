@@ -34,7 +34,7 @@
 #include "rt32/rt32_a64_emit.h"
 #include "vm/vm_file.h"
 
-#define I686_DBT_MAX_INSNS 64U
+#define I686_DBT_MAX_INSNS 256U
 
 /* Pre-scan classes (see header comment). */
 enum {
@@ -42,7 +42,8 @@ enum {
     TRC_PARTICIPANT = 1, /* fused full writer: skippable, valid j */
     TRC_JONLY = 2,       /* full writer, never skipped: valid j */
     TRC_TRANSPARENT = 3, /* no flags, never declines/closes */
-    TRC_PARTIAL = 4      /* partial writer (ROL/ROR/INC/DEC): skippable if seen_j */
+    TRC_PARTIAL = 4,     /* partial writer (ROL/ROR/INC/DEC): skippable if seen_j */
+    TRC_NZCV_READER = 5  /* reg-only CMOVcc/SETcc: reads NZCV only */
 };
 
 static int tr_is_regonly(const x86_insn_t *insn)
@@ -167,6 +168,64 @@ static int tr_is_static_rolror(unsigned op)
     }
 }
 
+static int tr_is_rolror_cnt1(const x86_insn_t *insn)
+{
+    unsigned op = insn->op;
+    if (op == (unsigned)I686_OP_ROL_Eb1 || op == (unsigned)I686_OP_ROL_Ev1 ||
+        op == (unsigned)I686_OP_ROR_Eb1 || op == (unsigned)I686_OP_ROR_Ev1) {
+        return 1;
+    }
+    if (tr_is_static_rolror(op) != 0 && ((insn->imm & 31U) == 1U)) {
+        return 1;
+    }
+    return 0;
+}
+
+static int tr_is_incdec(unsigned op)
+{
+    return (op == (unsigned)I686_OP_INC_Eb || op == (unsigned)I686_OP_INC_Ev ||
+            op == (unsigned)I686_OP_DEC_Eb || op == (unsigned)I686_OP_DEC_Ev)
+               ? 1
+               : 0;
+}
+
+static int tr_is_mem_ro32(unsigned op)
+{
+    switch (op) {
+    case I686_OP_MOV_GvEv:
+    case I686_OP_ADD_GvEv: case I686_OP_SUB_GvEv: case I686_OP_CMP_GvEv:
+    case I686_OP_AND_GvEv: case I686_OP_OR_GvEv:  case I686_OP_XOR_GvEv:
+    case I686_OP_CMP_EvGv: case I686_OP_CMP_EvIz: case I686_OP_CMP_EvIbSX:
+    case I686_OP_TEST_EvGv: case I686_OP_TEST_EvIz:
+    case I686_OP_IMUL_GvEv: case I686_OP_IMUL_GvEvIz: case I686_OP_IMUL_GvEvIb:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int tr_is_mem_rw32(unsigned op)
+{
+    switch (op) {
+    case I686_OP_MOV_EvGv: case I686_OP_MOV_EvIz:
+    case I686_OP_ADD_EvGv: case I686_OP_ADD_EvIz: case I686_OP_ADD_EvIbSX:
+    case I686_OP_SUB_EvGv: case I686_OP_SUB_EvIz: case I686_OP_SUB_EvIbSX:
+    case I686_OP_AND_EvGv: case I686_OP_AND_EvIz: case I686_OP_AND_EvIbSX:
+    case I686_OP_OR_EvGv:  case I686_OP_OR_EvIz:  case I686_OP_OR_EvIbSX:
+    case I686_OP_XOR_EvGv: case I686_OP_XOR_EvIz: case I686_OP_XOR_EvIbSX:
+    case I686_OP_NEG_Ev:   case I686_OP_NOT_Ev:
+    case I686_OP_INC_Ev:   case I686_OP_DEC_Ev:
+    case I686_OP_SHL_Ev1:  case I686_OP_SHL_EvIb:
+    case I686_OP_SHR_Ev1:  case I686_OP_SHR_EvIb:
+    case I686_OP_SAR_Ev1:  case I686_OP_SAR_EvIb:
+    case I686_OP_ROL_Ev1:  case I686_OP_ROL_EvIb:
+    case I686_OP_ROR_Ev1:  case I686_OP_ROR_EvIb:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static unsigned tr_classify(const x86_insn_t *insn)
 {
     unsigned op = insn->op;
@@ -178,6 +237,12 @@ static unsigned tr_classify(const x86_insn_t *insn)
     if (op == (unsigned)I686_OP_LEA_GvM) {
         return TRC_TRANSPARENT;
     }
+    if ((op == (unsigned)I686_OP_CMOVcc_Gv ||
+         op == (unsigned)I686_OP_SETcc_Eb) &&
+        regonly != 0 && insn->pfx_rep == 0U &&
+        ((insn->imm & 0xEU) != 10U)) {
+        return TRC_NZCV_READER;
+    }
 
     /* Fused full writers (no LOCK): skippable, valid j. */
     if (tr_is_fused9(op) != 0 ||
@@ -185,7 +250,7 @@ static unsigned tr_classify(const x86_insn_t *insn)
         return TRC_PARTICIPANT;
     }
     /* Eager full writers with a static nonzero count (no LOCK): valid j,
-     * never skipped (their stores always run). */
+     * skippable when followed by a register-only full writer. */
     switch (op) {
     case I686_OP_SHL_Eb1: case I686_OP_SHL_Ev1:
     case I686_OP_SHR_Eb1: case I686_OP_SHR_Ev1:
@@ -201,7 +266,7 @@ static unsigned tr_classify(const x86_insn_t *insn)
     case I686_OP_IMUL_GvEv:
     case I686_OP_IMUL_GvEvIz:
     case I686_OP_IMUL_GvEvIb:
-        return TRC_JONLY;
+        return TRC_PARTIAL;
     default:
         break;
     }
@@ -221,6 +286,11 @@ static unsigned tr_classify(const x86_insn_t *insn)
     case I686_OP_INC_Eb: case I686_OP_INC_Ev:
     case I686_OP_DEC_Eb: case I686_OP_DEC_Ev:
         return TRC_PARTIAL;
+    case I686_OP_BT_EvGv: case I686_OP_BTS_EvGv:
+    case I686_OP_BTR_EvGv: case I686_OP_BTC_EvGv:
+    case I686_OP_BT_EvIb: case I686_OP_BTS_EvIb:
+    case I686_OP_BTR_EvIb: case I686_OP_BTC_EvIb:
+        return (insn->modrm_mod == 3U) ? TRC_PARTIAL : TRC_BARRIER;
     default:
         break;
     }
@@ -304,49 +374,143 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
     /* Phase 2: fault-barrier-safe skip analysis.  Segments end at
      * barriers; the backward pass sets skip[i] for a fused producer
      * when a full flag writer follows in the same segment. */
-    for (i = 0U; i < m; i++) {
-        cls[i] = (unsigned char)tr_classify(&insns[i]);
-        skip[i] = 0U;
-    }
     {
+        uint8_t non_faulting[I686_DBT_MAX_INSNS];
+        uint32_t esp_r = 0U;
+        uint32_t esp_w = 0U;
         unsigned char seen_reg_j = 0U;
         unsigned char seen_mem_j = 0U;
+        unsigned char seen_rol1 = 0U;
+        unsigned char seen_reg_incdec = 0U;
+        unsigned char seen_nzcv_only = 0U;
+
+        for (i = 0U; i < m; i++) {
+            const x86_insn_t *in = &insns[i];
+            cls[i] = (unsigned char)tr_classify(in);
+            skip[i] = 0U;
+            if (in->op == I686_OP_LEA_GvM || tr_is_regonly(in) != 0) {
+                non_faulting[i] = 1U;
+            } else {
+                non_faulting[i] = 0U;
+                if (in->pfx_opsize == 0U && in->pfx_addrsize == 0U &&
+                    in->ea_has != 0U && in->ea_base == I686_REG_ESP &&
+                    in->ea_index == 0xFFU && in->pfx_seg == 0xFFU &&
+                    ((uint32_t)in->ea_disp & 3U) == 0U &&
+                    (uint32_t)in->ea_disp < 128U) {
+                    uint32_t bit = 1U << ((uint32_t)in->ea_disp >> 2U);
+                    if (tr_is_mem_ro32(in->op) != 0) {
+                        if (((esp_r | esp_w) & bit) != 0U) {
+                            non_faulting[i] = 1U;
+                        }
+                        esp_r |= bit;
+                    } else if (tr_is_mem_rw32(in->op) != 0) {
+                        if ((esp_w & bit) != 0U) {
+                            non_faulting[i] = 1U;
+                        }
+                        esp_w |= bit;
+                        esp_r |= bit;
+                    }
+                }
+            }
+            if (cls[i] == (unsigned char)TRC_BARRIER ||
+                in->modrm_reg == I686_REG_ESP ||
+                (in->modrm_mod == 3U && in->modrm_rm == I686_REG_ESP)) {
+                esp_r = 0U;
+                esp_w = 0U;
+            }
+        }
         for (i = m; i-- > 0U;) {
-            int regonly = (insns[i].op == I686_OP_LEA_GvM)
-                              ? 1
-                              : tr_is_regonly(&insns[i]);
+            int regonly = (int)non_faulting[i];
             if (cls[i] == (unsigned char)TRC_BARRIER) {
                 seen_reg_j = 0U;
                 seen_mem_j = 0U;
+                seen_rol1 = 0U;
+                seen_reg_incdec = 0U;
+                seen_nzcv_only = 0U;
+                continue;
+            }
+            if (cls[i] == (unsigned char)TRC_NZCV_READER) {
+                seen_nzcv_only =
+                    (seen_reg_j != 0U || seen_reg_incdec != 0U ||
+                     seen_nzcv_only != 0U)
+                        ? 1U
+                        : 0U;
+                seen_reg_j = 0U;
+                seen_mem_j = 0U;
+                seen_rol1 = 0U;
+                seen_reg_incdec = 0U;
                 continue;
             }
             if ((cls[i] == (unsigned char)TRC_PARTICIPANT ||
+                 cls[i] == (unsigned char)TRC_JONLY ||
                  cls[i] == (unsigned char)TRC_PARTIAL) &&
-                seen_reg_j != 0U) {
+                (seen_reg_j != 0U ||
+                 (tr_is_incdec(insns[i].op) != 0 && seen_reg_incdec != 0U))) {
                 skip[i] = 1U;
-            } else if ((cls[i] == (unsigned char)TRC_PARTICIPANT ||
-                        tr_is_static_rolror(insns[i].op) != 0) &&
-                       seen_mem_j != 0U) {
-                skip[i] = 2U;
+            } else if (cls[i] == (unsigned char)TRC_PARTICIPANT &&
+                       seen_nzcv_only != 0U) {
+                skip[i] = 3U;
+            } else if (seen_mem_j != 0U) {
+                if (cls[i] == (unsigned char)TRC_PARTICIPANT ||
+                    tr_is_static_rolror(insns[i].op) != 0 ||
+                    (tr_is_incdec(insns[i].op) != 0 && seen_rol1 == 0U)) {
+                    skip[i] = 2U;
+                }
+            } else if (tr_is_incdec(insns[i].op) != 0 && i >= 2U &&
+                       cls[i - 1U] == (unsigned char)TRC_PARTIAL &&
+                       tr_is_static_rolror(insns[i - 1U].op) != 0 &&
+                       tr_is_regonly(&insns[i - 1U]) != 0) {
+                unsigned q = i - 1U;
+                while (q > 0U && cls[q - 1U] == (unsigned char)TRC_TRANSPARENT) {
+                    q--;
+                }
+                if (q > 0U && cls[q - 1U] == (unsigned char)TRC_PARTICIPANT) {
+                    if (insns[i].opnd[0] != I686_OPND_RM8 &&
+                        insns[i].pfx_opsize == 0U && i + 2U == m &&
+                        (insns[i + 1U].op == I686_OP_JCC_Jb ||
+                         insns[i + 1U].op == I686_OP_JCC_Jz) &&
+                        (insns[i + 1U].modrm_reg & 0xEU) != 2U &&
+                        (insns[i + 1U].modrm_reg & 0xEU) != 6U &&
+                        (insns[i + 1U].modrm_reg & 0xEU) != 10U) {
+                        skip[i] = 5U;
+                    } else {
+                        skip[i] = 4U;
+                    }
+                }
             }
             if (cls[i] == (unsigned char)TRC_PARTICIPANT ||
                 cls[i] == (unsigned char)TRC_JONLY) {
                 seen_reg_j = (regonly != 0) ? 1U : 0U;
-                if (insns[i].op == I686_OP_IMUL_GvEv ||
-                    insns[i].op == I686_OP_IMUL_GvEvIz ||
-                    insns[i].op == I686_OP_IMUL_GvEvIb) {
-                    seen_mem_j = 0U;
-                } else {
-                    seen_mem_j = 1U;
-                }
+                seen_reg_incdec = 0U;
+                seen_nzcv_only = 0U;
+                seen_rol1 = 0U;
+                seen_mem_j = 1U;
             } else {
-                if (cls[i] == (unsigned char)TRC_PARTIAL &&
-                    tr_is_static_rolror(insns[i].op) == 0 &&
-                    seen_reg_j == 0U) {
-                    seen_mem_j = 0U;
+                if (cls[i] == (unsigned char)TRC_PARTIAL) {
+                    int is_id = tr_is_incdec(insns[i].op);
+                    seen_reg_incdec = (is_id != 0 && regonly != 0) ? 1U : 0U;
+                    seen_nzcv_only = (is_id != 0 && regonly != 0 &&
+                                      insns[i].opnd[0] != I686_OPND_RM8 &&
+                                      insns[i].pfx_opsize == 0U &&
+                                      skip[i] == 0U)
+                                         ? 1U
+                                         : 0U;
+                    if (skip[i] == 4U || skip[i] == 5U) {
+                        seen_mem_j = 1U;
+                        seen_rol1 = 0U;
+                    } else if (skip[i] == 0U ||
+                               (skip[i] == 1U && regonly == 0)) {
+                        seen_mem_j = 0U;
+                        seen_rol1 = 0U;
+                    } else if (skip[i] == 2U &&
+                               tr_is_rolror_cnt1(&insns[i]) != 0) {
+                        seen_rol1 = 1U;
+                    }
                 }
                 if (regonly == 0) {
                     seen_reg_j = 0U;
+                    seen_reg_incdec = 0U;
+                    seen_nzcv_only = 0U;
                 }
             }
         }

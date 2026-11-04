@@ -409,38 +409,44 @@ static inline void xalu_sync_eflags(i686_emit_ctx_t *e)
         e->flags_src = I686_FLAGS_EFLAGS;
         return;
     }
-    a64_emit_str_imm_w(b, 0U, 19U, 0U);
-    a64_emit_str_imm_w(b, 1U, 19U, 4U);
-    a64_emit_str_imm_w(b, 2U, 19U, 8U);
-    a64_emit_str_imm_w(b, 3U, 19U, 12U);
-    a64_emit_str_imm_w(b, 4U, 19U, 16U);
-    a64_emit_str_imm_w(b, 5U, 19U, 20U);
-    a64_emit_str_imm_w(b, 6U, 19U, 24U);
-    a64_emit_str_imm_w(b, 7U, 19U, 28U);
-    for (i = 0U; i < 4U; i++) {
-        uint32_t hw = (uint32_t)((fn >> (16U * i)) & 0xFFFFU);
-        uint32_t word;
-        if (i == 0U) {
-            word = 0xD2800000U; /* MOVZ X17, hw */
-        } else if (hw != 0U) {
-            word = 0xF2800000U; /* MOVK X17, hw, LSL #16i */
-        } else {
-            continue;
+    {
+        size_t to_done;
+        a64_emit_ldr_imm_w(b, XALU_T0, 19U, 76U); /* lazy_op */
+        to_done = xalu_cbz_x_placeholder(b, 0, XALU_T0);
+        a64_emit_str_imm_w(b, 0U, 19U, 0U);
+        a64_emit_str_imm_w(b, 1U, 19U, 4U);
+        a64_emit_str_imm_w(b, 2U, 19U, 8U);
+        a64_emit_str_imm_w(b, 3U, 19U, 12U);
+        a64_emit_str_imm_w(b, 4U, 19U, 16U);
+        a64_emit_str_imm_w(b, 5U, 19U, 20U);
+        a64_emit_str_imm_w(b, 6U, 19U, 24U);
+        a64_emit_str_imm_w(b, 7U, 19U, 28U);
+        for (i = 0U; i < 4U; i++) {
+            uint32_t hw = (uint32_t)((fn >> (16U * i)) & 0xFFFFU);
+            uint32_t word;
+            if (i == 0U) {
+                word = 0xD2800000U; /* MOVZ X17, hw */
+            } else if (hw != 0U) {
+                word = 0xF2800000U; /* MOVK X17, hw, LSL #16i */
+            } else {
+                continue;
+            }
+            a64_emit(b, word | (i << 21) | (hw << 5) | 17U);
         }
-        a64_emit(b, word | (i << 21) | (hw << 5) | 17U);
+        a64_emit(b, 0xAA1F0260U); /* x0 = x19 */
+        a64_emit(b, 0xAA1F03DCU); /* x28 = x30 (park lr) */
+        a64_emit(b, 0xD63F0220U); /* blr x17 */
+        a64_emit(b, 0xAA1F039EU); /* x30 = x28 */
+        a64_emit_ldr_imm_w(b, 0U, 19U, 0U);
+        a64_emit_ldr_imm_w(b, 1U, 19U, 4U);
+        a64_emit_ldr_imm_w(b, 2U, 19U, 8U);
+        a64_emit_ldr_imm_w(b, 3U, 19U, 12U);
+        a64_emit_ldr_imm_w(b, 4U, 19U, 16U);
+        a64_emit_ldr_imm_w(b, 5U, 19U, 20U);
+        a64_emit_ldr_imm_w(b, 6U, 19U, 24U);
+        a64_emit_ldr_imm_w(b, 7U, 19U, 28U);
+        xalu_patch_cbz_x(b, to_done, b->count);
     }
-    a64_emit(b, 0xAA1F0260U); /* x0 = x19 */
-    a64_emit(b, 0xAA1F03DCU); /* x28 = x30 (park lr) */
-    a64_emit(b, 0xD63F0220U); /* blr x17 */
-    a64_emit(b, 0xAA1F039EU); /* x30 = x28 */
-    a64_emit_ldr_imm_w(b, 0U, 19U, 0U);
-    a64_emit_ldr_imm_w(b, 1U, 19U, 4U);
-    a64_emit_ldr_imm_w(b, 2U, 19U, 8U);
-    a64_emit_ldr_imm_w(b, 3U, 19U, 12U);
-    a64_emit_ldr_imm_w(b, 4U, 19U, 16U);
-    a64_emit_ldr_imm_w(b, 5U, 19U, 20U);
-    a64_emit_ldr_imm_w(b, 6U, 19U, 24U);
-    a64_emit_ldr_imm_w(b, 7U, 19U, 28U);
 }
 
 /* ---- carry-in for ADC/SBB -------------------------------------------- */
