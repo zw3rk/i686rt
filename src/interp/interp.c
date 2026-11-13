@@ -88,7 +88,6 @@ static __thread uint32_t s_saved_lazy_width;
 static __thread uint64_t s_last_remap_ga = UINT64_C(0xFFFFFFFFFFFFFFFF);
 
 static __thread volatile sig_atomic_t s_fault_sig;
-static __thread volatile sig_atomic_t s_fault_code;
 
 static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
 {
@@ -153,7 +152,6 @@ static void host_fault_handler(int sig, siginfo_t *si, void *uc_)
         s_fault_jmp = NULL; /* disarm: a nested fault must not re-jump */
         s_fault_addr = (uint64_t)(uintptr_t)si->si_addr;
         s_fault_sig = sig;
-        s_fault_code = (sig_atomic_t)si->si_code;
         siglongjmp(*jb, 1);
     }
     _exit(128 + sig);
@@ -210,16 +208,11 @@ int i686_fault_sig(void)
     return (int)s_fault_sig;
 }
 
-/* Host siginfo code of the checkpointed fault (SEGV_MAPERR vs
- * SEGV_ACCERR selects remap-and-resume vs deliver in the catches). */
-int i686_fault_code(void)
-{
-    return (int)s_fault_code;
-}
-
 /* Validate a faulting guest address against the region mirror: returns
  * 1 with the covering region's prot/flags when mapped, 0 when the
- * address falls in no region (genuine unmapped fault). */
+ * address falls in no region (genuine unmapped fault).  Both the
+ * interpreter catch below and the DBT engine catch branch on this
+ * mirror (i686_fault_region_prot), not on the host si_code. */
 int i686_fault_region_prot(const i686_ctx_t *ctx, uint32_t ga,
                             uint32_t *out_prot, uint32_t *out_flags)
 {

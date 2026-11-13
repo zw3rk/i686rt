@@ -20,6 +20,11 @@
 #include "structs_i386.h"
 #include "syscalls_i386.h"
 
+/* Canonical guest<->host O_ flag map (I686_O_* / HOST_O_*).  Included
+ * for the sys_misc converters so both sys_pass_fs.c and sys_misc_conv.c
+ * share the single table; the GO_/HO_ names below alias onto it. */
+#include "sys_pass_internal.h"
+
 #include "rt32/rt32.h"
 
 #include <stdlib.h>
@@ -54,64 +59,74 @@
 #define L2E_NR_epoll_pwait   319U
 #define L2E_NR_prlimit64     340U
 
-/* O_ flags: historical x86 values (musl arch/i386/bits/fcntl.h) vs
- * include/uapi/asm-generic/fcntl.h — bit-identical. */
-#define I686_GO_CREAT     0x000040u
-#define I686_GO_EXCL      0x000080u
-#define I686_GO_NOCTTY    0x000100u
-#define I686_GO_TRUNC     0x000200u
-#define I686_GO_APPEND    0x000400u
-#define I686_GO_NONBLOCK  0x000800u
-#define I686_GO_DSYNC     0x001000u
-#define I686_GO_FASYNC    0x002000u
-#define I686_GO_DIRECT    0x004000u
-#define I686_GO_LARGEFILE 0x008000u
-#define I686_GO_DIRECTORY 0x010000u
-#define I686_GO_NOFOLLOW  0x020000u
-#define I686_GO_NOATIME   0x040000u
-#define I686_GO_CLOEXEC   0x080000u
-#define I686_GO_OSYNC     0x101000u
-#define I686_GO_PATH      0x200000u
-#define I686_GO_TMPFILE   0x400000u
-#define I686_GO_ACCMODE   0x000003u
+/* O_ flag aliases onto the single canonical map in
+ * src/os/sys_pass_internal.h (guest i386 I686_O_*, host aarch64 Linux
+ * HOST_O_*).  O_DIRECT (guest 0x4000, host 0x10000), O_DIRECTORY
+ * (guest 0x10000, host 0x4000) and O_NOFOLLOW (guest 0x20000, host
+ * 0x8000) differ between guest and host (on Darwin hosts the <fcntl.h>
+ * constants apply); the rest are bit-identical.  The host has no
+ * O_LARGEFILE (64-bit: always large); the guest bit maps to nothing. */
+#define I686_GO_ACCMODE   I686_O_ACCMODE
+#define I686_GO_CREAT     I686_O_CREAT
+#define I686_GO_EXCL      I686_O_EXCL
+#define I686_GO_NOCTTY    I686_O_NOCTTY
+#define I686_GO_TRUNC     I686_O_TRUNC
+#define I686_GO_APPEND    I686_O_APPEND
+#define I686_GO_NONBLOCK  I686_O_NONBLOCK
+#define I686_GO_DSYNC     I686_O_DSYNC
+#define I686_GO_FASYNC    I686_O_FASYNC
+#define I686_GO_DIRECT    I686_O_DIRECT
+#define I686_GO_LARGEFILE I686_O_LARGEFILE
+#define I686_GO_DIRECTORY I686_O_DIRECTORY
+#define I686_GO_NOFOLLOW  I686_O_NOFOLLOW
+#define I686_GO_NOATIME   I686_O_NOATIME
+#define I686_GO_CLOEXEC   I686_O_CLOEXEC
+#define I686_GO_OSYNC     I686_O__SYNC
+#define I686_GO_PATH      I686_O_PATH
+#define I686_GO_TMPFILE   I686_O__TMPFILE
 
-#define I686_HO_CREAT     0x000040u
-#define I686_HO_EXCL      0x000080u
-#define I686_HO_NOCTTY    0x000100u
-#define I686_HO_TRUNC     0x000200u
-#define I686_HO_APPEND    0x000400u
-#define I686_HO_NONBLOCK  0x000800u
-#define I686_HO_DSYNC     0x001000u
-#define I686_HO_FASYNC    0x002000u
-#define I686_HO_DIRECT    0x004000u
-#define I686_HO_LARGEFILE 0x008000u
-#define I686_HO_DIRECTORY 0x010000u
-#define I686_HO_NOFOLLOW  0x020000u
-#define I686_HO_NOATIME   0x040000u
-#define I686_HO_CLOEXEC   0x080000u
-#define I686_HO_OSYNC     0x101000u
-#define I686_HO_PATH      0x200000u
-#define I686_HO_TMPFILE   0x400000u
-#define I686_HO_ACCMODE   0x000003u
+#define I686_HO_ACCMODE   I686_O_ACCMODE
+#define I686_HO_CREAT     HOST_O_CREAT
+#define I686_HO_EXCL      HOST_O_EXCL
+#define I686_HO_NOCTTY    HOST_O_NOCTTY
+#define I686_HO_TRUNC     HOST_O_TRUNC
+#define I686_HO_APPEND    HOST_O_APPEND
+#define I686_HO_NONBLOCK  HOST_O_NONBLOCK
+#define I686_HO_DSYNC     HOST_O_DSYNC
+#define I686_HO_FASYNC    HOST_O_FASYNC
+#define I686_HO_DIRECT    HOST_O_DIRECT
+#define I686_HO_DIRECTORY HOST_O_DIRECTORY
+#define I686_HO_NOFOLLOW  HOST_O_NOFOLLOW
+#define I686_HO_NOATIME   HOST_O_NOATIME
+#define I686_HO_CLOEXEC   HOST_O_CLOEXEC
+#define I686_HO_OSYNC     HOST_O__SYNC
+#define I686_HO_PATH      HOST_O_PATH
+#define I686_HO_TMPFILE   HOST_O__TMPFILE
 
 #define I686_O_KNOWN                                                         \
-    (I686_GO_ACCMODE | I686_GO_CREAT | I686_GO_EXCL | I686_GO_NOCTTY |       \
-     I686_GO_TRUNC | I686_GO_APPEND | I686_GO_NONBLOCK | I686_GO_DSYNC |     \
-     I686_GO_FASYNC | I686_GO_DIRECT | I686_GO_LARGEFILE |                   \
-     I686_GO_DIRECTORY | I686_GO_NOFOLLOW | I686_GO_NOATIME |                \
-     I686_GO_CLOEXEC | I686_GO_OSYNC | I686_GO_PATH | I686_GO_TMPFILE)
+    (I686_O_ACCMODE | I686_O_CREAT | I686_O_EXCL | I686_O_NOCTTY |           \
+     I686_O_TRUNC | I686_O_APPEND | I686_O_NONBLOCK | I686_O_DSYNC |         \
+     I686_O_FASYNC | I686_O_DIRECT | I686_O_LARGEFILE |                     \
+     I686_O_DIRECTORY | I686_O_NOFOLLOW | I686_O_NOATIME |                  \
+     I686_O_CLOEXEC | I686_O__SYNC | I686_O_PATH | I686_O__TMPFILE)
 
 /* fcntl F_SETFL-allowed set: kernel fs/fcntl.c SETFL_MASK + FASYNC. */
 #define I686_SETFL_ALLOWED                                                   \
-    (I686_GO_APPEND | I686_GO_NONBLOCK | I686_GO_DIRECT | I686_GO_NOATIME |  \
-     I686_GO_FASYNC)
+    (I686_O_APPEND | I686_O_NONBLOCK | I686_O_DIRECT | I686_O_NOATIME |      \
+     I686_O_FASYNC)
 
+/* Identical encodings stay pinned; the three that differ are pinned to
+ * their distinct values on each side. */
 _Static_assert(I686_GO_CREAT == I686_HO_CREAT, "i386/aarch64 O_CREAT differ");
 _Static_assert(I686_GO_APPEND == I686_HO_APPEND, "i386/aarch64 O_APPEND differ");
 _Static_assert(I686_GO_NONBLOCK == I686_HO_NONBLOCK, "O_NONBLOCK differs");
-_Static_assert(I686_GO_LARGEFILE == I686_HO_LARGEFILE, "O_LARGEFILE differs");
 _Static_assert(I686_GO_CLOEXEC == I686_HO_CLOEXEC, "O_CLOEXEC differs");
 _Static_assert(I686_GO_NOATIME == I686_HO_NOATIME, "O_NOATIME differs");
+_Static_assert(I686_GO_DIRECT != I686_HO_DIRECT, "O_DIRECT must differ");
+_Static_assert(I686_GO_DIRECTORY != I686_HO_DIRECTORY, "O_DIRECTORY must differ");
+_Static_assert(I686_GO_NOFOLLOW != I686_HO_NOFOLLOW, "O_NOFOLLOW must differ");
+_Static_assert(I686_GO_DIRECT == I686_HO_DIRECTORY, "DIRECT/DIRECTORY swap");
+_Static_assert(I686_GO_DIRECTORY == I686_HO_DIRECT, "DIRECTORY/DIRECT swap");
 
 /* fcntl commands (identical numbering; the *64 cmds map down on the
  * 64-bit host — see i686_fcntl_cmd_to_host). */
@@ -231,29 +246,11 @@ static inline uint16_t rd_le16(const uint8_t *p)
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-static inline uint32_t rd_le32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
+/* rd_le32/wr_le32/wr_le16 come from sys_pass_internal.h (single copy). */
 
 static inline uint64_t rd_le64(const uint8_t *p)
 {
     return (uint64_t)rd_le32(p) | ((uint64_t)rd_le32(p + 4) << 32);
-}
-
-static inline void wr_le16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v & 0xFFu);
-    p[1] = (uint8_t)((v >> 8) & 0xFFu);
-}
-
-static inline void wr_le32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v & 0xFFu);
-    p[1] = (uint8_t)((v >> 8) & 0xFFu);
-    p[2] = (uint8_t)((v >> 16) & 0xFFu);
-    p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
 static inline void wr_le64(uint8_t *p, uint64_t v)

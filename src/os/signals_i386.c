@@ -496,10 +496,14 @@ int i686_sigreturn(i686_ctx_t *ctx, int rt)
             i686_seg_sc_decode(ctx, segs);
         }
     }
-    /* fpstate restore */
+    /* fpstate restore: a bad frame takes the bad-frame path (like a
+     * bad sigcontext above), never a silent partial restore. */
     if (sc.fpstate != 0U) {
         i686_fpstate_32_t fp;
-        if (i686_copy_from_guest(ctx, &fp, sc.fpstate, sizeof(fp)) == 0) {
+        if (i686_copy_from_guest(ctx, &fp, sc.fpstate, sizeof(fp)) != 0) {
+            return -1;
+        }
+        {
             ctx->fctrl = fp.cwd; ctx->fstat = fp.swd; ctx->ftag = fp.twd;
             ctx->fop = fp.fop;
             ctx->fpu_ip = (fp.fpu_ip2 != 0U) ? fp.fpu_ip2 : fp.fip;

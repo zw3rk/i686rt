@@ -143,24 +143,94 @@ int i686_groups16_from_guest(i686_ctx_t *ctx, uint32_t list_va, uint32_t n, gid_
     return 0;
 }
 
+/* Join sysroot and a guest path, resolving "." and clamping ".." at
+ * the sysroot so the result can never escape it.  Both absolute
+ * ("/x/../y") and relative ("a/../b", resolved under the sysroot)
+ * guest paths are confined.  Returns 0 with the joined path in out,
+ * or -1 with errno set (ENAMETOOLONG when the join does not fit). */
+int i686_sysroot_join(const char *sysroot, const char *path, char *out,
+                      size_t cap)
+{
+    size_t n, base;
+    const char *p;
+    if (cap == 0U) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    n = strlen(sysroot);
+    while (n > 1U && sysroot[n - 1U] == '/') {
+        n--;
+    }
+    if (n + 1U >= cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, sysroot, n);
+    out[n] = '\0';
+    base = n;
+    p = path;
+    while (*p != '\0') {
+        const char *q;
+        size_t len;
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        q = p;
+        while (*q != '\0' && *q != '/') {
+            q++;
+        }
+        len = (size_t)(q - p);
+        if (len == 1U && p[0] == '.') {
+            p = q;
+            continue;
+        }
+        if (len == 2U && p[0] == '.' && p[1] == '.') {
+            /* Clamp at the sysroot: excess ".." stays put instead of
+             * escaping (chroot-style resolution). */
+            if (n > base) {
+                while (n > base && out[n - 1U] != '/') {
+                    n--;
+                }
+                if (n > base) {
+                    n--;
+                }
+                out[n] = '\0';
+            }
+            p = q;
+            continue;
+        }
+        if (n + 1U + len >= cap) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (out[n - 1U] != '/') {
+            out[n] = '/';
+            n++;
+        }
+        memcpy(out + n, p, len);
+        n += len;
+        out[n] = '\0';
+        p = q;
+    }
+    return 0;
+}
+
 static long open_guest(const i686_ctx_t *ctx, const char *path, int flags,
                        mode_t mode)
 {
     char buf[PATH_BUF];
-    if (path[0] == '/' && ctx->sysroot != NULL &&
-        ctx->sysroot[0] != '\0') {
-        size_t n = strlen(ctx->sysroot);
-        size_t pl = strlen(path);
-        if (n + pl < sizeof buf) {
-            memcpy(buf, ctx->sysroot, n);
-            memcpy(buf + n, path, pl + 1U);
-            {
-                int fd = open(buf, flags, mode);
-                if (fd >= 0) {
-                    return fd;
-                }
-            }
+    /* A configured sysroot confines every open: the join resolves ".."
+     * inside the sysroot and the raw guest path is never opened on the
+     * host.  Oversize joins fail closed instead of falling through. */
+    if (ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
+        if (i686_sysroot_join(ctx->sysroot, path, buf, sizeof buf) != 0) {
+            errno = ENAMETOOLONG;
+            return -1;
         }
+        return open(buf, flags, mode);
     }
     return open(path, flags, mode);
 }

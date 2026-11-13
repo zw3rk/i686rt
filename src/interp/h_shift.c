@@ -20,8 +20,8 @@
  *  - SHL/SHR/SAR: CF = last bit shifted out; OF defined only for
  *    count==1 (SHL: CF ^ MSB(result), SHR: MSB(operand), SAR: 0);
  *    SF/ZF/PF from the result via i686_flags_logiczx (which also drops
- *    the lazy descriptor); AF is architecturally undefined and is left
- *    as-is in ctx->eflags.
+ *    the lazy descriptor); AF is architecturally undefined and is
+ *    cleared by i686_flags_logiczx along with the arithmetic bits.
  *  - ROL/ROR: CF = LSB/MSB of the result (defined for every count != 0,
  *    even when the value is unchanged, e.g. ROL16 by 16); OF only for
  *    count==1 (ROL: CF ^ MSB(result), ROR: two MSBs of the result);

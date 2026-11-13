@@ -6,11 +6,11 @@
  *
  * Lane L3a (docs/lanes/phase-3.md): every block opens with
  * i686_emit_begin, ends through exactly one i686_emit_exit, and is sealed
- * by i686_emit_finish.  The epilogue stores the live guest GPRs w0..w7
- * back to ctx->gpr[0..7] (ABI-locked offsets, src/i686rt.h), writes the
- * exit triplet {reason, arg, dest}, mirrors dest into ctx->eip for
- * BRANCH so the engine loop can chain without re-deriving it, and
- * returns to the trampoline.
+ * by i686_emit_finish.  The epilogue writes the exit triplet
+ * {reason, arg, dest} from w8/w9/w10 (mirroring dest into ctx->eip for
+ * BRANCH so the engine loop can chain without re-deriving it) and
+ * returns to the trampoline, whose .Lexit spills the live guest GPRs
+ * w0..w7 back to ctx->gpr[0..7] (ABI-locked offsets, src/i686rt.h).
  *
  * i686_emit_ea materializes a decoded ModRM effective address into w21
  * as a 32-bit guest offset: disp + base + (index << scale), wrapped with

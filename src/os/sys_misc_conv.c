@@ -123,49 +123,72 @@ void i686_rlimit_h2g(i686_rlimit_t *g, uint64_t cur, uint64_t max)
                                               : (uint32_t)max;
 }
 
-/* g2h keeps I686_O_KNOWN and drops O_LARGEFILE. It does not swap
- * DIRECTORY, DIRECT, or NOFOLLOW. i686_open_flags_to_host does that
- * for open. h2g below rewrites host DIRECT and NOFOLLOW only. */
-uint32_t i686_oflags_g2h(uint32_t g)
+/* Guest->host and host->guest O_ translation over the single shared
+ * map (I686_GO_* guest aliases, I686_HO_* host aliases in
+ * sys_misc_internal.h onto src/os/sys_pass_internal.h).  O_DIRECT,
+ * O_DIRECTORY and O_NOFOLLOW are swapped; O_LARGEFILE is guest-only
+ * (the 64-bit host has no such bit) and maps to nothing.  Full opens
+ * go through i686_open_flags_to_host (src/os/sys_pass_fs.c), which
+ * owns the table; these converters serve the fcntl GETFL/SETFL paths. */
+/* The three encodings that differ are extracted from the input side
+ * before any output bit is set: guest DIRECTORY shares its number with
+ * host DIRECT (and vice versa), so an in-place swap would alias. */
+static uint32_t oflags_swap_g2h(uint32_t g)
 {
-    return g & I686_O_KNOWN & ~(uint32_t)I686_GO_LARGEFILE;
+    uint32_t h =
+        g & ~((uint32_t)I686_GO_DIRECT | (uint32_t)I686_GO_DIRECTORY |
+              (uint32_t)I686_GO_NOFOLLOW);
+    if ((g & (uint32_t)I686_GO_DIRECT) != 0U) {
+        h |= (uint32_t)I686_HO_DIRECT;
+    }
+    if ((g & (uint32_t)I686_GO_DIRECTORY) != 0U) {
+        h |= (uint32_t)I686_HO_DIRECTORY;
+    }
+    if ((g & (uint32_t)I686_GO_NOFOLLOW) != 0U) {
+        h |= (uint32_t)I686_HO_NOFOLLOW;
+    }
+    return h;
 }
 
-/* S2 arbitration: the four O_ bits whose i386 and aarch64 encodings
- * differ (empirically verified by the L2f lane; both sides hard-coded):
- * O_DIRECT 0x4000 <-> 0x10000, O_DIRECTORY 0x10000 <-> 0x4000,
- * O_NOFOLLOW 0x20000 <-> 0x8000, O_LARGEFILE guest 0x8000 (host no-op). */
-#define I686_HO_DIRECT_ 0x10000u
-#define I686_HO_NOFOLLOW_ 0x8000u
+uint32_t i686_oflags_g2h(uint32_t g)
+{
+    uint32_t known =
+        g & (uint32_t)I686_O_KNOWN & ~(uint32_t)I686_GO_LARGEFILE;
+    return oflags_swap_g2h(known);
+}
+
+static uint32_t oflags_swap_h2g(uint32_t h)
+{
+    uint32_t g =
+        h & ~((uint32_t)I686_HO_DIRECT | (uint32_t)I686_HO_DIRECTORY |
+              (uint32_t)I686_HO_NOFOLLOW);
+    if ((h & (uint32_t)I686_HO_DIRECT) != 0U) {
+        g |= (uint32_t)I686_GO_DIRECT;
+    }
+    if ((h & (uint32_t)I686_HO_DIRECTORY) != 0U) {
+        g |= (uint32_t)I686_GO_DIRECTORY;
+    }
+    if ((h & (uint32_t)I686_HO_NOFOLLOW) != 0U) {
+        g |= (uint32_t)I686_GO_NOFOLLOW;
+    }
+    return g;
+}
 
 /* L2f owns the full table (src/os/sys_pass_fs.c). */
 long i686_open_flags_to_host(uint32_t guest_flags);
 
 uint32_t i686_oflags_h2g(uint32_t h)
 {
-    uint32_t g = h & I686_O_KNOWN;
-    if ((g & I686_HO_DIRECT_) != 0U) {
-        g = (g & ~I686_HO_DIRECT_) | I686_GO_DIRECT;
-    }
-    if ((g & I686_HO_NOFOLLOW_) != 0U) {
-        g = (g & ~I686_HO_NOFOLLOW_) | I686_GO_NOFOLLOW;
-    }
-    if ((g & I686_HO_LARGEFILE) != 0U) { /* host O_LARGEFILE slot holds
-        O_NOFOLLOW on arm64; that bit is handled above, nothing to do */
-    }
-    return g & I686_O_KNOWN;
+    return oflags_swap_h2g(h) & (uint32_t)I686_O_KNOWN;
 }
 
 /* F_SETFL argument subset (kernel SETFL_MASK + FASYNC), guest bits
  * translated to host (O_DIRECT moves; O_LARGEFILE is a 64-bit no-op). */
 uint32_t i686_setfl_to_host(uint32_t g)
 {
-    uint32_t allowed = g & I686_SETFL_ALLOWED;
-    if ((allowed & I686_GO_DIRECT) != 0U) {
-        allowed = (allowed & ~I686_GO_DIRECT) | I686_HO_DIRECT_;
-    }
-    allowed &= ~I686_GO_LARGEFILE;
-    return allowed;
+    uint32_t allowed = g & (uint32_t)I686_SETFL_ALLOWED;
+    allowed &= ~(uint32_t)I686_GO_LARGEFILE;
+    return oflags_swap_g2h(allowed);
 }
 
 /* Guest fcntl cmd -> host cmd.  fcntl64_entry selects the fcntl64(221)

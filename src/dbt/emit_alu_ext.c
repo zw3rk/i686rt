@@ -465,7 +465,10 @@ int xalu_rolror(i686_emit_ctx_t *e, const x86_insn_t *insn, int is_ror,
 
     /* CF = LSB (ROL) / MSB (ROR) of the result, for every count != 0. */
     a64_emit_ldr_imm_w(b, wE, 19U, 36U);
-    a64_emit_movz_w(b, XALU_T1, 0x0801U, 0U); /* CF|OF */
+    a64_emit_movz_w(b, XALU_T1, 0x0001U, 0U); /* CF only: OF is written
+                                                 * only when the masked
+                                                 * count == 1 below and
+                                                 * otherwise preserved. */
     a64_emit_bic_reg_w(b, false, wE, wE, XALU_T1, A64_SHIFT_LSL, 0U);
     if (is_ror == 0) {
         a64_emit_ubfm_w(b, XALU_T1, XALU_RES, 0U, 0U);

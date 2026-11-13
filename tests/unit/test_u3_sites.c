@@ -14,6 +14,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -172,7 +173,8 @@ static void t_regime_file(void)
     CHECK((i686_vm_file_flags(0x08048000u) & 0x01u) == 0u, "flag clears");
     {
         int pfd[2] = { -1, -1 };
-        int out_fd = -1;
+        int prefix_fd = -1;
+        int suffix_fd = -1;
         uint64_t out_off = 0u;
         uint8_t out_kind = 0u;
         CHECK(pipe(pfd) == 0, "pipe for file map test");
@@ -184,16 +186,25 @@ static void t_regime_file(void)
         /* Interior hole split (I686-R2-7) + owned_fd retention (I686-R2-6). */
         CHECK(i686_vm_file_untrack_map(0x40001000u, 4096u) == 0,
               "interior hole split succeeds");
-        CHECK(i686_vm_file_lookup_map(0x40000000u, &out_fd, &out_off,
+        CHECK(i686_vm_file_lookup_map(0x40000000u, &prefix_fd, &out_off,
                                       &out_kind, NULL) == 0 &&
-              out_fd >= 0 && out_fd != pfd[0] && out_off == 4096u &&
+              prefix_fd >= 0 && out_off == 4096u &&
               out_kind == I686_BACKING_SHARED_FILE,
               "prefix retained after interior hole split");
-        CHECK(i686_vm_file_lookup_map(0x40002000u, &out_fd, &out_off,
+        CHECK(i686_vm_file_lookup_map(0x40002000u, &suffix_fd, &out_off,
                                       &out_kind, NULL) == 0 &&
-              out_fd >= 0 && out_fd != pfd[0] && out_off == 12288u &&
+              suffix_fd >= 0 && out_off == 12288u &&
               out_kind == I686_BACKING_SHARED_FILE,
               "suffix retained with adjusted file_off after hole split");
+        /* Both retained entries must hold live independent owned fds:
+         * the caller-closed pfd[0] number may be recycled by dup(), so
+         * the integer value alone proves nothing. */
+        CHECK(prefix_fd >= 0 && fcntl(prefix_fd, F_GETFD) >= 0,
+              "prefix owned fd is live");
+        CHECK(suffix_fd >= 0 && fcntl(suffix_fd, F_GETFD) >= 0,
+              "suffix owned fd is live");
+        CHECK(prefix_fd != suffix_fd,
+              "prefix and suffix hold independent fds");
     }
     i686_vm_file_fini();
 }

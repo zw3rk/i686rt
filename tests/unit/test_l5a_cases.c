@@ -333,8 +333,10 @@ void run_l5a_part2(void)
         }
     }
 
-    /* 16. LDMXCSR (reserved bits masked) + STMXCSR + EMMS (ftag empty)
-     *     + PAUSE = NOP (no state change). */
+    /* 16. LDMXCSR + STMXCSR + EMMS (ftag empty) + PAUSE = NOP
+     *     (no state change).  The load uses a clean value: LDMXCSR
+     *     with reserved bits set must #GP without modifying MXCSR
+     *     (R5-2), so such an input would fault at the first insn. */
     {
         static const uint8_t code[] = {
             0x0F, 0xAE, 0x16,             /* ldmxcsr [esi]  */
@@ -343,7 +345,7 @@ void run_l5a_part2(void)
             0xF3, 0x0F, 0x90, 0xC0,       /* pause          */
             0xB8, 0x33, 0x00, 0x00, 0x00, /* mov eax, 0x33  */
         };
-        static const uint32_t mem[4] = {0x12349F80U, 0U, 0U, 0U};
+        static const uint32_t mem[4] = {0x00009F80U, 0U, 0U, 0U};
         case_t k = {code, sizeof code, mem,
                     {0U, 0U, 0U, 0U, 0U, 0U, DATA1, DATA2},
                     0U, NULL, 0x1F80U, 0x5555U, {0U, 0U}};
@@ -352,6 +354,82 @@ void run_l5a_part2(void)
             CHECK(data_word(DATA2, 0) == 0x00009F80U);
             CHECK(g_c.ftag == 0xFFFFU);
             CHECK(g_c.gpr[I686_REG_EAX] == 0x33U);
+        }
+    }
+
+    /* 17. R15-1: CVTSD2SS/CVTPD2PS of a NaN must match the interpreter's
+     * -QNaN (0xFFC00000), not the host FCVT(N) result (0x7FC00000).
+     * NaN lanes take the D2 interpret-one exit at the convert's own PC
+     * (first exit UNDEF with the convert length); finite lanes,
+     * including Infs, stay on the fast native path. */
+    {
+        static const uint8_t sd_nan[] = {0xF2, 0x0F, 0x5A, 0xC3};
+        static const uint8_t pd_nan[] = {0x66, 0x0F, 0x5A, 0xC3};
+        static const uint8_t sd_inf[] = {0xF2, 0x0F, 0x5A, 0xC3};
+        static uint32_t xmm[8][4] = {
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0x7FF80000U, 0U, 0U}, /* qNaN double in d0 */
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+        };
+        static uint32_t xmm_pd[8][4] = {
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0x7FF80000U, 0U, 0x3FF80000U}, /* qNaN, 1.5 */
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+        };
+        static uint32_t xmm_inf[8][4] = {
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0x7FF00000U, 0U, 0U}, /* +Inf double in d0 */
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+            {0U, 0U, 0U, 0U},
+        };
+        case_t k;
+        uint32_t fr, fa, fd;
+        int rc;
+        /* CVTSD2SS qNaN -> 0xFFC00000 via interpret-one. */
+        memset(&k, 0, sizeof(k));
+        k.code = sd_nan; k.clen = sizeof sd_nan;
+        k.xmm = (const uint32_t (*)[4])xmm;
+        prime(&k);
+        ctx_setup(&g_c, &k);
+        rc = dbt_engine(&g_c, &fr, &fa, &fd);
+        CHECK(rc == I686_EXIT_FAULT);
+        CHECK(fr == I686_EXIT_UNDEF && fa == 4U && fd == CASE_EIP);
+        CHECK(xmm_word(0, 0) == 0xFFC00000U);
+        CHECK(g_c.mxcsr == 0x1F80U);
+        /* CVTPD2PS {qNaN, 1.5} -> {0xFFC00000, 0x3FC00000}. */
+        memset(&k, 0, sizeof(k));
+        k.code = pd_nan; k.clen = sizeof pd_nan;
+        k.xmm = (const uint32_t (*)[4])xmm_pd;
+        prime(&k);
+        ctx_setup(&g_c, &k);
+        rc = dbt_engine(&g_c, &fr, &fa, &fd);
+        CHECK(rc == I686_EXIT_FAULT);
+        CHECK(fr == I686_EXIT_UNDEF && fa == 4U && fd == CASE_EIP);
+        CHECK(xmm_word(0, 0) == 0xFFC00000U);
+        CHECK(xmm_word(0, 1) == 0x3FC00000U);
+        CHECK(xmm_word(0, 2) == 0U && xmm_word(0, 3) == 0U);
+        CHECK(g_c.mxcsr == 0x1F80U);
+        /* CVTSD2SS +Inf stays fully native with 0x7F800000. */
+        memset(&k, 0, sizeof(k));
+        k.code = sd_inf; k.clen = sizeof sd_inf;
+        k.xmm = (const uint32_t (*)[4])xmm_inf;
+        if (run_case("cvtsd2ss inf native", &k) == 0) {
+            CHECK(xmm_word(0, 0) == 0x7F800000U);
+            CHECK(g_c.mxcsr == 0x1F80U);
         }
     }
 }

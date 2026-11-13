@@ -252,6 +252,11 @@ int setgroups(int, const gid_t *);
 
 /* Pure marshalling helpers */
 long i686_open_flags_to_host(uint32_t guest_flags);
+/* Sysroot-confined join (sys_pass_fs.c): resolve path under sysroot,
+ * clamping ".." so the result never escapes; 0 on success, -1 with
+ * errno (ENAMETOOLONG) when the join does not fit. */
+int i686_sysroot_join(const char *sysroot, const char *path, char *out,
+                      size_t cap);
 long i686_getcwd_store(i686_ctx_t *ctx, uint32_t buf_va, uint32_t size,
                        const char *cwd, size_t cwd_len);
 int i686_rusage_to_guest(i686_ctx_t *ctx, uint32_t ru_va, const struct rusage *ru);

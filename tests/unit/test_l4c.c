@@ -286,18 +286,20 @@ static void run_case(const char *name, const case_t *k)
     prime(k);
     ctx_setup(&c, k);
     rc = dbt_engine(&c, &fr, &fa, &fd);
-    if (rc != I686_EXIT_HLT) {
+    /* R7-23: the terminal exit is the HLT sentinel's #GP fault, reached
+     * via interpret-one after the DBT prefix. */
+    if (rc != I686_EXIT_FAULT) {
         printf("FAIL %s: dbt engine rc=%d (first exit %u/%u ->%08x)\n", name,
                rc, fr, fa, fd);
         g_fail++;
         return;
     }
-    /* Emitted-natively proof: the whole stream (LOCK insn + the 1-byte
-     * HLT) was one block; L3c's branch emitter exits HLT with the
-     * post-HLT resume EIP.  A declined LOCK would have ended block 1
-     * with UNDEF and the LOCK's own length instead. */
-    CHECK(fr == I686_EXIT_HLT && fa == 0U && fd == CASE_EIP + k->clen + 1U);
-    CHECK(c.eip == CASE_EIP + k->clen + 1U);
+    /* Emitted-natively proof: the LOCK insn ran in block 1 and the
+     * first exit is the declined-HLT UNDEF (arg 1, dest = HLT PC).  A
+     * declined LOCK would have ended block 1 with UNDEF and the
+     * LOCK's own length instead. */
+    CHECK(fr == I686_EXIT_UNDEF && fa == 1U && fd == CASE_EIP + k->clen);
+    CHECK(c.eip == CASE_EIP + k->clen);
 
     memcpy(&got_data, &g_win[DATA_VA], 4U);
     CHECK(got_data == mem);
@@ -315,11 +317,12 @@ static void run_case(const char *name, const case_t *k)
     }
     CHECK(i686_flags_read(&c) == ef);
 
-    /* Interpreter oracle over a fresh prime: full-state equality. */
+    /* Interpreter oracle over a fresh prime: full-state equality.
+     * R7-23: both legs terminate at the HLT sentinel's #GP fault. */
     prime(k);
     ctx_setup(&ref, k);
     rc = i686_interp_run(&ref);
-    if (rc != I686_EXIT_HLT) {
+    if (rc != I686_EXIT_FAULT) {
         printf("FAIL %s: reference rc=%d\n", name, rc);
         g_fail++;
         return;
@@ -346,6 +349,61 @@ static void run_case(const char *name, const case_t *k)
     }
 }
 
+/* R18-1: a misaligned LOCK must interpret-one, never host-fault.
+ * The DBT leg must exit block 1 with UNDEF at the LOCK's own PC and
+ * still reach the terminal #GP fault with state identical to a pure
+ * interpreter run. */
+static void run_unaligned_case(const char *name, const uint8_t *code,
+                               size_t clen, uint32_t base, uint32_t src,
+                               uint32_t data4)
+{
+    i686_ctx_t c, ref;
+    uint32_t fr = 0U, fa = 0U, fd = 0U;
+    uint8_t snap[8];
+    unsigned i;
+    int ok;
+    int rc, rc2;
+
+    memcpy(&g_win[CASE_EIP], code, clen);
+    g_win[CASE_EIP + clen] = 0xF4U;
+    memcpy(&g_win[DATA_VA], &data4, 4U);
+    memset(&g_win[DATA_VA + 4U], 0, 8U);
+    memset(&c, 0, sizeof(c));
+    c.guest_base = (uint64_t)(uintptr_t)g_win;
+    c.eip = CASE_EIP;
+    c.gpr[I686_REG_EAX] = base;
+    c.gpr[I686_REG_EBX] = src;
+    c.eflags = 0x2U;
+    rc = dbt_engine(&c, &fr, &fa, &fd);
+    CHECK(rc == I686_EXIT_FAULT);
+    CHECK(fr == I686_EXIT_UNDEF && fa == (uint32_t)clen && fd == CASE_EIP);
+    memcpy(snap, &g_win[DATA_VA], sizeof(snap));
+
+    memcpy(&g_win[CASE_EIP], code, clen);
+    g_win[CASE_EIP + clen] = 0xF4U;
+    memcpy(&g_win[DATA_VA], &data4, 4U);
+    memset(&g_win[DATA_VA + 4U], 0, 8U);
+    memset(&ref, 0, sizeof(ref));
+    ref.guest_base = (uint64_t)(uintptr_t)g_win;
+    ref.eip = CASE_EIP;
+    ref.gpr[I686_REG_EAX] = base;
+    ref.gpr[I686_REG_EBX] = src;
+    ref.eflags = 0x2U;
+    rc2 = i686_interp_run(&ref);
+    CHECK(rc2 == I686_EXIT_FAULT);
+    ok = (rc == I686_EXIT_FAULT && rc2 == I686_EXIT_FAULT &&
+          c.eip == ref.eip &&
+          i686_flags_read(&c) == i686_flags_read(&ref) &&
+          memcmp(snap, &g_win[DATA_VA], sizeof(snap)) == 0);
+    for (i = 0U; i < 8U; i++) {
+        ok = ok && (c.gpr[i] == ref.gpr[i]);
+    }
+    if (!ok) {
+        printf("FAIL %s: dbt/interp state mismatch\n", name);
+    }
+    CHECK(ok);
+}
+
 int main(void)
 {
     g_win = mmap(NULL, WIN_SIZE, PROT_READ | PROT_WRITE,
@@ -357,6 +415,18 @@ int main(void)
         return 1;
     }
     i686_interp_init_all();
+
+    /* R18-1: misaligned LOCK forms decline to interpret-one. */
+    {
+        static const uint8_t code[] = {0xF0, 0x01, 0x18};
+        run_unaligned_case("lock add dword [eax+1],ebx (misaligned)",
+                           code, sizeof code, DATA_VA + 1U, 1U, 0U);
+    }
+    {
+        static const uint8_t code[] = {0x66, 0xF0, 0x01, 0x18};
+        run_unaligned_case("lock add word [eax+1],bx (misaligned)",
+                           code, sizeof code, DATA_VA + 1U, 1U, 0U);
+    }
 
     /* 1. lock add dword [ebx], imm32 — unsigned carry out of bit 31. */
     {

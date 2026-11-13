@@ -319,9 +319,15 @@ static int vm32_futex_load_u32(i686_ctx_t *ctx, uint32_t gva, uint32_t *out)
             return -1;
         }
         i686_vm32_subpage_lock();
-        (void)i686_vm32_union_prot(ctx, gbase, gbase + hps);
+        if (i686_vm32_union_prot(ctx, gbase, gbase + hps) != 0) {
+            i686_vm32_subpage_unlock();
+            return -1;
+        }
         *out = atomic_load((const _Atomic uint32_t *)i686_guest_ptr(ctx, gva));
-        (void)i686_vm32_widen_prot(ctx, gbase, gbase + hps);
+        if (i686_vm32_widen_prot(ctx, gbase, gbase + hps) != 0) {
+            i686_vm32_subpage_unlock();
+            return -1;
+        }
         i686_vm32_subpage_unlock();
         return 0;
     }

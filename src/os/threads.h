@@ -54,7 +54,6 @@ typedef struct i686_thread_start {
 int i686_tls_install(i686_ctx_t *ctx, uint32_t ud_va);
 
 /* Registered by the coordinator (src/os/clone.c). */
-void i686_threads_init(void);
 void i686_threads_main_init(i686_ctx_t *ctx);
 i686_ctx_t *i686_current_ctx(void);
 

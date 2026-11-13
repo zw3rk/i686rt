@@ -101,7 +101,10 @@ static int parse_args(i686_ctx_t *ctx, int argc, char **argv)
         } else if (strcmp(argv[i], "--sysroot") == 0) {
             ctx->sysroot = argv[i + 1];
         } else if (strcmp(argv[i], "--cache") == 0) {
-            ctx->cache_dir = argv[i + 1];
+            /* Accepted for CLI compatibility (parity suite passes
+             * --cache); no file backend consumes it (Wave C2 note in
+             * tests/parity_suite.sh), so the argument is discarded. */
+            (void)argv[i + 1];
         } else if (strcmp(argv[i], "--engine") == 0) {
             if (parse_engine(argv[i + 1], &ctx->engine) != 0) {
                 return -1;
@@ -144,9 +147,6 @@ static void apply_env(i686_ctx_t *ctx)
     }
     if (ctx->sysroot == NULL && (s = getenv("I686RT_SYSROOT")) != NULL) {
         ctx->sysroot = s;
-    }
-    if (ctx->cache_dir == NULL && (s = getenv("I686RT_CACHE")) != NULL) {
-        ctx->cache_dir = s;
     }
     /* I686RT_HOST=none opts out of the /dev/a32host handshake (D14). */
     if ((s = getenv("I686RT_HOST")) != NULL && strcmp(s, "none") == 0) {

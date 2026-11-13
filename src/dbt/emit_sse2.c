@@ -298,6 +298,32 @@ static int sse_emit_cvttpi(i686_emit_ctx_t *e, const x86_insn_t *insn)
 /* CVTPS2PD/CVTSS2SD/CVTSD2SS/CVTPD2PS (0F 5A). CVTPS2PD and CVTPD2PS
  * fully overwrite the dest, so they skip the dst preimage load and
  * write the computed scratch register through. */
+static int sse_emit_cvt_5a(i686_emit_ctx_t *e, const x86_insn_t *insn);
+
+/* NaN-lane guard for the narrowing converts below: test one double
+ * lane whose bits are in xn (w_hi/w_lo/w_tmp are W scratch) and return
+ * a forward branch slot taken when the lane is a NaN (exponent
+ * all-ones, nonzero fraction).  The caller patches it to the D2
+ * interpret-one exit.  Integer bit test only: no NZCV/FPSR side
+ * effects, so pending lazy flags survive. */
+static size_t sse_guard_nan_lane(a64_buf_t *b, unsigned xn, unsigned w_hi,
+                                 unsigned w_lo, unsigned w_tmp)
+{
+    size_t to_lane_ok, to_nan;
+    a64_emit_ubfx_x_to_w(b, w_hi, xn, 32U, 32U);
+    a64_emit_ubfx_x_to_w(b, w_lo, xn, 0U, 32U);
+    a64_emit_ubfm_w(b, w_tmp, w_hi, 20U, 30U); /* exponent */
+    a64_emit_sub_imm_w(b, false, w_tmp, w_tmp, 0x7FFU, 0U);
+    to_lane_ok = a64_emit_cbz_w_placeholder(b, true, w_tmp);
+    /* Exponent all-ones: NaN iff the fraction is nonzero (an Inf lane
+     * falls through to the fast path). */
+    a64_emit_ubfm_w(b, w_tmp, w_hi, 0U, 19U);
+    a64_emit_orr_reg_w(b, w_tmp, w_tmp, w_lo, A64_SHIFT_LSL, 0U);
+    to_nan = a64_emit_cbz_w_placeholder(b, true, w_tmp);
+    a64_patch_cbz_w(b, to_lane_ok, b->count);
+    return to_nan;
+}
+
 static int sse_emit_cvt_5a(i686_emit_ctx_t *e, const x86_insn_t *insn)
 {
     a64_buf_t *b = &e->buf;
@@ -314,17 +340,36 @@ static int sse_emit_cvt_5a(i686_emit_ctx_t *e, const x86_insn_t *insn)
         sse_q_str(e, insn->modrm_reg & 7U, 0U);
     } else if (insn->pfx_rep == 0U) {
         /* CVTPD2PS: dest.s[0..1] = (float)src.d[0..1]; bits 127:64 = 0 */
+        size_t to_nan0, to_nan1, to_done;
         if (insn->modrm_mod == 3U) {
             sse_q_ldr(e, 1U, insn->modrm_rm & 7U);
         } else {
             sse_guest_addr(e, insn);
             sse_ldr_q(b, 1U, SSE_ADDR, 0U);
         }
+        /* Host FCVTN keeps the source sign/payload (0x7FC00000 for the
+         * canonical double quiet NaN) while the interpreter
+         * canonicalizes every NaN to -QNaN 0xFFC00000
+         * (sse_round_f64_to_f32): any NaN lane takes the D2
+         * interpret-one path, which produces the exact result and
+         * MXCSR effects.  Finite lanes (including Infs) stay on the
+         * fast NEON instruction. */
+        sse_umov_d(b, 8U, 1U, 0U);
+        to_nan0 = sse_guard_nan_lane(b, 8U, SSE_W10, SSE_W11, SSE_W12);
+        sse_ext_16b(b, 2U, 1U, 1U, 8U);
+        sse_umov_d(b, 9U, 2U, 0U);
+        to_nan1 = sse_guard_nan_lane(b, 9U, SSE_W10, SSE_W11, SSE_W12);
         sse_fcvtn_2s(b, 2U, 1U);
         sse_ins_s_elt(b, 0U, 0U, 2U, 0U);
         sse_ins_s_elt(b, 0U, 1U, 2U, 1U);
         sse_ins_d_gpr(b, 0U, 1U, 31U);
         sse_q_str(e, insn->modrm_reg & 7U, 0U);
+        to_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, to_nan0, b->count);
+        a64_patch_cbz_w(b, to_nan1, b->count);
+        i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+        a64_patch_b_cond(b, to_done, b->count);
+        e->block_open = true; /* guard exit closed it; NEON path inlines */
     } else if (insn->pfx_rep == 1U) { /* CVTSS2SD */
         if (insn->modrm_mod == 3U) {
             sse_s_ldr(e, 1U, insn->modrm_rm & 7U);
@@ -335,14 +380,25 @@ static int sse_emit_cvt_5a(i686_emit_ctx_t *e, const x86_insn_t *insn)
         sse_fcvt_d_s(b, 2U, 1U);
         sse_d_str(e, insn->modrm_reg & 7U, 2U);
     } else { /* CVTSD2SS */
+        size_t to_nan, to_done;
         if (insn->modrm_mod == 3U) {
             sse_d_ldr(e, 1U, insn->modrm_rm & 7U);
         } else {
             sse_guest_addr(e, insn);
             sse_ldr_d(b, 1U, SSE_ADDR, 0U);
         }
+        /* Same NaN canonicalization as CVTPD2PS above: a NaN source
+         * takes the D2 interpret-one path (exact 0xFFC00000 result and
+         * MXCSR effects); finite sources convert natively. */
+        sse_umov_d(b, 8U, 1U, 0U);
+        to_nan = sse_guard_nan_lane(b, 8U, SSE_W10, SSE_W11, SSE_W12);
         sse_fcvt_s_d(b, 2U, 1U);
         sse_s_str(e, insn->modrm_reg & 7U, 2U);
+        to_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, to_nan, b->count);
+        i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+        a64_patch_b_cond(b, to_done, b->count);
+        e->block_open = true; /* guard exit closed it; NEON path inlines */
     }
     return 0;
 }

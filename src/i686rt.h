@@ -244,7 +244,9 @@ typedef struct i686_ctx {
     /* Configuration & engine selection */
     const char *sysroot;
     const char *exec_path;
-    const char *cache_dir;
+    const void *reserved0;    /* was cache_dir (R13-5): write-only, removed;
+                                 slot kept so the emitted-code-pinned ctx
+                                 layout below does not shift */
     int         engine;         /* I686_ENGINE_* */
     bool        x87_80;         /* --x87-80 / I686RT_X87=80 (D9) */
     bool        stats_enabled;

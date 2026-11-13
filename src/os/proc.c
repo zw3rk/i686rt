@@ -358,5 +358,30 @@ int i686_proc_open_at(i686_ctx_t *ctx, const char *guest_path)
             return (fd >= 0) ? fd : -errno;
         }
     }
+    /* Anything else under /proc/self/ or /proc/<pid>/ is guest-pid
+     * namespaced: deny it inside the sandbox instead of falling through
+     * to the host's /proc. */
+    {
+        const char *slash = strchr(canon, '/');
+        size_t first = (slash != NULL) ? (size_t)(slash - canon)
+                                       : strlen(canon);
+        if (first > 0U) {
+            size_t i = 0U;
+            int numeric = 1;
+            if (first == 4U && memcmp(canon, "self", 4U) == 0) {
+                return -ENOENT;
+            }
+            while (i < first) {
+                if (canon[i] < '0' || canon[i] > '9') {
+                    numeric = 0;
+                    break;
+                }
+                i++;
+            }
+            if (numeric != 0) {
+                return -ENOENT;
+            }
+        }
+    }
     return I686_PROC_NOT_MATCHED;
 }

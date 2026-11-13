@@ -110,6 +110,12 @@ static void t_ctx_init(i686_ctx_t *ctx, uint32_t eip, uint32_t eflags)
     ctx->gpr[I686_REG_ESP] = T_STACK_TOP;
     ctx->guest_base = (uint64_t)(uintptr_t)g_win;
     ctx->lazy_op = I686_FOP_NONE;
+    /* Flat 32-bit model (R7-11): the real runtime establishes
+     * cs_d/ss_b at exec; the DBT emitters assume 32-bit ESP, so the
+     * oracle must use a 32-bit stack too (ss_b=0 would truncate SP
+     * to 16 bits and diverge on every push/pop/call/ret). */
+    ctx->cs_d = 1u;
+    ctx->ss_b = 1u;
 }
 
 /* Miniature DBT engine loop (frozen exit protocol). */
@@ -157,7 +163,18 @@ static void t_dbt_run(i686_ctx_t *ctx)
             }
             continue; /* EIP already advanced past the gate */
         }
-        return; /* TRAP/HLT/UNDEF/FAULT: terminal for the check */
+        if (ctx->exit_reason == I686_EXIT_UNDEF) {
+            /* Engine-faithful D2 fallback (R7-23): interpret exactly one
+             * insn at the UNDEF pc (declined emitter or HLT/#GP alike)
+             * and resume translation instead of stopping, mirroring the
+             * real engine's interpret-one-and-continue. */
+            int r = i686_interp_step(ctx);
+            if (r != I686_INTERP_CONTINUE) {
+                return; /* terminal exit already recorded in ctx */
+            }
+            continue;
+        }
+        return; /* TRAP/HLT/FAULT: terminal for the check */
     }
     ctx->exit_reason = 0xFFU; /* iteration cap: surfaced as a mismatch */
 }
@@ -198,6 +215,13 @@ static void t_run_case(const t_case_t *c)
      * MOVS/STOS stores and the CALL return-address push data). */
     memcpy(snap, g_win + c->slot, sizeof(snap));
 
+    /* Observe architectural flags on both sides: the oracle path
+     * materializes below, and the DBT leg needs the same treatment —
+     * a block that ends at an interp_stepped insn (UNDEF decline or
+     * HLT/#GP) otherwise leaves ctx->eflags at its pre-block value
+     * while the true state still rides the lazy descriptor. */
+    i686_flags_materialize(&a);
+
     /* Interpreter oracle on an identical clone. */
     t_ctx_init(&b, c->slot, c->eflags);
     memcpy(b.gpr, c->gpr, sizeof(b.gpr));
@@ -230,7 +254,11 @@ static void t_run_case(const t_case_t *c)
     }
     CHECK((a.eflags & c->ef_mask) == (b.eflags & c->ef_mask));
     CHECK(memcmp(snap, g_win + c->slot, sizeof(snap)) == 0);
-    if (c->cmp_arg) {
+    /* FAULT exit_arg conventions differ by API by design and predate
+     * this suite: the DBT leg's interp_step preserves the handler's
+     * trap number (13 for HLT/#GP), while interp_run stamps the
+     * faulting opcode.  Compare args only for non-fault exits. */
+    if (c->cmp_arg && a.exit_reason != I686_EXIT_FAULT) {
         CHECK(a.exit_arg == b.exit_arg);
     }
     if (g_fail == 0U) {
@@ -329,6 +357,18 @@ int main(void)
     static const uint8_t b_lodsb[] = {0xAC, 0xF4};
     static const uint8_t b_cmps_jz[] = {0xA6, 0x74, 0x01, 0xF4, 0xCC};
     static const uint8_t b_scas_jnz[] = {0xAE, 0x75, 0x01, 0xF4, 0xCC};
+    /* R14-1: cmp eax,1 / setp bl / add edx,edx — the SETcc parity bit
+     * must come from the post-cmp descriptor, not a stale one.  The
+     * trailing add avoids ECX, which the miniature engine uses as the
+     * x1-relay scratch register. */
+    static const uint8_t b_setp[] = {0x83, 0xF8, 0x01, 0x0F, 0x9A, 0xD3,
+                                     0x01, 0xD2, 0xF4};
+    static const uint8_t b_setnp[] = {0x83, 0xF8, 0x01, 0x0F, 0x9B, 0xD3,
+                                      0x01, 0xD2, 0xF4};
+    /* R14-2: add sets OF, rol al,2 must preserve it, jo observes it. */
+    static const uint8_t b_rol_of_jo[] = {0x83, 0xC0, 0x01, 0xB8, 0x81,
+                                           0x00, 0x00, 0x00, 0xC0, 0xC0,
+                                           0x02, 0x70, 0x01, 0xF4, 0xCC};
 
     /* Jcc matrix: one byte stream, 14 fusible conditions, taken and
      * fall-through directions via two EFLAGS settings each. */
@@ -450,6 +490,15 @@ int main(void)
             {"scas_eq_jnz", 0U, b_scas_jnz, sizeof(b_scas_jnz), 2U,
              {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U}, t_setup_scas_eq,
              T_EF_PF_AF, 0},
+            {"setp_stale_pf", 0U, b_setp, sizeof(b_setp),
+             2U | I686_EF_PF,
+             {2U, 0U, 5U, 7U, 0U, 0U, 0U, 0U}, NULL, 0xFFFFFFFFU, 1},
+            {"setnp_ctrl", 0U, b_setnp, sizeof(b_setnp),
+             2U | I686_EF_PF,
+             {2U, 0U, 5U, 7U, 0U, 0U, 0U, 0U}, NULL, 0xFFFFFFFFU, 1},
+            {"rol_of_jo", 0U, b_rol_of_jo, sizeof(b_rol_of_jo), 2U,
+             {0x7FFFFFFFU, 0U, 0U, 0U, 0U, 0U, 0U, 0U}, NULL,
+             0xFFFFFFFFU, 0},
         };
 
         for (i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -582,16 +631,19 @@ int main(void)
     }
 
     /* Targeted invariant: the ret_imm DBT run must leave ESP exactly
-     * top+4+8 (functional proof the imm16 pop-adjust ran in-block). */
+     * top+4+8 (functional proof the imm16 pop-adjust ran in-block).
+     * R7-23: the trailing HLT faults #GP(0) at CPL=3, so the terminal
+     * exit is FAULT with EIP still at the HLT. */
     {
         i686_ctx_t a;
         t_ctx_init(&a, T_SLOT(30U), 2U);
         t_put(T_SLOT(30U), b_ret_imm, sizeof(b_ret_imm));
         t_setup_ret_imm(&a, T_SLOT(30U));
         t_dbt_run(&a);
-        CHECK(a.exit_reason == I686_EXIT_HLT);
+        CHECK(a.exit_reason == I686_EXIT_FAULT);
+        CHECK(a.exit_arg == 13U);
         CHECK(a.gpr[I686_REG_ESP] == T_STACK_TOP + 4U + 8U);
-        CHECK(a.eip == T_SLOT(30U) + 5U);
+        CHECK(a.eip == T_SLOT(30U) + 4U);
     }
 
     if (g_fail != 0U) {

@@ -73,8 +73,11 @@
  *     (LOCK on r,r is undefined on hardware anyway)
  *
  * Alignment: LSE atomics require natural alignment of the accessed
- * element; a misaligned guest EA takes a host alignment fault rather
- * than a guest exception (split-lock #AC emulation is a later phase).
+ * element, while x86 LOCK succeeds misaligned, so a runtime TST of the
+ * low EA bits declines misaligned 16/32-bit forms to the D2
+ * interpret-one fallback (which performs the byte-wise RMW); only
+ * aligned EAs reach the LSE sequence (split-lock #AC emulation is a
+ * later phase).
  * FEAT_LSE is assumed (any ARMv8.1+ host; the HWCAP_ATOMICS runtime
  * check plus an LDXR/STXR fallback path is Phase H per the card).
  * TSO (D5): the AL variants are acquire+release. e->tso is not read
@@ -382,6 +385,22 @@ int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn)
      * register must be a full X: x23 = xG + uxtw(w21). */
     uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
     i686_emit_ea(e, insn, 1);
+    /* x86 LOCK succeeds on unaligned addresses while AArch64 LSE
+     * atomics fault: a misaligned 16/32-bit form takes the D2
+     * single-instruction interpreter fallback (interpret-one at
+     * e->insn_pc) before any guest state is modified.  The check is
+     * flag-neutral (UBFM+CBZ touch no flags) and the ctx lazy
+     * descriptor is the architectural state, so no sync is needed.
+     * Byte forms are aligned by definition.  CBZ skips the UNDEF
+     * stub on the aligned fast path; misaligned falls into it. */
+    if (width == 16U || width == 32U) {
+        size_t to_aligned;
+        a64_emit_ubfm_w(b, 22U, 21U, 0U, (width == 16U) ? 0U : 1U);
+        to_aligned = a64_emit_cbz_w_placeholder(b, false, 22U);
+        i686_emit_exit(e, I686_EXIT_UNDEF, insn->len, e->insn_pc);
+        a64_patch_cbz_w(b, to_aligned, b->count);
+        e->block_open = true; /* guard exit closed it; aligned path inlines */
+    }
     a64_emit_add_uxtw_x(b, SCR_ADDR, 20U, 21U);
 
     /* w12 = original source value, width-masked (descriptor src2). */

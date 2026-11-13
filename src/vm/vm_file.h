@@ -69,19 +69,6 @@ int i686_vm_file_map_private(uint64_t arena_base, uint32_t gva, size_t len,
 
 struct i686_ctx;
 
-/* Ordered shrink-then-regrow hook (5.1.3): on ftruncate(fd, S_shrink),
- * staged mappings zero the partial-page tail past S_shrink and zero +
- * invalidate (mark ANON, no longer valid file image) pages wholly at or
- * past align_up(S_shrink); native mappings keep host EOF behaviour and
- * are never touched.  RC-U3: shrink_size is a FILE OFFSET (not a guest
- * VA); map_file_offset translates it into the mapping (cut = map_start
- * + align_up(shrink - file_offset), clamped to the map).  The caller may
- * pass NULL ctx (treated as non-A2); otherwise A2 covers use the ctx
- * window.  Serialized under the VM lock. */
-void i686_vm_file_note_shrink(struct i686_ctx *ctx, uint32_t map_start,
-                              size_t map_len, uint64_t map_file_offset,
-                              uint64_t shrink_size, uint8_t staged);
-
 /* Pure cut computation for the shrink hook: the first guest VA at or
  * past the shrink point, or map_end when nothing is cut. */
 uint32_t i686_vm_file_shrink_cut(uint32_t map_start, size_t map_len,

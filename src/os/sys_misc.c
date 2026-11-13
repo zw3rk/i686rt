@@ -196,19 +196,26 @@ static int64_t do_select(i686_ctx_t *ctx, uint32_t n, uint32_t in_va,
                  have_tv ? &ts : NULL, NULL);
     ret = (rc < 0) ? -(int64_t)errno : (int64_t)rc;
 
-    /* fd_set writeback: only on success (kernel skips it on error). */
+    /* fd_set writeback: only on success (kernel skips it on error).
+     * A failed copy-out must not report success with stale guest sets. */
     if (ret >= 0) {
         if (in_va != 0u) {
             i686_fdset_h2g(gin, (const uint8_t *)hin, n);
-            (void)i686_copy_to_guest(ctx, in_va, gin, nbytes);
+            if (i686_copy_to_guest(ctx, in_va, gin, nbytes) != 0) {
+                return -(int64_t)EFAULT;
+            }
         }
         if (out_va != 0u) {
             i686_fdset_h2g(gout, (const uint8_t *)hout, n);
-            (void)i686_copy_to_guest(ctx, out_va, gout, nbytes);
+            if (i686_copy_to_guest(ctx, out_va, gout, nbytes) != 0) {
+                return -(int64_t)EFAULT;
+            }
         }
         if (exc_va != 0u) {
             i686_fdset_h2g(gexc, (const uint8_t *)hexc, n);
-            (void)i686_copy_to_guest(ctx, exc_va, gexc, nbytes);
+            if (i686_copy_to_guest(ctx, exc_va, gexc, nbytes) != 0) {
+                return -(int64_t)EFAULT;
+            }
         }
     }
 

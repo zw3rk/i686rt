@@ -73,19 +73,19 @@ int rt32_open_guest_ro(const i686_ctx_t *ctx, const char *guest_path)
     if (guest_path == NULL || guest_path[0] == '\0') {
         return -1;
     }
-    /* a32rt resolved via a32_resolve_guest_path() (syscalls.c, not vendored):
-     * resolve absolute guest paths against the sysroot here; the full resolver
-     * (relative paths, /proc magic) arrives with the Phase 2 syscall marshal. */
-    if (ctx != NULL && guest_path[0] == '/' &&
-        ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
+    /* Resolve guest paths inside the sysroot (i686_sysroot_join,
+     * confined: ".." cannot escape).  When a sysroot is configured the
+     * raw host path is never opened: oversize joins fail closed. */
+    if (ctx != NULL && ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
         char resolved[PATH_MAX];
-        int n = snprintf(resolved, sizeof(resolved), "%s%s", ctx->sysroot, guest_path);
-        if (n > 0 && (size_t)n < sizeof(resolved)) {
-            int fd = open(resolved, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                return fd;
-            }
+        extern int i686_sysroot_join(const char *, const char *, char *,
+                                     size_t);
+        if (i686_sysroot_join(ctx->sysroot, guest_path, resolved,
+                              sizeof(resolved)) != 0) {
+            errno = ENAMETOOLONG;
+            return -1;
         }
+        return open(resolved, O_RDONLY | O_CLOEXEC);
     }
     return open(guest_path, O_RDONLY | O_CLOEXEC);
 }

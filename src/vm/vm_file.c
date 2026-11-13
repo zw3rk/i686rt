@@ -423,16 +423,6 @@ static void vm_file_shrink_locked(i686_ctx_t *ctx, uint32_t map_start,
     }
 }
 
-void i686_vm_file_note_shrink(i686_ctx_t *ctx, uint32_t map_start,
-                              size_t map_len, uint64_t map_file_offset,
-                              uint64_t shrink_size, uint8_t staged)
-{
-    rt32_vm_lock_acquire();
-    vm_file_shrink_locked(ctx, map_start, map_len, map_file_offset,
-                          shrink_size, staged);
-    rt32_vm_lock_release();
-}
-
 int i686_vm_file_track_map(int fd, uint32_t gva, size_t len,
                            uint64_t file_offset, uint8_t kind,
                            uint8_t staged)

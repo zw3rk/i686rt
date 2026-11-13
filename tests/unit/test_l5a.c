@@ -116,23 +116,29 @@ int run_case(const char *name, const case_t *k)
     prime(k);
     ctx_setup(&g_c, k);
     rc = dbt_engine(&g_c, &fr, &fa, &fd);
-    if (rc != I686_EXIT_HLT) {
+    /* R7-23: the terminal exit is the HLT sentinel's #GP fault, reached
+     * via interpret-one after the DBT prefix. */
+    if (rc != I686_EXIT_FAULT) {
         printf("FAIL %s: dbt engine rc=%d (first exit %u/%u ->%08x)\n", name,
                rc, fr, fa, fd);
         g_fail++;
         return -1;
     }
     /* Native proof: the block covered every SSE insn and ended at the
-     * sentinel — either the emitted HLT exit (dest = post-HLT resume
-     * PC) or the declined-HLT UNDEF shape (arg 1, dest = HLT PC).  An
-     * emitter decline would UNDEF at that SSE insn's own PC instead. */
-    if (!((fr == I686_EXIT_HLT && fd == (uint32_t)(CASE_EIP + k->clen + 1U)) ||
-          (fr == I686_EXIT_UNDEF && fa == 1U &&
-           fd == (uint32_t)(CASE_EIP + k->clen)))) {
-        printf("FAIL %s: not native: first exit %u/%u ->%08x (want HLT"
-               " ->%08x or UNDEF/1 ->%08x)\n",
-               name, fr, fa, fd, (uint32_t)(CASE_EIP + k->clen + 1U),
-               (uint32_t)(CASE_EIP + k->clen));
+     * sentinel — the declined-HLT UNDEF shape (arg 1, dest = HLT PC;
+     * R7-23 declines HLT to the interpreter so CPL=3 #GP applies).
+     * The mxcsr case additionally declines LDMXCSR by design (R5-2:
+     * reserved-bits #GP lives in the interpreter), so UNDEF with the
+     * LDMXCSR length (3) at the case PC is accepted too.  Any other
+     * emitter decline UNDEFs at that SSE insn's own PC instead. */
+    if (!((fr == I686_EXIT_UNDEF && fa == 1U &&
+           fd == (uint32_t)(CASE_EIP + k->clen)) ||
+          (fr == I686_EXIT_UNDEF && fa == 3U &&
+           fd == (uint32_t)CASE_EIP))) {
+        printf("FAIL %s: not native: first exit %u/%u ->%08x (want UNDEF/1"
+               " ->%08x or UNDEF/3 ->%08x)\n",
+               name, fr, fa, fd, (uint32_t)(CASE_EIP + k->clen),
+               (uint32_t)CASE_EIP);
         g_fail++;
         return -1;
     }
@@ -237,10 +243,10 @@ int main(void)
                     {0U, 0U, 0U, 0U, 0U, 0U, DATA1, DATA2},
                     0U, xmm, 0U, 0U, {0U, 0U, 0U}};
         if (run_case("movss/movsd lanes", &k) == 0) {
-            static const uint32_t e0[4] = {0x40490FDBU, 0x22222222U,
-                                           0x33333333U, 0x44444444U};
+            /* R7-34: scalar memory loads zero the upper lanes. */
+            static const uint32_t e0[4] = {0x40490FDBU, 0U, 0U, 0U};
             static const uint32_t e2[4] = {0x40490FDBU, 0x400921FBU,
-                                           0xCCCCCCCCU, 0xDDDDDDDDU};
+                                           0U, 0U};
             static const uint32_t e1[4] = {0x40490FDBU, 0x400921FBU,
                                            0U, 0U};
             xmm_eq(0, e0);
@@ -377,7 +383,8 @@ int main(void)
                     0U, xmm, 0U, 0U, {0U, 0U, 0U}};
         if (run_case("punpck b/w/d/q", &k) == 0) {
             static const uint32_t e0[4] = {0xA0U, 0xB0U, 0xA1U, 0xB1U};
-            static const uint32_t e2[4] = {0xC1U, 0xB1U, 0xC3U, 0xB3U};
+            /* PUNPCKHDQ interleaves the HIGH dwords of dest and src. */
+            static const uint32_t e2[4] = {0xC2U, 0xB2U, 0xC3U, 0xB3U};
             static const uint32_t e3[4] = {0xD0U, 0xD1U, 0xB0U, 0xB1U};
             static const uint32_t e4[4] = {0xE2U, 0xE3U, 0xB2U, 0xB3U};
             /* punpcklbw interleaves dest-low bytes with src-low bytes

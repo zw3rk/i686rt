@@ -369,13 +369,21 @@ static void t_oflags(void)
     CHECK(i686_oflags_g2h(0x280000u) == 0x280000u);
     /* Unknown high bits masked. */
     CHECK(i686_oflags_g2h(0x80000000u) == 0u);
-    /* h2g is the identity over the known mask. */
+    /* O_DIRECT/O_DIRECTORY/O_NOFOLLOW swap to the host encodings. */
+    CHECK(i686_oflags_g2h(0x004000u) == 0x010000u);
+    CHECK(i686_oflags_g2h(0x010000u) == 0x004000u);
+    CHECK(i686_oflags_g2h(0x020000u) == 0x008000u);
+    CHECK(i686_oflags_g2h(0x034000u) == 0x01C000u);
+    /* h2g swaps the differing encodings back to guest numbers. */
     CHECK(i686_oflags_h2g(0x000802u) == 0x000802u);
-    CHECK(i686_oflags_h2g(0x008000u) == 0x008000u);
+    CHECK(i686_oflags_h2g(0x008000u) == 0x020000u);
+    CHECK(i686_oflags_h2g(0x010000u) == 0x004000u);
+    CHECK(i686_oflags_h2g(0x004000u) == 0x010000u);
+    CHECK(i686_oflags_h2g(0x01C042u) == 0x034042u);
     /* F_SETFL keeps APPEND|NONBLOCK|DIRECT|NOATIME|FASYNC only. */
     CHECK(i686_setfl_to_host(0x0008800u) == 0x000800u);
     CHECK(i686_setfl_to_host(0x0002400u) == 0x0002400u);
-    CHECK(i686_setfl_to_host(0x0004800u) == 0x0004800u);
+    CHECK(i686_setfl_to_host(0x0004800u) == 0x010800u);
 }
 
 static void t_fcntl_cmd(void)

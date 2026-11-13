@@ -239,9 +239,17 @@ static unsigned tr_classify(const x86_insn_t *insn)
     }
     if ((op == (unsigned)I686_OP_CMOVcc_Gv ||
          op == (unsigned)I686_OP_SETcc_Eb) &&
-        regonly != 0 && insn->pfx_rep == 0U &&
-        ((insn->imm & 0xEU) != 10U)) {
-        return TRC_NZCV_READER;
+        regonly != 0 && insn->pfx_rep == 0U) {
+        /* CMOVcc parks its condition in insn->imm, but SETcc parks its
+         * condition in insn->modrm_reg (decode.c) with imm left at 0:
+         * classify each from its own field so SETP/SETNP (conditions 10
+         * and 11, parity readers) are not marked NZCV readers. */
+        unsigned cc = (op == (unsigned)I686_OP_SETcc_Eb)
+                          ? (unsigned)insn->modrm_reg
+                          : (unsigned)insn->imm;
+        if ((cc & 0xEU) != 10U) {
+            return TRC_NZCV_READER;
+        }
     }
 
     /* Fused full writers (no LOCK): skippable, valid j. */

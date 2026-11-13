@@ -179,21 +179,6 @@ static void thread_registry_commit(i686_ctx_t *ctx, uint32_t tid)
     (void)pthread_mutex_unlock(&s_registry_lock);
 }
 
-void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid);
-void i686_thread_registry_add(i686_ctx_t *ctx, uint32_t tid)
-{
-    (void)pthread_mutex_lock(&s_registry_lock);
-    if (s_registry_n < I686_THREAD_REGISTRY_MAX) {
-        s_registry[s_registry_n].tid = tid;
-        s_registry[s_registry_n].host_tid = (int)tid;
-        s_registry[s_registry_n].ctx = ctx;
-        s_registry_n++;
-    }
-    /* Over the bound: the tid stays unregistered, tkill reports -ESRCH
-     * for it (bounded table, v1 thread count is small). */
-    (void)pthread_mutex_unlock(&s_registry_lock);
-}
-
 void i686_thread_registry_remove(uint32_t tid);
 void i686_thread_registry_remove(uint32_t tid)
 {
@@ -585,37 +570,32 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
      * tid rather than signaling a ctx no thread will ever poll. */
     i686_thread_registry_remove(tid);
     if (ctx->clear_child_tid != 0U && s_clear_done == 0) {
+        /* The 4-byte clear must stay inside the 4 GiB guest window and
+         * land on a writable mapping: i686_copy_to_guest enforces both
+         * (window overflow and protection faults report an error) so an
+         * out-of-window or read-only ctid_va skips the write and the
+         * wake instead of touching host memory outside the window. */
         uint32_t zero = 0U;
         uint32_t ctid_va = ctx->clear_child_tid;
-        extern int i686_vm32_union_prot(i686_ctx_t *, uint32_t, uint32_t);
-        extern int i686_vm32_widen_prot(i686_ctx_t *, uint32_t, uint32_t);
-        extern void i686_vm32_subpage_lock(void);
-        extern void i686_vm32_subpage_unlock(void);
         extern long i686_vm32_futex_wake(i686_ctx_t *, uint32_t, uint32_t,
                                          uint32_t);
-        i686_vm32_subpage_lock();
-        {
-            uint32_t hps = (ctx->vm_host_page != 0u) ?
-                ctx->vm_host_page : 4096u;
-            uint32_t cpage = ctid_va & ~(hps - 1u);
-            (void)i686_vm32_union_prot(ctx, cpage, cpage + hps);
-            memcpy(i686_guest_ptr(ctx, ctid_va), &zero, 4U);
+        if (ctid_va <= 0xFFFFFFFCU &&
+            i686_copy_to_guest(ctx, ctid_va, &zero, sizeof(zero)) == 0) {
             s_clear_done = 1;
-            (void)i686_vm32_widen_prot(ctx, cpage, cpage + hps);
-        }
-        i686_vm32_subpage_unlock();
-        if (ctx->vm_regime == I686_VM_REGIME_A2 && ctx->vm_host_page > 4096u) {
-            (void)i686_vm32_futex_wake(ctx, ctid_va, 1u, 0xFFFFFFFFu);
-        } else {
+            if (ctx->vm_regime == I686_VM_REGIME_A2 &&
+                ctx->vm_host_page > 4096u) {
+                (void)i686_vm32_futex_wake(ctx, ctid_va, 1u, 0xFFFFFFFFu);
+            } else {
 #ifdef __linux__
-            (void)syscall(SYS_futex, i686_guest_ptr(ctx, ctid_va),
-                          1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/, 1,
-                          NULL, NULL, 0);
-            (void)syscall(SYS_futex, i686_guest_ptr(ctx, ctid_va),
-                          1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
+                (void)syscall(SYS_futex, i686_guest_ptr(ctx, ctid_va),
+                              1 /*FUTEX_WAKE*/ + 128 /*PRIVATE*/, 1,
+                              NULL, NULL, 0);
+                (void)syscall(SYS_futex, i686_guest_ptr(ctx, ctid_va),
+                              1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
 #else
-            (void)i686_vm32_futex_wake(ctx, ctid_va, 1u, 0xFFFFFFFFu);
+                (void)i686_vm32_futex_wake(ctx, ctid_va, 1u, 0xFFFFFFFFu);
 #endif
+            }
         }
         ctx->clear_child_tid = 0U;
     }
@@ -884,16 +864,5 @@ void i686_threads_main_init(i686_ctx_t *ctx)
      * recovery, cleartid wakes) agree with the guest's view. */
     ctx->host_tid = (int)getpid();
     i686_thread_registry_main(ctx);
-    i686_sys_register(120 /* clone */, r_clone);
-}
-
-void i686_threads_init(void)
-{
-    extern void i686_sys_register(long, int64_t (*)(i686_ctx_t *));
-    (void)pthread_once(&s_once, make_key);
-    (void)pthread_once(&s_fork_once, fork_register);
-    if (s_thread_ctx != NULL) {
-        (void)pthread_setspecific(s_ctx_key, s_thread_ctx);
-    }
     i686_sys_register(120 /* clone */, r_clone);
 }
