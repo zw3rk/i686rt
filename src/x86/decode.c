@@ -37,7 +37,7 @@
 #include "x86/decode.h"
 
 #define SEG_NONE 0xffU
-#define REG_NONE 0xffU
+#define REG_NONE I686_REG_NONE
 
 /* Effective CS default size: 16-bit only once the descriptor model is
  * initialized (ctx->ldt != NULL) AND the loaded CS descriptor said D=0.
@@ -382,6 +382,30 @@ static unsigned synth_reg_opcode_0f(uint8_t b2)
     return b2 >= 0xc8U && b2 <= 0xcfU;
 }
 
+/* 0F opcodes of the SSE/MMX families that the generated table leaves
+ * INVALID but real userland (gnulib, musl, CPython, gcc) executes. */
+static int ssex_key(unsigned key)
+{
+    static const uint8_t ok[] = {
+        0x2D, 0x51, 0x52, 0x53, 0x5D, 0x5F, 0x63, 0x65, 0x66, 0x6B, 0x71,
+        0x72, 0x75, 0xC3, 0xC4, 0xC5, 0xD1, 0xD2, 0xD3, 0xD8, 0xD9, 0xDC,
+        0xDD, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE8, 0xE9, 0xEA,
+        0xEC, 0xED, 0xEE, 0xF1, 0xF2, 0xF3, 0xF5, 0xF6, 0xF7, 0xF9, 0xFC,
+        0xFD,
+    };
+    size_t i;
+
+    if ((key & 0xff00u) != 0x0f00u) {
+        return 0;
+    }
+    for (i = 0; i < sizeof ok; i++) {
+        if (ok[i] == (key & 0xffu)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Phase 7: decode bytes whose generated table rows are INVALID but which
  * 16-bit/LDT code must execute (docs/lanes/phase-7.md card L7a).  Fills
  * *out (op, operands, len) and returns 0, or -1 when the byte stays
@@ -524,8 +548,42 @@ static int far_op_decode(i686_ctx_t *ctx, uint8_t b1, uint8_t b2,
             (*pc)++; /* imm8 forms */
         }
         break;
+    case 0x0F19u: /* hint-NOP space: NOP r/m (incl. F3 0F 1E FB ENDBR32) */
+    case 0x0F1Au:
+    case 0x0F1Bu:
+    case 0x0F1Cu:
+    case 0x0F1Du:
+    case 0x0F1Eu:
+    case 0x0F1Fu:
+        out->op = I686_OP_NOP;
+        out->opnd[0] = I686_OPND_RM32;
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
+        break;
     default:
-        return -1;
+        if (!ssex_key(key)) {
+            return -1;
+        }
+        /* SSE/MMX 0F opcodes missing from the generated table: one
+         * synthetic id, the 0F byte rides far_sel (see h_sse_ext.c). */
+        out->op = I686_OP7_SSEX;
+        out->far_sel = (uint16_t)(key & 0xffu);
+        out->opnd[0] = I686_OPND_R32;
+        out->opnd[1] = I686_OPND_RM32;
+        if (decode_modrm(ctx, pc, out, cs_base, eip) != 0) {
+            return -1;
+        }
+        if (key == 0x0F71u || key == 0x0F72u || key == 0x0FC4u ||
+            key == 0x0FC5u) {
+            if (!code_ok(*pc, eip, 1u)) {
+                return -1;
+            }
+            out->imm = fetch8(ctx, cs_base + *pc);
+            out->imm_size = 1u;
+            (*pc)++;
+        }
+        break;
     }
     out->len = (uint8_t)(*pc - eip);
     if (out->len < 1u || out->len > 15u) {

@@ -320,6 +320,7 @@ static inline void int_vec_dst(i686_ctx_t *ctx, const x86_insn_t *insn,
 }
 
 void i686_interp_sse_int_init(void);
+void i686_interp_sse_ext_init(void);
 
 static inline uint32_t sse_f32_src(i686_ctx_t *ctx, uint32_t b)
 {

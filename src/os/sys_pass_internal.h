@@ -205,6 +205,121 @@ int pipe2(int [2], int);
 #define SS_ 12u
 #define PATH_BUF 4096
 
+/* Forward: defined in sys_pass_fs.c (also declared below). */
+int i686_sysroot_join(const char *sysroot, const char *path, char *out,
+                      size_t cap);
+
+/* i386 guest AT_* / UTIME_* constants (Linux i386 ABI).  On Linux the
+ * host values are identical; on Darwin they differ (AT_FDCWD -2 vs
+ * -100, narrower AT_* flag bits, UTIME_NOW/OMIT -1/-2).  AT_REMOVEDIR
+ * and AT_EACCESS share the guest bit 0x200, so flags translate
+ * per-syscall, never with one blind bitmask. */
+#define I686_AT_FDCWD_GUEST            (-100)
+#define I686_AT_SYMLINK_NOFOLLOW_GUEST 0x100U
+#define I686_AT_REMOVEDIR_GUEST        0x200U
+#define I686_AT_EACCESS_GUEST          0x200U
+#define I686_AT_SYMLINK_FOLLOW_GUEST   0x400U
+#define I686_UTIME_NOW_GUEST           0x3fffffffL
+#define I686_UTIME_OMIT_GUEST          0x3ffffffeL
+
+/* Guest dirfd (-100 = AT_FDCWD) to host dirfd. */
+static inline int i686_at_fd_to_host(uint32_t guest_fd)
+{
+    if ((int32_t)guest_fd == I686_AT_FDCWD_GUEST) {
+        return AT_FDCWD;
+    }
+    return (int)(int32_t)guest_fd;
+}
+
+/* Guest AT_SYMLINK_NOFOLLOW bit (0x100) to host. */
+static inline int i686_at_no_follow_to_host(int guest_flags)
+{
+    if ((guest_flags & (int)I686_AT_SYMLINK_NOFOLLOW_GUEST) == 0) {
+        return 0;
+    }
+#ifdef __APPLE__
+    return AT_SYMLINK_NOFOLLOW;
+#else
+    return (int)I686_AT_SYMLINK_NOFOLLOW_GUEST;
+#endif
+}
+
+/* Guest AT_SYMLINK_FOLLOW bit (0x400) to host. */
+static inline int i686_at_follow_to_host(int guest_flags)
+{
+    if ((guest_flags & (int)I686_AT_SYMLINK_FOLLOW_GUEST) == 0) {
+        return 0;
+    }
+#ifdef __APPLE__
+    return AT_SYMLINK_FOLLOW;
+#else
+    return (int)I686_AT_SYMLINK_FOLLOW_GUEST;
+#endif
+}
+
+/* Guest AT_REMOVEDIR bit (0x200) to host. */
+static inline int i686_at_removedir_to_host(int guest_flags)
+{
+    if ((guest_flags & (int)I686_AT_REMOVEDIR_GUEST) == 0) {
+        return 0;
+    }
+#ifdef __APPLE__
+    return AT_REMOVEDIR;
+#else
+    return (int)I686_AT_REMOVEDIR_GUEST;
+#endif
+}
+
+/* Guest AT_EACCESS bit (0x200) to host. */
+static inline int i686_at_eaccess_to_host(int guest_flags)
+{
+    if ((guest_flags & (int)I686_AT_EACCESS_GUEST) == 0) {
+        return 0;
+    }
+#ifdef __APPLE__
+    return AT_EACCESS;
+#else
+    return (int)I686_AT_EACCESS_GUEST;
+#endif
+}
+
+/* Guest tv_nsec UTIME_* sentinel to host (plain nanoseconds pass). */
+static inline long i686_utime_nsec_to_host(long guest_nsec)
+{
+    if (guest_nsec == I686_UTIME_NOW_GUEST) {
+        return (long)UTIME_NOW;
+    }
+    if (guest_nsec == I686_UTIME_OMIT_GUEST) {
+        return (long)UTIME_OMIT;
+    }
+    return guest_nsec;
+}
+
+/* Resolve one *at() path operand under --sysroot: absolute guest paths
+ * ignore dirfd (POSIX) and join under the sysroot, failing closed when
+ * the join does not fit; relative paths copy through for dirfd-relative
+ * resolution.  `path` is the fetch_path buffer, `host` a PATH_BUF call
+ * buffer.  Returns 0 on success, -1 with errno set. */
+static inline int i686_at_path_to_host(const i686_ctx_t *ctx,
+                                       const char *path, char *host)
+{
+    if (path[0] == '/' && ctx->sysroot != NULL &&
+        ctx->sysroot[0] != '\0') {
+        return (i686_sysroot_join(ctx->sysroot, path, host, PATH_BUF) != 0)
+                   ? -1
+                   : 0;
+    }
+    {
+        size_t len = strlen(path);
+        if (len >= PATH_BUF) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(host, path, len + 1U);
+    }
+    return 0;
+}
+
 static inline int guest_ptr_bad(uint32_t va)
 {
     return (va < 0x1000U) ? 1 : 0;
@@ -254,9 +369,8 @@ int setgroups(int, const gid_t *);
 long i686_open_flags_to_host(uint32_t guest_flags);
 /* Sysroot-confined join (sys_pass_fs.c): resolve path under sysroot,
  * clamping ".." so the result never escapes; 0 on success, -1 with
- * errno (ENAMETOOLONG) when the join does not fit. */
-int i686_sysroot_join(const char *sysroot, const char *path, char *out,
-                      size_t cap);
+ * errno (ENAMETOOLONG) when the join does not fit.  (Declared near the
+ * top for the *at() resolver above.) */
 long i686_getcwd_store(i686_ctx_t *ctx, uint32_t buf_va, uint32_t size,
                        const char *cwd, size_t cwd_len);
 int i686_rusage_to_guest(i686_ctx_t *ctx, uint32_t ru_va, const struct rusage *ru);
@@ -290,6 +404,8 @@ int64_t i686_pass_r_fchmodat(i686_ctx_t *ctx);
 int64_t i686_pass_r_fchownat(i686_ctx_t *ctx);
 int64_t i686_pass_r_access(i686_ctx_t *ctx);
 int64_t i686_pass_r_faccessat(i686_ctx_t *ctx);
+void i686_syscalls_at_init(void);
+void i686_syscalls_extra_init(void);
 int64_t i686_pass_r_chdir(i686_ctx_t *ctx);
 int64_t i686_pass_r_fchdir(i686_ctx_t *ctx);
 int64_t i686_pass_r_getcwd(i686_ctx_t *ctx);

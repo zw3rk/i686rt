@@ -56,10 +56,6 @@ _Static_assert(offsetof(i686_ibtc_entry_t, host_code) == 8,
 _Static_assert(offsetof(i686_ctx_t, ibtc_hits) == 464,
                "trampoline pins ibtc_hits @0x1d0 (464)");
 
-__thread dbt_entry_t g_dbt_ht[DBT_HT_SIZE];
-__thread uint64_t    g_dbt_site_start[DBT_HT_SIZE];
-__thread uint64_t    g_dbt_site_end[DBT_HT_SIZE];
-__thread uint32_t    g_dbt_site_eip[DBT_HT_SIZE];
 __thread i686_ctx_t *g_dbt_run_ctx;
 
 static __thread uint32_t s_local_cache_epoch;
@@ -129,8 +125,12 @@ void dbt_sites_clear_hash(uint32_t h)
 
 void dbt_sites_clear_range(uint32_t start, uint32_t end)
 {
-    uint32_t h;
-    for (h = 0U; h < DBT_HT_SIZE; h++) {
+    uint32_t idx;
+    if (g_dbt_ht == NULL) {
+        return;
+    }
+    for (idx = 0U; idx < g_dbt_nactive; idx++) {
+        uint32_t h = g_dbt_active[idx];
         if (g_dbt_site_end[h] > g_dbt_site_start[h] &&
             g_dbt_site_eip[h] >= start && g_dbt_site_eip[h] < end) {
             dbt_sites_clear_hash(h);
@@ -140,9 +140,12 @@ void dbt_sites_clear_range(uint32_t start, uint32_t end)
 
 void dbt_sites_clear_all(void)
 {
-    uint32_t h;
-    for (h = 0U; h < DBT_HT_SIZE; h++) {
-        dbt_sites_clear_hash(h);
+    uint32_t idx;
+    if (g_dbt_ht == NULL) {
+        return;
+    }
+    for (idx = 0U; idx < g_dbt_nactive; idx++) {
+        dbt_sites_clear_hash(g_dbt_active[idx]);
     }
 }
 
@@ -154,43 +157,65 @@ static void dbt_sync_thread_cache(i686_ctx_t *ctx)
                                               memory_order_acquire);
     uint32_t cur_flush;
     size_t i;
+    uint32_t idx;
+
+    uint64_t t0 = 0U;
 
     if (s_local_cache_epoch == cur_epoch) {
         return;
     }
+    if (g_dbt_stats_on) {
+        t0 = dbt_stat_now_ns();
+    }
     cur_flush = atomic_load_explicit(&g_dbt_flush_epoch, memory_order_acquire);
-    if (s_local_flush_epoch != cur_flush) {
-        dbt_sites_clear_all();
-        for (i = 0U; i < DBT_HT_SIZE; i++) {
-            if (g_dbt_ht[i].len != 0U) {
-                g_dbt_ht[i].eip = 0xFFFFFFFFU;
-                dbt_graveyard_push(g_dbt_ht[i].code, g_dbt_ht[i].cap);
-                g_dbt_ht[i].code = NULL;
-                g_dbt_ht[i].cap = 0U;
-                g_dbt_ht[i].len = 0U;
+    if (g_dbt_ht == NULL) {
+        s_local_flush_epoch = cur_flush; /* empty cache: nothing to drop */
+    } else if (s_local_flush_epoch != cur_flush) {
+        DBT_STAT(DBT_STAT_SYNC_FLUSH);
+        for (idx = 0U; idx < g_dbt_nactive; idx++) {
+            uint32_t h = g_dbt_active[idx];
+            dbt_sites_clear_hash(h);
+            if (g_dbt_ht[h].len != 0U) {
+                g_dbt_ht[h].eip = 0xFFFFFFFFU;
+                dbt_graveyard_push(g_dbt_ht[h].code, g_dbt_ht[h].cap);
+                g_dbt_ht[h].code = NULL;
+                g_dbt_ht[h].cap = 0U;
+                g_dbt_ht[h].len = 0U;
             }
+            g_dbt_in_active[h] = 0U;
         }
+        g_dbt_nactive = 0U;
         s_local_flush_epoch = cur_flush;
     } else {
-        for (i = 0U; i < DBT_HT_SIZE; i++) {
-            if (g_dbt_ht[i].len != 0U) {
-                uint32_t vpn0 = g_dbt_ht[i].eip >> 12U;
+        uint32_t w = 0U;
+        DBT_STAT(DBT_STAT_SYNC_SCAN);
+        for (idx = 0U; idx < g_dbt_nactive; idx++) {
+            uint32_t h = g_dbt_active[idx];
+            if (g_dbt_ht[h].len != 0U) {
+                uint32_t vpn0 = g_dbt_ht[h].eip >> 12U;
                 uint32_t vpn1 = (vpn0 + 1U) & 0xFFFFFU;
                 uint32_t pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
                                                       memory_order_acquire);
                 uint32_t pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
                                                       memory_order_acquire);
-                if (pgen0 != g_dbt_ht[i].page_gen ||
-                    pgen1 != g_dbt_ht[i].page_gen1) {
-                    dbt_sites_clear_hash((uint32_t)i);
-                    g_dbt_ht[i].eip = 0xFFFFFFFFU;
-                    dbt_graveyard_push(g_dbt_ht[i].code, g_dbt_ht[i].cap);
-                    g_dbt_ht[i].code = NULL;
-                    g_dbt_ht[i].cap = 0U;
-                    g_dbt_ht[i].len = 0U;
+                if (pgen0 != g_dbt_ht[h].page_gen ||
+                    pgen1 != g_dbt_ht[h].page_gen1) {
+                    dbt_sites_clear_hash(h);
+                    g_dbt_ht[h].eip = 0xFFFFFFFFU;
+                    dbt_graveyard_push(g_dbt_ht[h].code, g_dbt_ht[h].cap);
+                    g_dbt_ht[h].code = NULL;
+                    g_dbt_ht[h].cap = 0U;
+                    g_dbt_ht[h].len = 0U;
                 }
             }
+            if (g_dbt_ht[h].len != 0U) {
+                g_dbt_active[w++] = h;
+            } else {
+                dbt_sites_clear_hash(h);
+                g_dbt_in_active[h] = 0U;
+            }
         }
+        g_dbt_nactive = w;
     }
     if (ctx != NULL) {
         for (i = 0U; i < I686_IBTC_SIZE; i++) {
@@ -205,16 +230,23 @@ static void dbt_sync_thread_cache(i686_ctx_t *ctx)
         }
     }
     s_local_cache_epoch = cur_epoch;
+    if (g_dbt_stats_on) {
+        dbt_stat_add(DBT_STAT_SYNC_NS, dbt_stat_now_ns() - t0);
+    }
 }
 
 void i686_dbt_trace_enable(int on)
 {
     s_trace_dbt = on;
     s_trace_blocks = on && getenv("I686RT_DBTTRACE") != NULL;
+    dbt_stats_init();
 }
 
 void i686_dbt_fork_child(void)
 {
+    /* s_tcache_map and the g_dbt_* views (including g_dbt_active /
+     * g_dbt_in_active) survive fork via MAP_PRIVATE CoW, so the slot
+     * list stays coherent without re-init. */
 #ifdef __APPLE__
     (void)pthread_mutex_destroy(&s_jit_toggle_mutex);
     (void)pthread_mutex_init(&s_jit_toggle_mutex, NULL);
@@ -226,14 +258,21 @@ void i686_dbt_fork_child(void)
 
 void i686_dbt_flush_all(void)
 {
+    uint32_t idx;
+    DBT_STAT(DBT_STAT_FLUSH_ALL);
     dbt_sites_clear_all();
-    for (size_t i = 0U; i < DBT_HT_SIZE; i++) {
-        if (g_dbt_ht[i].len != 0U) {
-            munmap(g_dbt_ht[i].code, g_dbt_ht[i].cap);
-            g_dbt_ht[i].code = NULL;
-            g_dbt_ht[i].cap = 0U;
-            g_dbt_ht[i].len = 0U;
+    if (g_dbt_ht != NULL) {
+        for (idx = 0U; idx < g_dbt_nactive; idx++) {
+            uint32_t h = g_dbt_active[idx];
+            if (g_dbt_ht[h].len != 0U) {
+                munmap(g_dbt_ht[h].code, g_dbt_ht[h].cap);
+                g_dbt_ht[h].code = NULL;
+                g_dbt_ht[h].cap = 0U;
+                g_dbt_ht[h].len = 0U;
+            }
+            g_dbt_in_active[h] = 0U;
         }
+        g_dbt_nactive = 0U;
     }
     smc_clear_code_pages();
     (void)atomic_fetch_add_explicit(&g_dbt_flush_epoch, 1U,
@@ -256,13 +295,16 @@ void i686_dbt_flush_all(void)
 
 static uint32_t dbt_hash(uint32_t eip)
 {
-    return (eip ^ (eip >> 12U)) & (DBT_HT_SIZE - 1U);
+    /* Multiplicative (Fibonacci) hash.  The old eip ^ (eip >> 12) sent
+     * every 4 KiB code page onto one 4096-slot bucket (only 2^bits/4096
+     * hot pages fit), which thrashed cc1plus into ~15x re-translation. */
+    return (eip * 0x9E3779B1U) >> (32U - DBT_HT_BITS);
 }
 
 static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
 {
     uint32_t h = DBT_HT_SIZE;
-    uint32_t i;
+    uint32_t idx;
     uint32_t base;
     uint64_t start;
     uint64_t end;
@@ -278,10 +320,11 @@ static void i686_dbt_recover_fault(i686_ctx_t *ctx, uint64_t host_pc)
 #endif
     uint32_t live_esp = 0U;
 
-    if (host_pc == 0U) {
+    if (host_pc == 0U || g_dbt_ht == NULL) {
         return;
     }
-    for (i = 0U; i < DBT_HT_SIZE; i++) {
+    for (idx = 0U; idx < g_dbt_nactive; idx++) {
+        uint32_t i = g_dbt_active[idx];
         uint64_t lo = (uint64_t)(uintptr_t)g_dbt_ht[i].code;
         if (g_dbt_ht[i].len != 0U && host_pc >= lo &&
             host_pc < lo + (uint64_t)g_dbt_ht[i].len) {
@@ -376,7 +419,11 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
     uint32_t cur_epoch;
     uint32_t cur_pgen0;
     uint32_t cur_pgen1;
+    uint64_t t0 = 0U;
 
+    if (dbt_tcache_ensure() != 0) {
+        return NULL;
+    }
     dbt_sync_thread_cache(ctx);
     e = &g_dbt_ht[dbt_hash(eip)];
     cur_epoch = atomic_load_explicit(&g_dbt_cache_epoch, memory_order_acquire);
@@ -396,11 +443,15 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
             }
             return e;
         }
+        DBT_STAT(e->eip == eip ? DBT_STAT_EVICT_STALE : DBT_STAT_EVICT_COLL);
         dbt_ibtc_sever(ctx, e->eip);
         munmap(e->code, e->cap);
         e->code = NULL;
         e->cap = 0U;
         e->len = 0U;
+    }
+    if (g_dbt_stats_on) {
+        t0 = dbt_stat_now_ns();
     }
     for (;;) {
 #ifdef __APPLE__
@@ -413,25 +464,20 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
         size_t len;
+        uint32_t guest_len, tail_pg;
         size_t ring_before;
         uint32_t pre_pgen0;
         uint32_t pre_pgen1;
         uint32_t pre_flush;
         bool smc_on = (getenv("I686RT_SMC_OFF") == NULL);
         if (code == MAP_FAILED) {
+            DBT_STAT(DBT_STAT_MMAP_FAIL);
             return NULL;
         }
-        /* I686-R2-4: sample page_gen BEFORE arming SMC write-protection
-         * and BEFORE decoding guest bytes so a concurrent SMC write-fault
-         * between smc_protect and the sample cannot bump the generation
-         * undetected (its later stores during translation would no longer
-         * fault and post == pre would publish mixed bytes). Any store or
-         * VMA invalidation during translation bumps g_dbt_page_gen and is
-         * caught below.
-         * On Regime A2 (16K/64K host pages), hold the sub-page lock and
-         * temporarily apply union_prot while decoding guest bytes so a
-         * widened neighbor sub-page does not SIGBUS the translator, then
-         * re-apply smc_protect / widen_prot before unlocking. */
+        /* Sample page_gen BEFORE arming SMC protection and decoding so
+         * a concurrent store/VMA-invalidate during translation is caught
+         * by the post-translate PGEN_RETRY check (I686-R2-4). On A2
+         * host pages hold the sub-page lock with union_prot applied. */
         {
             extern int i686_fault_region_prot(const i686_ctx_t *, uint32_t,
                                               uint32_t *, uint32_t *);
@@ -478,16 +524,38 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
 #endif
             ring_before = i686_aot_ring_count();
             len = i686_dbt_translate(ctx, eip, code, cap);
+            guest_len = i686_dbt_last_guest_len();
+            tail_pg = (eip + (guest_len > 0U ? guest_len - 1U : 0U)) &
+                ~(SMC_PAGE - 1U);
 #ifdef __APPLE__
             pthread_jit_write_protect_np(1);
             s_jit_toggle_locked = false;
             (void)pthread_mutex_unlock(&s_jit_toggle_mutex);
 #endif
+            if (len == 0U) {
+                if (a2_subpage && p0_ok) {
+                    (void)i686_vm32_widen_prot(ctx, vpn0 << 12U,
+                                               (vpn0 << 12U) + 0x1000U);
+                    if (p1_ok) {
+                        (void)i686_vm32_widen_prot(ctx, vpn1 << 12U,
+                                                   (vpn1 << 12U) + 0x1000U);
+                    }
+                    i686_vm32_subpage_unlock();
+                }
+                DBT_STAT(DBT_STAT_XLATE_FAIL);
+                munmap(code, cap);
+                dbt_sites_clear_hash(dbt_hash(eip));
+                return NULL;
+            }
             if (a2_subpage && p0_ok) {
                 if (smc_on && len > 0U && len < cap) {
                     smc_protect(ctx, eip);
                     if (p1_ok) {
                         smc_protect(ctx, vpn1 << 12U);
+                    }
+                    if (tail_pg != (eip & ~0xFFFU) &&
+                        tail_pg != (vpn1 << 12U)) {
+                        smc_protect(ctx, tail_pg);
                     }
                 } else {
                     (void)i686_vm32_widen_prot(ctx, vpn0 << 12U,
@@ -499,14 +567,25 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
                 }
                 i686_vm32_subpage_unlock();
             }
-        }
-        if (len == 0U) {
-            munmap(code, cap);
-            dbt_sites_clear_hash(dbt_hash(eip));
-            return NULL;
+            /* Non-A2: also write-protect a tail page the block crossed into. */
+            if (!a2_subpage && smc_on && p0_ok && len > 0U && len < cap) {
+                if (tail_pg != (eip & ~(SMC_PAGE - 1U))) {
+                    uint32_t rprotT = 0U;
+                    if (i686_fault_region_prot(ctx, tail_pg, &rprotT,
+                                              NULL) != 0 &&
+                        (rprotT & 0x05U) != 0U) {
+                        smc_protect(ctx, tail_pg);
+                    }
+                }
+            }
         }
         if (len < cap) {
             uint32_t h = dbt_hash(eip);
+            /* Ever-compiled marks BEFORE the PGEN re-check (seq_cst). */
+            atomic_store_explicit(&g_dbt_compiled_page[vpn0], 1U,
+                                  memory_order_seq_cst);
+            atomic_store_explicit(&g_dbt_compiled_page[tail_pg >> 12U], 1U,
+                                  memory_order_seq_cst);
             uint32_t post_pgen0 = atomic_load_explicit(&g_dbt_page_gen[vpn0],
                                                        memory_order_acquire);
             uint32_t post_pgen1 = atomic_load_explicit(&g_dbt_page_gen[vpn1],
@@ -515,6 +594,7 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
                                                        memory_order_acquire);
             if (post_pgen0 != pre_pgen0 || post_pgen1 != pre_pgen1 ||
                 post_flush != pre_flush) {
+                DBT_STAT(DBT_STAT_PGEN_RETRY);
                 munmap(code, cap);
                 dbt_sites_clear_hash(h);
                 dbt_sync_thread_cache(ctx);
@@ -531,10 +611,17 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
             }
 #endif
             ctx->wx_transitions++;
+            if (g_dbt_stats_on) {
+                dbt_stat_add(DBT_STAT_COMPILES, 1U);
+                dbt_stats_compiled(eip);
+                dbt_stat_add(DBT_STAT_COMPILE_NS, dbt_stat_now_ns() - t0);
+            }
             cur_epoch = atomic_load_explicit(&g_dbt_cache_epoch,
                                              memory_order_acquire);
+            dbt_active_record(h);
             e->eip = eip;
             e->len = (uint32_t)len;
+            e->guest_len = guest_len;
             e->page_gen = pre_pgen0;
             e->page_gen1 = pre_pgen1;
             e->code = code;
@@ -550,6 +637,7 @@ static dbt_entry_t *dbt_get_or_compile(i686_ctx_t *ctx, uint32_t eip)
             };
             return e;
         }
+        DBT_STAT(DBT_STAT_GROW);
         munmap(code, cap);
         cap *= 2U;
         if (cap > 1U << 20) {
@@ -677,15 +765,24 @@ dispatch:
                 continue;
             }
         }
+        if (g_dbt_stats_on) {
+            dbt_stats_tick();
+        }
         i686_vm32_exec_enter(ctx);
         dbt_entry_t *e = dbt_get_or_compile(ctx, ctx->eip);
         int r;
 
         if (e == NULL) {
+            /* Untranslatable block: interpret one insn, then resume (D2).
+             * Publish the same exit fields the translated path sets so
+             * handle_exit never reads a stale reason/arg. */
+            DBT_STAT(DBT_STAT_INTERP_FALLBACK);
             i686_vm32_exec_leave();
-            (void)fprintf(stderr, "DBTFALL eip=%08x\n", ctx->eip);
-            i686_fault_disarm();
-            return i686_interp_run(ctx);
+            ctx->exit_reason = I686_EXIT_UNDEF;
+            ctx->exit_arg = 0U;
+            ctx->exit_dest = ctx->eip;
+            r = I686_EXIT_UNDEF;
+            goto handle_exit;
         }
         ctx->exit_reason = I686_EXIT_NONE;
         ctx->exit_arg = 0U;
@@ -698,6 +795,15 @@ dispatch:
         ctx->blocks_executed++;
 
         r = (int)ctx->exit_reason;
+        if (g_dbt_stats_on) {
+            if (r == I686_EXIT_UNDEF) {
+                dbt_stat_add(DBT_STAT_EXIT_UNDEF, 1U);
+                dbt_stats_undef(ctx, ctx->exit_dest);
+            } else if (r == I686_EXIT_SYSCALL) {
+                dbt_stat_add(DBT_STAT_EXIT_SYSCALL, 1U);
+            }
+        }
+handle_exit:
         switch (r) {
         case I686_EXIT_BRANCH:
             ctx->eip = ctx->exit_dest;

@@ -66,8 +66,19 @@ long i686_getcwd_store(i686_ctx_t *ctx, uint32_t buf_va, uint32_t size,
 int i686_rusage_to_guest(i686_ctx_t *ctx, uint32_t ru_va, const struct rusage *ru)
 {
     uint8_t out[72];
+    uint32_t maxrss;
+#ifdef __APPLE__
+    /* macOS reports ru_maxrss in bytes; the i386 ABI counts kilobytes.
+     * Divide before narrowing so large byte counts do not truncate. */
+    {
+        uint64_t kb = (uint64_t)(unsigned long)ru->ru_maxrss / 1024ULL;
+        maxrss = (kb > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)kb;
+    }
+#else
+    maxrss = (uint32_t)ru->ru_maxrss;
+#endif
     const long fields[14] = {
-        ru->ru_maxrss, ru->ru_ixrss, ru->ru_idrss, ru->ru_isrss,
+        (long)maxrss, ru->ru_ixrss, ru->ru_idrss, ru->ru_isrss,
         ru->ru_minflt, ru->ru_majflt, ru->ru_nswap, ru->ru_inblock,
         ru->ru_oublock, ru->ru_msgsnd, ru->ru_msgrcv, ru->ru_nsignals,
         ru->ru_nvcsw, ru->ru_nivcsw,
@@ -314,6 +325,46 @@ static long sys_symlink(i686_ctx_t *ctx, uint32_t target_va, uint32_t link_va)
     return host_ret_(symlink(target, linkp));
 }
 
+/* Guest-view of a host absolute path: strip the --sysroot prefix on a
+ * path boundary (sysroot "/s": "/s" -> "/", "/s/x" -> "/x"); anything
+ * else passes through unchanged.  Used for guest-visible outputs
+ * (getcwd, /proc/self/exe) so the guest never sees host paths. */
+static const char *strip_sysroot_view(const i686_ctx_t *ctx,
+                                      const char *host, char *out,
+                                      size_t cap)
+{
+    size_t sl;
+
+    if (ctx->sysroot == NULL || ctx->sysroot[0] == '\0' || cap == 0U) {
+        return host;
+    }
+    sl = strlen(ctx->sysroot);
+    while (sl > 1U && ctx->sysroot[sl - 1U] == '/') {
+        sl--;
+    }
+    if (strncmp(host, ctx->sysroot, sl) != 0 ||
+        (host[sl] != '/' && host[sl] != '\0')) {
+        return host;
+    }
+    if (host[sl] == '\0') {
+        out[0] = '/';
+        if (cap > 1U) {
+            out[1] = '\0';
+        }
+        return out;
+    }
+    {
+        size_t n = strlen(host + sl) + 1U;
+
+        if (n > cap) {
+            n = cap;
+        }
+        memcpy(out, host + sl, n - 1U);
+        out[n - 1U] = '\0';
+    }
+    return out;
+}
+
 static int is_own_proc_exe(const char *linkp)
 {
     const char *p;
@@ -357,14 +408,20 @@ static long sys_readlink(i686_ctx_t *ctx, uint32_t link_va, uint32_t buf_va,
                                  ctx->guest_argv[0] != NULL)
                                     ? ctx->guest_argv[0]
                                     : NULL);
+        const char *guest_view;
+        char view[PATH_BUF];
+
         if (ep == NULL || ep[0] == '\0') {
             return -ENOENT;
         }
-        n = (ssize_t)strlen(ep);
+        /* Guest-view exe path: a host path under --sysroot presents
+         * stripped, everything else verbatim. */
+        guest_view = strip_sysroot_view(ctx, ep, view, sizeof view);
+        n = (ssize_t)strlen(guest_view);
         if (n > (ssize_t)bufsiz) {
             n = (ssize_t)bufsiz;
         }
-        if (i686_copy_to_guest(ctx, buf_va, ep, (size_t)n) != 0) {
+        if (i686_copy_to_guest(ctx, buf_va, guest_view, (size_t)n) != 0) {
             return -EFAULT;
         }
         return (long)n;
@@ -527,10 +584,15 @@ static long sys_chdir(i686_ctx_t *ctx, uint32_t path_va)
 static long sys_getcwd(i686_ctx_t *ctx, uint32_t buf_va, uint32_t size)
 {
     char cwd[PATH_BUF];
+    char view[PATH_BUF];
+    const char *guest_view;
+
     if (getcwd(cwd, sizeof cwd) == NULL) {
         return -errno;
     }
-    return i686_getcwd_store(ctx, buf_va, size, cwd, strlen(cwd) + 1U);
+    guest_view = strip_sysroot_view(ctx, cwd, view, sizeof view);
+    return i686_getcwd_store(ctx, buf_va, size, guest_view,
+                             strlen(guest_view) + 1U);
 }
 
 int64_t i686_pass_r_openat(i686_ctx_t *ctx)
@@ -559,7 +621,8 @@ int64_t i686_pass_r_openat(i686_ctx_t *ctx)
         return host_ret_(open_guest(ctx, path, (int)hf,
                                     (mode_t)ctx->gpr[I686_REG_ESI]));
     }
-    return -EINVAL;
+    return host_ret_(openat((int)dirfd, path, (int)hf,
+                            (mode_t)ctx->gpr[I686_REG_ESI]));
 }
 
 int64_t i686_pass_r_open(i686_ctx_t *ctx)
@@ -689,8 +752,10 @@ int64_t i686_pass_r_fchown32(i686_ctx_t *ctx)
 
 int64_t i686_pass_r_fchmodat(i686_ctx_t *ctx)
 {
+    /* The i386 fchmodat takes (dirfd, path, mode) only; ESI is stale
+     * (musl passes whatever was there).  fchmodat2 (452) carries flags. */
     return sys_fchmodat(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
-                        ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI]);
+                        ctx->gpr[I686_REG_EDX], 0U);
 }
 
 int64_t i686_pass_r_fchownat(i686_ctx_t *ctx)

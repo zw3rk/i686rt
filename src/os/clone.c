@@ -557,6 +557,16 @@ void i686_thread_exit_teardown(i686_ctx_t *ctx)
     uint32_t tid;
 
     i686_vm32_exec_leave();
+#ifndef I686RT_NO_DBT
+    /* Free this thread's DBT translation cache (engine_tcache.c). The
+     * pthread-key destructor alone only runs on pthread exit, so a
+     * guest thread that exits via the raw exit path would leak its
+     * region and every translated block without this call. */
+    {
+        extern void dbt_tcache_fini(void);
+        dbt_tcache_fini();
+    }
+#endif
     if (s_robust_done == 0) {
         s_robust_done = 1;
         tid = clone_host_gettid();

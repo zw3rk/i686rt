@@ -36,6 +36,18 @@
 
 #define I686_DBT_MAX_INSNS 256U
 
+/* Guest byte span (end_eip - eip) of the most recent i686_dbt_translate
+ * on this thread. Translation runs synchronously on the compiling
+ * thread, so __thread storage needs no locking; the engine reads it
+ * right after translate returns to record per-block guest extents
+ * (head/tail pages) without changing translate's signature. */
+static __thread uint32_t s_last_guest_len;
+
+uint32_t i686_dbt_last_guest_len(void)
+{
+    return s_last_guest_len;
+}
+
 /* Pre-scan classes (see header comment). */
 enum {
     TRC_BARRIER = 0,     /* ends the current skip segment */
@@ -314,6 +326,8 @@ static unsigned tr_classify(const x86_insn_t *insn)
     case I686_OP_MOV_GbIb: case I686_OP_MOV_GvIv:
     case I686_OP_MOVZX_GvEb: case I686_OP_MOVZX_GvEw:
     case I686_OP_MOVSX_GvEb: case I686_OP_MOVSX_GvEw:
+    case I686_OP_MOV_ALOb: case I686_OP_MOV_eAXOv:
+    case I686_OP_MOV_ObAL: case I686_OP_MOV_OveAX:
         return TRC_TRANSPARENT;
     case I686_OP_XCHG_EbGb: case I686_OP_XCHG_EvGv:
     case I686_OP_XCHG_eAXGv:
@@ -343,6 +357,9 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
 {
     i686_emit_ctx_t e;
     uint32_t pc = eip;
+    /* No stale span: every return below with len > 0 sets this to
+     * pc - eip, so a failed translate (len 0) reads back as 0. */
+    s_last_guest_len = 0U;
     x86_insn_t insns[I686_DBT_MAX_INSNS];
     unsigned char cls[I686_DBT_MAX_INSNS];
     uint8_t skip[I686_DBT_MAX_INSNS];
@@ -564,6 +581,9 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
             rc = i686_emit_string(&e, insn);
         }
         if (rc < 0) {
+            rc = i686_emit_bit(&e, insn);
+        }
+        if (rc < 0) {
             extern int i686_emit_sse(i686_emit_ctx_t *, const x86_insn_t *);
             rc = i686_emit_sse(&e, insn);
             if (rc == 0 && e.tso && tr_is_regonly(insn) == 0) {
@@ -613,6 +633,8 @@ size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
     {
         size_t len;
         (void)i686_emit_finish(&e, &len);
+        /* pc is the block's guest end_eip (wrap-safe uint32 delta). */
+        s_last_guest_len = pc - eip;
         return len;
     }
 }

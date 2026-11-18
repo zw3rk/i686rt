@@ -21,22 +21,27 @@ static int h_fld_m32(i686_ctx_t *ctx, const x86_insn_t *insn)
         if (vs == I686_EXIT_FAULT) {
             return I686_EXIT_FAULT;
         }
+        /* The source is ST(i) relative to the OLD top: latch it before
+         * the push moves TOP (FLD ST(0) must duplicate, not copy the
+         * fresh slot). */
+        double v64 = 0.0;
+        uint8_t b[10];
+
+        if (vs != X87_SRC_EMPTY) {
+            if (!ctx->x87_80) {
+                v64 = x87_get_f64(ctx, insn->modrm_rm);
+            } else {
+                x87_get_ext80(ctx, insn->modrm_rm, b);
+            }
+        }
         if (x87_push_checked(ctx) != I686_INTERP_CONTINUE) {
             return I686_EXIT_FAULT;
         }
         if (!ctx->x87_80) {
-            double v = (vs == X87_SRC_EMPTY)
-                           ? (double)NAN
-                           : x87_get_f64(ctx, insn->modrm_rm);
-
-            x87_set_f64(ctx, 0, v);
+            x87_set_f64(ctx, 0, (vs == X87_SRC_EMPTY) ? (double)NAN : v64);
         } else {
-            uint8_t b[10];
-
             if (vs == X87_SRC_EMPTY) {
                 x87_80_nan(b, false, false);
-            } else {
-                x87_get_ext80(ctx, insn->modrm_rm, b);
             }
             x87_set_ext80(ctx, 0, b);
         }

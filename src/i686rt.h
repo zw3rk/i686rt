@@ -291,6 +291,15 @@ typedef struct i686_ctx {
      * A siglongjmp out of the handler intentionally leaves it set,
      * matching the kernel (longjmp never clears on-stack state). */
     uint32_t altstack_onstack;   /* 1 = executing on the alternate stack */
+    /* pselect6 old-mask stash (M2): when pselect swaps in its temporary
+     * mask while a deliverable signal is already pending (or the host
+     * wait is interrupted by one), the pre-swap mask is stashed here
+     * and the temporary mask stays live through handler delivery; the
+     * sigframe builder consumes the stash as the frame's saved mask so
+     * sigreturn restores it.  valid = 0 when no override is in flight.
+     * C-only tail: extend at end only. */
+    uint64_t sig_pselect_oldmask;
+    uint32_t sig_pselect_oldmask_valid;
 } i686_ctx_t;
 
 /* ABI-locked offsets (src/trampoline.S, Phase 3, must agree). */

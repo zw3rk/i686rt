@@ -39,12 +39,12 @@
 
 #include "i686rt.h"
 #include "os/syscalls_i386.h"
+#include "interp/interp.h"
 #include "os/marshal.h"
 #include "os/threads.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
-#include <sys/mman.h>
 
 #include "rt32/rt32.h"
 
@@ -406,7 +406,6 @@ static int64_t r_waitpid(i686_ctx_t *ctx)
     return sys_wait4(ctx, (int32_t)ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
                      ctx->gpr[I686_REG_EDX], 0U);
 }
-
 
 /* ---- in-process execve (S2 coordinator design) ------------------------ */
 /* Reload a new i386 image into the same process: marshal argv/envp, tear
@@ -798,6 +797,7 @@ static int64_t r_execve(i686_ctx_t *ctx)
     memset(ctx->seg_base, 0, sizeof(ctx->seg_base));
     ctx->cs_d = 1U; /* exec reloads flat segment regs; LDT persists */
     ctx->ss_b = 1U; /* R7-11: flat stack is 32-bit */
+    i686_x87_reset(ctx); /* FNINIT state, as Linux starts every process */
     ctx->mxcsr = 0x1F80U;
     ctx->mxcsr_mask = 0xFFFFU;
     {

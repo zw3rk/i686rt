@@ -90,7 +90,7 @@ $(OBJ_DIR)/%.o: src/%.c $(HDRS)
 
 test: check ## Run the host test suite (line limits + Wave U3 host checks)
 
-check: check-line-limits test-u3 ## Run line limits + host unit tests (RC-U3)
+check: check-line-limits test-u3 test-dbt-active ## Run line limits + host unit tests (RC-U3)
 
 test-p0-lima: ## Phase 0 Lima placeholder; the real RC0 check is nix build .#i686rt
 	@echo "phase 0: no test yet (RC0 = nix build)"
@@ -287,7 +287,14 @@ test-u3: ## Build and run the Wave U3 host check (must print U3-I686 OK)
 	$(HOST_CC) $(CFLAGS) -Werror $(HOST_DEFS) -DI686RT_NO_DBT $(U3_TEST_SRCS) -o $(BUILD_DIR)/test_u3_sites -pthread
 	timeout --kill-after=10s 30s ./$(BUILD_DIR)/test_u3_sites
 
-.PHONY: check-line-limits build-darwin test-u3
+DBT_ACTIVE_TEST_SRCS := tests/unit/test_dbt_active.c src/dbt/engine_tcache.c
+
+test-dbt-active: ## Build and run the DBT active-slot host check (must print DBT-ACTIVE OK)
+	@mkdir -p $(BUILD_DIR)
+	$(HOST_CC) $(CFLAGS) -Werror $(HOST_DEFS) $(DBT_ACTIVE_TEST_SRCS) -o $(BUILD_DIR)/test_dbt_active -pthread
+	timeout --kill-after=10s 30s ./$(BUILD_DIR)/test_dbt_active
+
+.PHONY: check-line-limits build-darwin test-u3 test-dbt-active
 
 ## ------------------------------------------------------------------ ##
 ##  Phase H — H3: CoreMark performance (interp vs dbt vs oracle)        ##

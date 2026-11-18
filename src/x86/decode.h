@@ -40,6 +40,10 @@ enum {
     I686_OPND_SREG   /* segment register (reg field)               */
 };
 
+/* ea_base/ea_index "no register" sentinel (stored values are I686_REG_*;
+ * pfx_seg uses the same 0xFF value for "no override"). */
+#define I686_REG_NONE 0xFFU
+
 /* Decoded instruction (frozen layout; consumed by interp handlers, the
  * Phase 3 translator, and the differential tracer). */
 typedef struct x86_insn {
@@ -107,7 +111,8 @@ enum {
     I686_OP7_UNPCKLPS = 470, /* 0F 14 Vps,Wps / 66 Vpd,Wpd              */
     I686_OP7_UNPCKHPS = 471, /* 0F 15 Vps,Wps / 66 Vpd,Wpd              */
     I686_OP7_PACKUSWB = 472, /* 0F 67 Pq,Qd / 66 Vdq,Wdq                */
-    I686_OP7_SHUFPS   = 473  /* 0F C6 Vps,Wps,Ib / 66 Vpd,Wpd,Ib        */
+    I686_OP7_SHUFPS   = 473, /* 0F C6 Vps,Wps,Ib / 66 Vpd,Wpd,Ib        */
+    I686_OP7_SSEX     = 474  /* misc SSE/MMX 0F xx, byte in far_sel      */
 };
 
 #endif /* I686RT_X86_DECODE_H */

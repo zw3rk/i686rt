@@ -115,14 +115,24 @@ static inline unsigned i686_w(unsigned x86_reg) { return x86_reg & 7U; }
  * eip into code (cap bytes); returns emitted length or 0. */
 size_t i686_dbt_translate(i686_ctx_t *ctx, uint32_t eip, uint8_t *code,
                           size_t cap);
+/* Guest byte span (end_eip - eip) of this thread's most recent
+ * i686_dbt_translate; valid right after it returns. */
+uint32_t i686_dbt_last_guest_len(void);
 
 /* DBT engine loop (src/dbt/engine.c). */
 int i686_dbt_run(i686_ctx_t *ctx);
 
 int i686_emit_alu(i686_emit_ctx_t *e, const x86_insn_t *insn);
 int i686_emit_mov(i686_emit_ctx_t *e, const x86_insn_t *insn);
+/* Hot r/m-stack + moffs extension (src/dbt/emit_mov_ext.c); called from
+ * i686_emit_mov's default arm.  Shared PUSH store (emit_mov.c). */
+int i686_emit_mov_ext(i686_emit_ctx_t *e, const x86_insn_t *insn);
+void i686_emit_push_store(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                          unsigned wsrc, unsigned bytes);
 int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn);
 int i686_emit_string(i686_emit_ctx_t *e, const x86_insn_t *insn);
+/* Bit-scan emitters (src/dbt/emit_bit.c): BSF/BSR, eager EFLAGS. */
+int i686_emit_bit(i686_emit_ctx_t *e, const x86_insn_t *insn);
 
 /* LOCK-prefixed RMW via LSE atomics (src/dbt/emit_atomic.c, L4c). */
 int i686_emit_atomic(i686_emit_ctx_t *e, const x86_insn_t *insn);
