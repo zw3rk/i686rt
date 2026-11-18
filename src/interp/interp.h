@@ -30,6 +30,9 @@ typedef int (*i686_interp_fn)(i686_ctx_t *ctx, const x86_insn_t *insn);
  * only from per-module init functions at engine startup. */
 void i686_interp_register(uint16_t op, i686_interp_fn fn);
 
+/* Reset the x87 unit to its FNINIT state (process start and exec). */
+void i686_x87_reset(i686_ctx_t *ctx);
+
 /* Run the guest from ctx->eip until a terminal exit (exit_group, fatal
  * fault, fatal undecodable).  Returns the last exit_reason. */
 int i686_interp_run(i686_ctx_t *ctx);

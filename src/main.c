@@ -290,6 +290,7 @@ static int run_guest(i686_ctx_t *ctx)
     ctx->seg_base[I686_SEG_FS] = 0;
     ctx->seg_base[I686_SEG_GS] = 0;
     ctx->ss_b = 1U; /* R7-11: flat stack is 32-bit */
+    i686_x87_reset(ctx); /* FNINIT state, as Linux starts every process */
     ctx->mxcsr = 0x1F80U;
     ctx->mxcsr_mask = 0xFFFFU;
 
@@ -408,6 +409,12 @@ int main(int argc, char **argv)
                       (unsigned long long)ctx.chain_hits,
                       (unsigned long long)ctx.ibtc_hits,
                       (unsigned long long)ctx.flags_elided);
+#ifndef I686RT_NO_DBT
+        {
+            extern void i686_dbt_stats_dump(void);
+            i686_dbt_stats_dump();
+        }
+#endif
     }
     return st;
 }

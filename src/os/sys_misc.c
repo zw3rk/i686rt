@@ -137,8 +137,13 @@ static int64_t host_prlimit64(int64_t pid, int resource, const uint8_t *new16,
 /* select / _newselect                                                  */
 /* ------------------------------------------------------------------ */
 
+/* Timeout layouts: select = timeval{i32,i32}; pselect6 = timespec
+ * {i32,i32}; pselect6_time64 = timespec{i64,i64}. */
+enum { SEL_TIMEVAL = 0, SEL_TS32 = 1, SEL_TS64 = 2 };
+
 static int64_t do_select(i686_ctx_t *ctx, uint32_t n, uint32_t in_va,
-                         uint32_t out_va, uint32_t exc_va, uint32_t tv_va)
+                         uint32_t out_va, uint32_t exc_va, uint32_t tv_va,
+                         int tmode)
 {
     uint8_t gin[I686_FD_BYTES], gout[I686_FD_BYTES], gexc[I686_FD_BYTES];
     uint64_t hin[16], hout[16], hexc[16];
@@ -170,16 +175,42 @@ static int64_t do_select(i686_ctx_t *ctx, uint32_t n, uint32_t in_va,
     }
 
     if (have_tv) {
-        i686_timeval_t gtv;
-        int e = i686_copy_from_guest(ctx, &gtv, tv_va, sizeof(gtv));
-        if (e != 0) return e;
-        if (gtv.tv_sec < 0 || gtv.tv_usec < 0 || gtv.tv_usec > 999999) {
+        int64_t gsec, gfrac;
+        int64_t fmax = (tmode == SEL_TIMEVAL) ? 999999 : 999999999;
+        int e;
+
+        if (tmode == SEL_TS64) {
+            /* i386 64-bit-time struct timespec is {s64 sec; s32 nsec;
+             * s32 pad}: +12..+15 is uninitialized padding, and the
+             * kernel get_timespec64 compat path sign-extends tv_nsec
+             * from the low 32-bit word, ignoring the padding. */
+            int64_t w[2];
+
+            e = i686_copy_from_guest(ctx, w, tv_va, sizeof(w));
+            if (e != 0) return e;
+            gsec = w[0];
+            gfrac = (int64_t)(int32_t)(uint32_t)w[1];
+        } else {
+            int32_t w[2];
+
+            e = i686_copy_from_guest(ctx, w, tv_va, sizeof(w));
+            if (e != 0) return e;
+            gsec = w[0];
+            gfrac = w[1];
+        }
+        if (gsec < 0 || gfrac < 0 || gfrac > fmax) {
             return -EINVAL;
         }
-        orig_sec = (uint32_t)gtv.tv_sec;
-        orig_usec = (uint32_t)gtv.tv_usec;
-        ts.tv_sec = (time_t)gtv.tv_sec;
-        ts.tv_nsec = (long)gtv.tv_usec * 1000L;
+        if (tmode != SEL_TIMEVAL) {
+            gfrac /= 1000; /* keep the microsecond bookkeeping below */
+        }
+        if (gsec > 0x7fffffffLL) {
+            gsec = 0x7fffffffLL; /* bookkeeping is 32-bit seconds */
+        }
+        orig_sec = (uint32_t)gsec;
+        orig_usec = (uint32_t)gfrac;
+        ts.tv_sec = (time_t)gsec;
+        ts.tv_nsec = (long)gfrac * 1000L;
     }
 
     if (in_va != 0u) i686_fdset_g2h((uint8_t *)hin, gin, n);
@@ -229,13 +260,30 @@ static int64_t do_select(i686_ctx_t *ctx, uint32_t n, uint32_t in_va,
                                  (int64_t)(now.tv_nsec - start.tv_nsec) / 1000;
             int64_t orig_us = (int64_t)orig_sec * 1000000 + (int64_t)orig_usec;
             int64_t rem = orig_us - elapsed_us;
-            i686_timeval_t gtv;
+            int64_t rs, rf;
+
             if (rem < 0) {
                 rem = 0;
             }
-            gtv.tv_sec = (int32_t)(rem / 1000000);
-            gtv.tv_usec = (int32_t)(rem % 1000000);
-            (void)i686_copy_to_guest(ctx, tv_va, &gtv, sizeof(gtv));
+            rs = rem / 1000000;
+            rf = rem % 1000000;
+            if (tmode != SEL_TIMEVAL) {
+                rf *= 1000;
+            }
+            if (tmode == SEL_TS64) {
+                int64_t w[2];
+
+                w[0] = rs;
+                w[1] = rf; /* rf in [0, 999999999): high word is zero,
+                            * so the +12..+15 pad reads back zeroed */
+                (void)i686_copy_to_guest(ctx, tv_va, w, sizeof(w));
+            } else {
+                int32_t w[2];
+
+                w[0] = (int32_t)rs;
+                w[1] = (int32_t)rf;
+                (void)i686_copy_to_guest(ctx, tv_va, w, sizeof(w));
+            }
         }
     }
     return ret;
@@ -246,14 +294,106 @@ static int64_t r_old_select(i686_ctx_t *ctx)
     i686_sel_args_t a;
     int e = i686_copy_from_guest(ctx, &a, ctx->gpr[I686_REG_EBX], sizeof(a));
     if (e != 0) return e;
-    return do_select(ctx, a.n, a.inp, a.outp, a.exp, a.tvp);
+    return do_select(ctx, a.n, a.inp, a.outp, a.exp, a.tvp, SEL_TIMEVAL);
 }
 
 static int64_t r_newselect(i686_ctx_t *ctx)
 {
     return do_select(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
                      ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
-                     ctx->gpr[I686_REG_EDI]);
+                     ctx->gpr[I686_REG_EDI], SEL_TIMEVAL);
+}
+
+/* pselect6 / pselect6_time64: EBX=n ECX=in EDX=out ESI=exc EDI=timespec,
+ * EBP -> {sigmask_ptr, sigsetsize}. The temporary mask replaces the
+ * guest mask (ctx->sig_mask, emulated: the host mask is never touched,
+ * so translator-reserved signals such as SIGUSR2/SIGSEGV stay live) for
+ * the duration of the select; SIGKILL/SIGSTOP are stripped. */
+#define PSEL_UNBLOCKABLE ((UINT64_C(1) << 8) | (UINT64_C(1) << 18))
+
+/* True when a signal delivery round could consume a pending bit under
+ * the given live mask (mirrors i686_deliver_pending's unblock check;
+ * SIGKILL/SIGSTOP deliver regardless of mask). */
+static int pselect_deliverable(const i686_ctx_t *ctx, uint64_t live_mask)
+{
+    uint64_t pend =
+        __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST);
+
+    if ((pend & PSEL_UNBLOCKABLE) != 0ULL) {
+        return 1;
+    }
+    return (pend & ~live_mask) != 0ULL;
+}
+
+/* Stash the pre-swap mask for the sigframe and keep the temporary mask
+ * live: the delivery check must see the signal unblocked (restoring old
+ * first would re-block it and the handler would never run), while the
+ * frame must save old so sigreturn restores it. */
+static void pselect_stash_old(i686_ctx_t *ctx, uint64_t old)
+{
+    __atomic_store_n(&ctx->sig_pselect_oldmask, old, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&ctx->sig_pselect_oldmask_valid, 1U,
+                     __ATOMIC_SEQ_CST);
+}
+
+static int64_t pselect_common(i686_ctx_t *ctx, int tmode)
+{
+    uint32_t sm_va = ctx->gpr[I686_REG_EBP];
+    uint64_t old = 0;
+    uint64_t tmp = 0;
+    int swapped = 0;
+    int64_t r;
+
+    if (sm_va != 0u) {
+        uint32_t pair[2];
+        int e = i686_copy_from_guest(ctx, pair, sm_va, sizeof(pair));
+
+        if (e != 0) return e;
+        if (pair[0] != 0u) {
+            uint64_t set;
+
+            if (pair[1] != 8u) {
+                return -EINVAL;
+            }
+            e = i686_copy_from_guest(ctx, &set, pair[0], sizeof(set));
+            if (e != 0) return e;
+            tmp = set & ~PSEL_UNBLOCKABLE;
+            old = __atomic_exchange_n(&ctx->sig_mask, tmp,
+                                      __ATOMIC_SEQ_CST);
+            swapped = 1;
+            /* Race the sleep (the atomicity pselect exists to close):
+             * a signal already pending and unblocked by the temporary
+             * mask reports EINTR without sleeping. */
+            if (pselect_deliverable(ctx, tmp)) {
+                pselect_stash_old(ctx, old);
+                return -EINTR;
+            }
+        }
+    }
+    r = do_select(ctx, ctx->gpr[I686_REG_EBX], ctx->gpr[I686_REG_ECX],
+                  ctx->gpr[I686_REG_EDX], ctx->gpr[I686_REG_ESI],
+                  ctx->gpr[I686_REG_EDI], tmode);
+    if (swapped) {
+        uint64_t live =
+            __atomic_load_n(&ctx->sig_mask, __ATOMIC_SEQ_CST);
+        if ((r == -(int64_t)EINTR || r >= 0) &&
+            pselect_deliverable(ctx, live)) {
+            pselect_stash_old(ctx, old);
+        } else {
+            __atomic_store_n(&ctx->sig_mask, old, __ATOMIC_SEQ_CST);
+        }
+    }
+    return r;
+}
+
+static int64_t r_pselect6(i686_ctx_t *ctx)
+{
+    return pselect_common(ctx, SEL_TS32);
+}
+
+static int64_t r_pselect6_time64(i686_ctx_t *ctx)
+{
+    return pselect_common(ctx, SEL_TS64);
 }
 
 /* ------------------------------------------------------------------ */
@@ -642,6 +782,8 @@ void i686_syscalls_misc_init(void)
     i686_sys_register((long)L2E_NR_mmap, r_old_mmap);
     i686_sys_register((long)L2E_NR_sysinfo, r_sysinfo);
     i686_sys_register((long)L2E_NR_newselect, r_newselect);
+    i686_sys_register((long)L2E_NR_pselect6, r_pselect6);
+    i686_sys_register((long)L2E_NR_pselect6_time64, r_pselect6_time64);
     i686_sys_register((long)L2E_NR_flock, r_flock);
     i686_sys_register((long)L2E_NR_madvise, r_madvise);
     i686_sys_register((long)L2E_NR_fcntl64, r_fcntl64);

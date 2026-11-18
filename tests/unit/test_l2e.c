@@ -82,6 +82,11 @@ static uint32_t r32(uint32_t va)
     return v;
 }
 
+static void w64(uint32_t va, uint64_t v)
+{
+    memcpy(&g_window[va], &v, 8);
+}
+
 /* Test-local rt32_vm_mmap2 stub (signature mirrors src/rt32/rt32.h). */
 static uint32_t s_mm_addr, s_mm_len, s_mm_prot, s_mm_flags, s_mm_pgoff;
 static int s_mm_fd;
@@ -505,6 +510,59 @@ static void t_select(void)
     CHECK(ret == -EFAULT);
 }
 
+/* pselect6_time64(413) reads the i386 64-bit-time struct timespec
+ * {s64 sec @+0; s32 nsec @+8; s32 pad @+12}: the kernel compat path
+ * (get_timespec64) sign-extends tv_nsec from the low 32-bit word and
+ * ignores the uninitialized padding at +12..+15. */
+static void t_pselect6_time64_pad(void)
+{
+    int64_t ret;
+
+    /* Zero timeout with garbage padding must succeed, not -EINVAL. */
+    reset();
+    w64(0x300, 0u);          /* tv_sec */
+    w32(0x308, 0u);          /* tv_nsec low word */
+    w32(0x30c, 0xDEADBEEFu); /* uninitialized padding */
+    ctx.gpr[I686_REG_EBX] = 1;
+    ctx.gpr[I686_REG_ECX] = 0;
+    ctx.gpr[I686_REG_EDX] = 0;
+    ctx.gpr[I686_REG_ESI] = 0;
+    ctx.gpr[I686_REG_EDI] = 0x300;
+    ctx.gpr[I686_REG_EBP] = 0;
+    ret = i686_sys_dispatch(&ctx, 413);
+    CHECK(ret == 0);
+
+    /* 1 ms timeout with garbage padding: succeeds and zero-fills the
+     * padding word on remaining-time writeback. */
+    reset();
+    w64(0x300, 0u);
+    w32(0x308, 1000000u);
+    w32(0x30c, 0xBAADF00Du);
+    ctx.gpr[I686_REG_EBX] = 1;
+    ctx.gpr[I686_REG_ECX] = 0;
+    ctx.gpr[I686_REG_EDX] = 0;
+    ctx.gpr[I686_REG_ESI] = 0;
+    ctx.gpr[I686_REG_EDI] = 0x300;
+    ctx.gpr[I686_REG_EBP] = 0;
+    ret = i686_sys_dispatch(&ctx, 413);
+    CHECK(ret == 0);
+    CHECK(r32(0x30c) == 0u);
+
+    /* Negative tv_nsec (low word 0xFFFFFFFF) stays -EINVAL. */
+    reset();
+    w64(0x300, 0u);
+    w32(0x308, 0xFFFFFFFFu);
+    w32(0x30c, 0u);
+    ctx.gpr[I686_REG_EBX] = 1;
+    ctx.gpr[I686_REG_ECX] = 0;
+    ctx.gpr[I686_REG_EDX] = 0;
+    ctx.gpr[I686_REG_ESI] = 0;
+    ctx.gpr[I686_REG_EDI] = 0x300;
+    ctx.gpr[I686_REG_EBP] = 0;
+    ret = i686_sys_dispatch(&ctx, 413);
+    CHECK(ret == -EINVAL);
+}
+
 static void t_registration(void)
 {
     /* fcntl(55) with an unknown cmd rejects before any host call. */
@@ -546,6 +604,7 @@ int main(void)
     t_fcntl_cmd();
     t_old_mmap();
     t_select();
+    t_pselect6_time64_pad();
     t_registration();
 
     if (g_fail != 0) {

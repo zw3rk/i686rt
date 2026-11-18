@@ -64,8 +64,6 @@
 #include "dbt/emit.h"
 #include "dbt/aot/aot.h"
 
-#define L3C_NONE 0xFFU /* decoder sentinel for "no base/index/segment" */
-
 /* In-block scratch (fixed): reason/arg/dest hand-off + temps + EA. */
 #define L3C_W8   8U   /* exit reason */
 #define L3C_W9   9U   /* exit arg */
@@ -619,17 +617,64 @@ int i686_emit_branch(i686_emit_ctx_t *e, const x86_insn_t *insn)
     case I686_OP_SETcc_Eb: {
         int a64c = l3c_cond_map(insn->modrm_reg);
 
-        if (a64c < 0 || insn->modrm_mod != 3U || insn->pfx_lock != 0U ||
-            insn->pfx_rep != 0U) {
-            return -1; /* reg forms only in v1 */
+        if (a64c < 0 || insn->pfx_lock != 0U || insn->pfx_rep != 0U) {
+            return -1; /* parity conditions + prefixed forms decline */
         }
         l3c_flags_consume(e);
-        l3c_emit_cset_w11(e, (unsigned)a64c);
-        if (insn->modrm_rm < 4U) { /* low byte: bfi wReg, w11, #0, #8 */
-            a64_emit_bfm_w(b, i686_w(insn->modrm_rm), L3C_W11, 0U, 7U);
-        } else { /* AH..BH live in bits 15:8 of the same wN */
-            a64_emit_bfm_w(b, i686_w(insn->modrm_rm - 4U), L3C_W11, 24U,
-                           7U);
+        if (insn->modrm_mod == 3U) {
+            /* Register destination: no EA to compute, so the condition
+             * can be materialized first. */
+            l3c_emit_cset_w11(e, (unsigned)a64c);
+            if (insn->modrm_rm < 4U) { /* low byte: bfi wReg, w11, #0, #8 */
+                a64_emit_bfm_w(b, i686_w(insn->modrm_rm), L3C_W11, 0U, 7U);
+            } else { /* AH..BH live in bits 15:8 of the same wN */
+                a64_emit_bfm_w(b, i686_w(insn->modrm_rm - 4U), L3C_W11,
+                               24U, 7U);
+            }
+            return 0;
+        }
+        /* Memory destination: EA + byte store.  SETcc writes no flags,
+         * so a faulting store retries with intact pre-insn flags. */
+        if (insn->ea_has == 0U) {
+            return -1;
+        }
+        {
+            uint32_t seq = (uint32_t)((uint64_t)b->count * 4u);
+            uint32_t mem;
+            uint32_t cont;
+            dbt_mem_site_t site;
+
+            /* EA first: i686_emit_ea must never clobber the condition
+             * in w11 (it owns w21/w22 and leaves NZCV alone), so the
+             * cset runs after the address is materialized. */
+            i686_emit_ea(e, insn, 1);
+            l3c_emit_cset_w11(e, (unsigned)a64c);
+            mem = (uint32_t)((uint64_t)b->count * 4u);
+            a64_emit_guest_strb_w(b, L3C_W11, L3C_EA);
+            if (e->tso) {
+                a64_emit(b, 0xD5033BBFU); /* dmb ish */
+            }
+            cont = (uint32_t)((uint64_t)b->count * 4u);
+            memset(&site, 0, sizeof(site));
+            site.seq_start_offset = (uint16_t)seq;
+            site.host_insn_offset = (uint16_t)mem;
+            site.cont_insn_offset = (uint16_t)cont;
+            site.guest_pc_delta =
+                (e->insn_pc >= e->guest_eip &&
+                 e->insn_pc - e->guest_eip <= 0xFFF0U)
+                    ? (uint16_t)(e->insn_pc - e->guest_eip)
+                    : I686_SITE_PC_UNKNOWN;
+            site.insn_word = ((uint32_t)insn->op & 0xFFFFU) |
+                             ((uint32_t)insn->pfx_lock << 16);
+            site.sp_rollback_delta = 0;
+            site.npc_mode = (uint8_t)I686_NPC_SEQUENTIAL;
+            site.width = 1U;
+            site.flags = (uint8_t)I686_SITE_STORE;
+            site.val_or_dst_reg = (uint8_t)L3C_W11;
+            site.addr_base_reg = (uint8_t)(insn->ea_base != I686_REG_NONE
+                                               ? (insn->ea_base & 7U)
+                                               : 0xFFu);
+            (void)i686_aot_note_stack_site(&site);
         }
         return 0;
     }

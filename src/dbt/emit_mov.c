@@ -31,8 +31,9 @@
  * Declined forms (return -1; translate.c ends the block with UNDEF and
  * the engine interprets one insn, D2 — declining is always safe):
  * PUSHA/POPA/ENTER/LEAVE in v1, XCHG with a memory operand, segment
- * moves (MOV_EwSw/SwEw, PUSH/POP sreg), the moffs forms A0-A3, and
- * PUSH_Ev/POP_Ev (r/m stack forms).
+ * moves (MOV_EwSw/SwEw, PUSH/POP sreg), and POP_Ev (its ESP-relative
+ * destination semantics stay interpreter-only).  The moffs forms
+ * A0-A3 and PUSH_Ev live in emit_mov_ext.c (hot-path extension).
  */
 
 #include <stddef.h>
@@ -551,9 +552,10 @@ static int em_xchg_rmi(i686_emit_ctx_t *e, const x86_insn_t *insn,
 /* Decrement ESP and store wsrc at the new ESP: sub w4,w4,#bytes;
  * str/strh wsrc, [x20, w4, uxtw]. Records the Wave U3 site: ESP moves
  * BEFORE the store, so a fault between the two must roll ESP back by
- * +bytes (sp_rollback_delta = -bytes, undone by the landing pad). */
-static void emit_push_store(i686_emit_ctx_t *e, const x86_insn_t *insn,
-                            unsigned wsrc, unsigned bytes)
+ * +bytes (sp_rollback_delta = -bytes, undone by the landing pad).
+ * Shared with emit_mov_ext.c (FF /6 PUSH r/m: value load first). */
+void i686_emit_push_store(i686_emit_ctx_t *e, const x86_insn_t *insn,
+                          unsigned wsrc, unsigned bytes)
 {
     a64_buf_t *b = &e->buf;
     dbt_mem_site_t site;
@@ -597,9 +599,9 @@ static int em_push_gv(i686_emit_ctx_t *e, const x86_insn_t *insn)
 
     if (r == 4U) {
         a64_emit_mov_w(b, SCR0, 4U); /* old ESP */
-        emit_push_store(e, insn, SCR0, v_bytes(insn));
+        i686_emit_push_store(e, insn, SCR0, v_bytes(insn));
     } else {
-        emit_push_store(e, insn, r, v_bytes(insn));
+        i686_emit_push_store(e, insn, r, v_bytes(insn));
     }
     return 0;
 }
@@ -610,7 +612,7 @@ static int em_push_iz(i686_emit_ctx_t *e, const x86_insn_t *insn)
     a64_buf_t *b = &e->buf;
 
     a64_emit_mov_imm32(b, SCR0, insn->imm); /* 16-bit Iz: low half used */
-    emit_push_store(e, insn, SCR0, v_bytes(insn));
+    i686_emit_push_store(e, insn, SCR0, v_bytes(insn));
     return 0;
 }
 
@@ -621,7 +623,7 @@ static int em_push_ib(i686_emit_ctx_t *e, const x86_insn_t *insn)
 
     a64_emit_movz_w(b, SCR0, (uint16_t)(insn->imm & 0xFFU), 0U);
     emit_sbfx_w(b, SCR0, SCR0, 0U, 8U); /* sext8 -> 32; strh takes low 16 */
-    emit_push_store(e, insn, SCR0, v_bytes(insn));
+    i686_emit_push_store(e, insn, SCR0, v_bytes(insn));
     return 0;
 }
 
@@ -815,9 +817,10 @@ int i686_emit_mov(i686_emit_ctx_t *e, const x86_insn_t *insn)
         return -1;
 
     default:
-        /* Not a MOV-family op for this lane (segment moves, moffs,
-         * PUSHF/POPF, sreg pushes, r/m stack forms, XLAT, CPUID ...):
-         * another lane or the D2 fallback owns them. */
-        return -1;
+        /* Extension forms (FF /6 PUSH r/m, moffs A0-A3) live in
+         * emit_mov_ext.c; everything else (segment moves, PUSHF/POPF,
+         * sreg pushes, POP r/m, XLAT, CPUID ...) stays with another
+         * lane or the D2 fallback. */
+        return i686_emit_mov_ext(e, insn);
     }
 }

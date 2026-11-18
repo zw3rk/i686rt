@@ -58,6 +58,8 @@
 #define L2E_NR_ugetrlimit    191U
 #define L2E_NR_epoll_pwait   319U
 #define L2E_NR_prlimit64     340U
+#define L2E_NR_pselect6     308U
+#define L2E_NR_pselect6_time64 413U
 
 /* O_ flag aliases onto the single canonical map in
  * src/os/sys_pass_internal.h (guest i386 I686_O_*, host aarch64 Linux

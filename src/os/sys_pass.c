@@ -532,6 +532,10 @@ void i686_syscalls_pass_init(void)
     i686_sys_register(NR_set_tid_address, r_set_tid_address);
     i686_sys_register(NR_personality, r_personality);
     i686_sys_register(NR_futex, r_futex);
+    /* Registered last so the *at()/extra tables win on any overlap;
+     * verified disjoint from the handlers above (no shared NR). */
+    i686_syscalls_at_init();
+    i686_syscalls_extra_init();
 }
 
 uint64_t i686_sigmask_get(void)

@@ -311,7 +311,7 @@ static void classify_sse_x87_modrm(const x86_insn_t *insn,
         return;
     }
     if ((op >= I686_OP_MOVUPS && op <= I686_OP_PMOVMSKB) ||
-        (op >= I686_OP7_UNPCKLPS && op <= I686_OP7_SHUFPS)) {
+        (op >= I686_OP7_UNPCKLPS && op <= I686_OP7_SSEX)) {
         /* Determine SSE/MMX store vs load and width. */
         uint32_t w = 16u;
         uint8_t need = 0x01u;

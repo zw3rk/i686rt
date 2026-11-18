@@ -254,21 +254,35 @@ static int sigframe_build_snapshot(i686_ctx_t *ctx, int sig,
          * current->blocked unmodified; the sig | sa_mask blocking is
          * live task state for the handler's duration and sigreturn
          * restores the frame's copy — that is how a handler's own
-         * uc_sigmask edit (musl's SIGCANCEL re-raise) survives). */
-        uint64_t pre =
+         * uc_sigmask edit (musl's SIGCANCEL re-raise) survives).
+         * A pselect temporary-mask override in flight (M2) stashes the
+         * pre-swap mask here: the frame saves the stash so sigreturn
+         * restores it, while the temporary mask stays live for the
+         * handler's duration.  The stash is consumed by the first
+         * frame built after the wait. */
+        uint64_t live_mask =
             __atomic_load_n(&ctx->sig_mask, __ATOMIC_SEQ_CST);
-        uint64_t blocked = pre | (1ULL << (uint32_t)(sig - 1));
+        uint64_t frame_mask = live_mask;
+        if (__atomic_load_n(&ctx->sig_pselect_oldmask_valid,
+                            __ATOMIC_SEQ_CST) != 0U) {
+            frame_mask = __atomic_load_n(&ctx->sig_pselect_oldmask,
+                                         __ATOMIC_SEQ_CST);
+            __atomic_store_n(&ctx->sig_pselect_oldmask_valid, 0U,
+                             __ATOMIC_SEQ_CST);
+        }
+        uint64_t blocked =
+            live_mask | (1ULL << (uint32_t)(sig - 1));
 
         blocked |= ((uint64_t)ga->mask[1] << 32) | (uint64_t)ga->mask[0];
         __atomic_store_n(&ctx->sig_mask, blocked, __ATOMIC_SEQ_CST);
         if (sa_siginfo) {
             /* uc_sigmask: ucontext@frame+0x90, +0x14 mcontext(88) -> +0x6c */
             uint8_t m[8];
-            memcpy(m, &pre, sizeof(m));
+            memcpy(m, &frame_mask, sizeof(m));
             (void)i686_copy_to_guest(ctx, frame_va + 0x90U + 0x6cU, m,
                                      sizeof(m));
         } else {
-            sc.oldmask = (uint32_t)pre;
+            sc.oldmask = (uint32_t)frame_mask;
         }
     }
     if (sa_siginfo) {
@@ -767,6 +781,19 @@ int i686_deliver_pending(i686_ctx_t *ctx)
         ctx->exit_arg = 0; /* no trapno for async */
         return sigframe_build_snapshot(ctx, sig, &ga,
                                        (ga.flags & 0x4U) ? 1 : 0, 0U, 0U);
+    }
+    if (__atomic_load_n(&ctx->sig_pselect_oldmask_valid,
+                        __ATOMIC_SEQ_CST) != 0U) {
+        /* A stashed pselect mask with no frame built (every pending bit
+         * was ignored or took a default disposition): the temporary mask
+         * must not leak past the finished wait, so the live mask falls
+         * back to the stashed pre-swap mask. */
+        uint64_t stashed =
+            __atomic_load_n(&ctx->sig_pselect_oldmask,
+                            __ATOMIC_SEQ_CST);
+        __atomic_store_n(&ctx->sig_pselect_oldmask_valid, 0U,
+                         __ATOMIC_SEQ_CST);
+        __atomic_store_n(&ctx->sig_mask, stashed, __ATOMIC_SEQ_CST);
     }
     return -1;
 }

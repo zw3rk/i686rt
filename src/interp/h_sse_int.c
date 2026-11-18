@@ -816,4 +816,5 @@ void i686_interp_sse_int_init(void)
     i686_interp_register(471 /* UNPCKHPS/PD */, h_unpckhps);
     i686_interp_register(472 /* PACKUSWB */, h_packuswb);
     i686_interp_register(473 /* SHUFPS/PD */, h_shufps);
+    i686_interp_sse_ext_init();
 }

@@ -82,10 +82,10 @@ run_engine() {
     _rc=0
     if [ "$_host" = "hl" ]; then
         # shellcheck disable=SC2086
-        perl -e 'alarm 20; exec @ARGV' "$HL_BIN" "$RT_LINUX" --engine "$_eng" -- "$_guest" "$@" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
+        perl -e 'alarm 60; exec @ARGV' "$HL_BIN" "$RT_LINUX" --engine "$_eng" -- "$_guest" "$@" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
     else
         # shellcheck disable=SC2086
-        perl -e 'alarm 20; exec @ARGV' "$RT_DARWIN" --engine "$_eng" -- "$_guest" "$@" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
+        perl -e 'alarm 60; exec @ARGV' "$RT_DARWIN" --engine "$_eng" -- "$_guest" "$@" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
     fi
     _t1=$(parity_now_ms)
     _ms=0

@@ -665,3 +665,13 @@ void x87_set_exc(i686_ctx_t *ctx, unsigned bits)
         ctx->fstat = (uint16_t)(ctx->fstat | 0x80U | 0x8000U);
     }
 }
+
+/* FNINIT state: Linux starts every process (and every exec) with an empty
+ * x87 stack and all exceptions masked; musl/gnulib code does not FINIT. */
+void i686_x87_reset(i686_ctx_t *ctx)
+{
+    ctx->fctrl = 0x037FU;
+    ctx->fstat = 0U;
+    ctx->ftag = 0xFFFFU;
+    ctx->x87_top = 0U;
+}
